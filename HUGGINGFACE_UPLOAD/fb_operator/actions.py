@@ -94,10 +94,143 @@ def _find_posts(page: Page) -> list[Locator]:
 
     return page.locator('div[role="article"]').all()
 
-def like_posts(page: Page, mode: str = "latest", count: int = 1) -> int:
-    """
-    التفاعل والإعجاب بمنشورات الحساب المستهدف بدقة تامة وبدون أي خبط أو إلغاء سابق.
-    """
+def get_target_post(page: Page, post_index: int = 1):
+    """الوصول إلى المنشور المستهدف بالرقم المحدد (الأول، الثاني، الثالث، ...) بدقة وسلاسة"""
+    dismiss_dialogs(page)
+    close_floating_chats(page)
+
+    url = page.url.lower()
+    if any(k in url for k in ["/posts/", "/permalink/", "/photo", "fbid=", "/videos/"]):
+        article = page.locator('div[role="article"]').first
+        if article.is_visible(timeout=3000):
+            return article
+        dialog = page.locator('div[role="dialog"]').first
+        if dialog.is_visible(timeout=2000):
+            return dialog
+        return page.locator('div[role="main"]').first
+
+    attempts = 0
+    while attempts < 6:
+        raw_posts = page.locator('div[role="feed"] > div, div[role="article"]').all()
+        valid = []
+        for p in raw_posts:
+            try:
+                cnt = p.locator('div[role="button"][aria-label*="أعجبني"], div[role="button"][aria-label*="Like" i], div[role="button"][aria-label*="تعليق"], div[role="button"][aria-label*="Comment" i]').count()
+                if cnt > 0:
+                    valid.append(p)
+            except Exception:
+                pass
+        
+        if len(valid) >= post_index:
+            target = valid[post_index - 1]
+            try:
+                target.scroll_into_view_if_needed(timeout=2500)
+            except Exception:
+                pass
+            return target
+        
+        page.evaluate("window.scrollBy({top: 650, behavior: 'smooth'})")
+        human_delay(1.5, 2.5)
+        attempts += 1
+
+    all_p = _find_posts(page)
+    if all_p:
+        idx = min(post_index - 1, len(all_p) - 1)
+        return all_p[idx]
+    return None
+
+def react_to_posts(page: Page, reaction: str = "like", post_index: int = 1) -> bool:
+    """التفاعل مع منشور محدد (إعجاب، أحببته، أدعمه، هاها، واو، أحزنني، أغضبني، أو إلغاء الإعجاب)"""
+    dismiss_dialogs(page)
+    close_floating_chats(page)
+
+    target_post = get_target_post(page, post_index)
+    if not target_post:
+        print(f"[-] لم يتم العثور على المنشور رقم {post_index}.")
+        return False
+
+    like_btn = target_post.locator(
+        'div[role="button"][aria-label*="أعجبني"], '
+        'div[role="button"][aria-label*="Like" i], '
+        'div[role="button"]:has-text("أعجبني"), '
+        'div[role="button"]:has-text("Like")'
+    ).first
+
+    if not like_btn.is_visible(timeout=3000):
+        try:
+            like_btn.scroll_into_view_if_needed(timeout=2000)
+        except Exception:
+            pass
+
+    if not like_btn.is_visible(timeout=2500):
+        print(f"[-] المنشور رقم {post_index}: لم يتم العثور على زر التفاعل/الإعجاب.")
+        return False
+
+    aria_label = (like_btn.get_attribute("aria-label") or "").strip().lower()
+    btn_text = (like_btn.inner_text() or "").strip().lower()
+    is_pressed = like_btn.get_attribute("aria-pressed") == "true"
+    is_already_reacted = is_pressed or any(w in aria_label for w in ["إزالة", "أعجبك", "تراجع", "إلغاء", "unlike", "remove"]) or any(w in btn_text for w in ["أعجبك", "unlike"])
+
+    reaction = reaction.lower().strip()
+
+    if reaction in ["unlike", "remove", "cancel"]:
+        if is_already_reacted:
+            like_btn.click()
+            print(f"[+] المنشور {post_index}: تم إلغاء الإعجاب بنجاح.")
+            human_delay(2.0, 3.5)
+            return True
+        else:
+            print(f"[i] المنشور {post_index}: غير معجب به مسبقاً.")
+            return True
+
+    if reaction == "like":
+        if is_already_reacted:
+            print(f"[+] المنشور {post_index}: معجب به مسبقاً.")
+            return True
+        like_btn.click()
+        print(f"[+] المنشور {post_index}: تم الإعجاب بنجاح (Like).")
+        human_delay(2.0, 3.5)
+        return True
+
+    reaction_map = {
+        "love": ["أحببته", "Love"],
+        "care": ["أدعمه", "Care"],
+        "haha": ["هاها", "Haha"],
+        "wow": ["واو", "Wow"],
+        "sad": ["أحزنني", "Sad"],
+        "angry": ["أغضبني", "Angry"]
+    }
+    keywords = reaction_map.get(reaction, ["أحببته", "Love"])
+
+    try:
+        like_btn.hover()
+        human_delay(1.2, 1.8)
+
+        for kw in keywords:
+            react_btn = page.locator(f'div[role="toolbar"] div[aria-label*="{kw}" i], div[aria-label*="{kw}" i][role="button"]').first
+            if react_btn.is_visible(timeout=2000):
+                react_btn.click()
+                print(f"[+] المنشور {post_index}: تم وضع التفاعل بنجاح ({reaction}).")
+                human_delay(2.0, 3.5)
+                return True
+
+        like_btn.click()
+        print(f"[+] المنشور {post_index}: تم وضع الإعجاب الافتراضي.")
+        human_delay(2.0, 3.0)
+        return True
+    except Exception as e:
+        print(f"[-] خطأ أثناء وضع التفاعل: {e}")
+        return False
+
+def unlike_posts(page: Page, post_index: int = 1) -> bool:
+    """إلغاء التفاعل أو الإعجاب عن المنشور المحدد"""
+    return react_to_posts(page, reaction="unlike", post_index=post_index)
+
+def like_posts(page: Page, mode: str = "latest", count: int = 1, post_index: int = 1) -> int:
+    """التفاعل والإعجاب بمنشورات الحساب المستهدف بدقة تامة"""
+    if mode == "index":
+        return 1 if react_to_posts(page, reaction="like", post_index=post_index) else 0
+
     dismiss_dialogs(page)
     close_floating_chats(page)
     posts = _find_posts(page)
@@ -106,14 +239,11 @@ def like_posts(page: Page, mode: str = "latest", count: int = 1) -> int:
         print("[-] لم يتم العثور على أي منشورات ظاهرة في هذا الحساب للتفاعل معها.")
         return 0
 
-    print(f"[i] تم رصد {len(posts)} منشوراً في الصفحة.")
-
     target_posts = posts[:1] if mode == "latest" else (posts[:count] if mode == "count" else posts)
     liked_count = 0
 
     for idx, post in enumerate(target_posts, start=1):
         try:
-            # فحص زر الإعجاب داخل هذا المنشور تحديداً
             like_btn = post.locator(
                 'div[role="button"][aria-label*="أعجبني"], '
                 'div[role="button"][aria-label*="Like" i], '
@@ -125,14 +255,11 @@ def like_posts(page: Page, mode: str = "latest", count: int = 1) -> int:
                 like_btn.scroll_into_view_if_needed(timeout=2000)
 
             if not like_btn.is_visible(timeout=2500):
-                print(f"[-] المنشور رقم {idx}: لم يتم العثور على زر الإعجاب.")
                 continue
 
-            # التحقق إذا كان المنشور معجباً به مسبقاً لمنع إلغاء الإعجاب نهائياً
             aria_label = (like_btn.get_attribute("aria-label") or "").strip().lower()
             btn_text = (like_btn.inner_text() or "").strip().lower()
             is_pressed = like_btn.get_attribute("aria-pressed") == "true"
-
             is_already_liked = (
                 is_pressed or
                 any(word in aria_label for word in ["إزالة", "أعجبك", "تراجع", "إلغاء", "unlike", "remove"]) or
@@ -140,91 +267,104 @@ def like_posts(page: Page, mode: str = "latest", count: int = 1) -> int:
             )
 
             if is_already_liked:
-                print(f"[+] المنشور رقم {idx}: معجب به مسبقاً، تم تخطيه حفاظاً على اللايك ومنع إزالته.")
                 continue
 
             like_btn.click()
             liked_count += 1
-            print(f"[+] المنشور رقم {idx}: تم الإعجاب بنجاح ودقة.")
             human_delay(2.0, 3.5)
-
-        except Exception as e:
-            print(f"[-] خطأ أثناء التفاعل مع المنشور {idx}: {e}")
+        except Exception:
+            pass
 
     return liked_count
 
-def comment_on_posts(page: Page, comment_text: str, mode: str = "latest", count: int = 1) -> int:
-    """كتابة تعليق مباشر داخل حقل تعليقات المنشور بدقة تامة ودعم النوافذ المنبثقة دون إلغاء مبكر"""
+def comment_on_posts(page: Page, comment_text: str, mode: str = "latest", count: int = 1, post_index: int = 1, post_url: str = "") -> int:
+    """كتابة ونشر تعليق مباشر وموثق على المنشور المستهدف بدقة تامة"""
     dismiss_dialogs(page)
     close_floating_chats(page)
-    posts = _find_posts(page)
 
-    if not posts:
+    if post_url and post_url.strip():
+        navigate_to_target(page, post_url.strip())
+        human_delay(2.0, 3.0)
+
+    target_post = get_target_post(page, post_index)
+    if not target_post:
         print("[-] لم يتم العثور على منشورات للتعليق عليها.")
         return 0
 
-    target_posts = posts[:1] if mode == "latest" else (posts[:count] if mode == "count" else posts)
-    commented_count = 0
+    try:
+        comment_btn = target_post.locator(
+            'div[role="button"][aria-label*="Comment" i], '
+            'div[role="button"][aria-label*="تعليق"], '
+            'div[role="button"]:has-text("تعليق"), '
+            'div[role="button"]:has-text("Comment")'
+        ).first
 
-    for idx, post in enumerate(target_posts, start=1):
-        try:
-            # 1. النقر على زر التعليق لفتح صندوق التعليق
-            comment_btn = post.locator(
-                'div[role="button"][aria-label*="Comment" i], '
-                'div[role="button"][aria-label*="تعليق"], '
-                'div[role="button"]:has-text("تعليق"), '
-                'div[role="button"]:has-text("Comment")'
-            ).first
-
-            if comment_btn.is_visible(timeout=3000):
+        if comment_btn.is_visible(timeout=2500):
+            try:
+                comment_btn.scroll_into_view_if_needed(timeout=1500)
                 comment_btn.click()
                 human_delay(1.5, 2.5)
+            except Exception:
+                pass
 
-            # 2. تحديد حقل كتابة التعليق (يدعم وضع النافذة المنبثقة والوضع المضمن)
-            input_box_selectors = [
-                'div[aria-label*="اكتب تعليق"][role="textbox"]',
-                'div[aria-label*="Write a comment"][role="textbox"]',
-                'div[role="dialog"] div[role="textbox"][contenteditable="true"]',
-                'div[role="article"] div[role="textbox"][contenteditable="true"]',
-                'div[role="textbox"][contenteditable="true"]'
-            ]
+        input_box = None
+        selectors = [
+            'div[role="textbox"][contenteditable="true"]',
+            'div[aria-label*="اكتب تعليق"][role="textbox"]',
+            'div[aria-label*="Write a comment"][role="textbox"]',
+            'div[role="dialog"] div[role="textbox"][contenteditable="true"]'
+        ]
 
-            input_box = None
-            for i_sel in input_box_selectors:
-                loc = page.locator(i_sel).first
-                if loc.is_visible(timeout=3000):
+        for s in selectors:
+            loc = target_post.locator(s).first
+            if loc.is_visible(timeout=1500):
+                input_box = loc
+                break
+
+        if not input_box:
+            for s in selectors:
+                loc = page.locator(s).first
+                if loc.is_visible(timeout=2000):
                     input_box = loc
                     break
 
-            if input_box:
+        if input_box:
+            try:
+                input_box.scroll_into_view_if_needed(timeout=2000)
+            except Exception:
+                pass
+            human_delay(0.5, 1.0)
+            input_box.click(force=True)
+            human_delay(0.4, 0.8)
+            page.keyboard.type(comment_text, delay=random.randint(40, 75))
+            human_delay(1.0, 1.8)
+            page.keyboard.press("Enter")
+
+            # البحث عن زر الإرسال الصريح والنقر عليه
+            send_btns = [
+                'div[role="button"][aria-label*="تعليق"][tabindex="0"]',
+                'div[role="button"][aria-label*="Comment" i][tabindex="0"]',
+                'div[role="button"][aria-label*="نشر"]',
+                'div[role="button"][aria-label*="Post" i]'
+            ]
+            for sb in send_btns:
                 try:
-                    input_box.scroll_into_view_if_needed(timeout=2000)
+                    b = page.locator(sb).first
+                    if b.is_visible(timeout=1000):
+                        b.click(timeout=1000)
+                        break
                 except Exception:
                     pass
-                human_delay(0.5, 1.0)
-                try:
-                    input_box.focus()
-                except Exception:
-                    try:
-                        input_box.click(force=True, timeout=2000)
-                    except Exception:
-                        pass
-                human_delay(0.4, 0.8)
-                page.keyboard.type(comment_text, delay=random.randint(45, 85))
-                human_delay(1.0, 1.8)
-                page.keyboard.press("Enter")
-                print(f"[+] المنشور رقم {idx}: تم إرسال التعليق بنجاح: '{comment_text}'")
-                
-                # انتظار 4.5 ثوانٍ ريثما ينتهي فيسبوك من نشر التعليق على السيرفر دون ضغط Escape
-                human_delay(4.5, 6.0)
-                commented_count += 1
-            else:
-                print(f"[-] المنشور رقم {idx}: تعذر الوصول لصندوق كتابة التعليق.")
 
-        except Exception as e:
-            print(f"[-] خطأ أثناء كتابة التعليق على المنشور {idx}: {e}")
-
-    return commented_count
+            human_delay(3.5, 5.0)
+            print(f"[+] تم إرسال ونشر التعليق بنجاح: '{comment_text}'")
+            return 1
+        else:
+            print("[-] تعذر الوصول لصندوق كتابة التعليق.")
+            return 0
+    except Exception as e:
+        print(f"[-] خطأ أثناء كتابة التعليق: {e}")
+        return 0
 
 def _ensure_post_comments_expanded(page: Page, target_post) -> list:
     """فتح وتوسيع درج التعليقات في المنشور إذا كانت مطوية أو مخفية دون إعادة إغلاقها"""
@@ -725,6 +865,70 @@ def follow_profile(page: Page) -> bool:
             continue
 
     print("[-] زر المتابعة غير متوفر (قد تكون تتابعه بالفعل أو الإعدادات مغلقة).")
+    return False
+
+
+def unfollow_profile(page: Page) -> bool:
+    """إلغاء متابعة الحساب المستهدف"""
+    dismiss_dialogs(page)
+    close_floating_chats(page)
+    human_delay(1.5, 3.0)
+
+    unfollow_selectors = [
+        'div[role="button"]:has-text("متابَع")',
+        'div[role="button"]:has-text("Following")',
+        'div[aria-label*="متابَع"]',
+        'div[aria-label*="Following" i]',
+        'span:has-text("متابَع")',
+        'span:has-text("Following")'
+    ]
+
+    for sel in unfollow_selectors:
+        try:
+            btn = page.locator(sel).first
+            if btn.is_visible(timeout=2500):
+                btn.click()
+                human_delay(1.0, 2.0)
+                menu_unfollow = page.locator(
+                    'div[role="menuitem"]:has-text("إلغاء المتابعة"), '
+                    'div[role="menuitem"]:has-text("Unfollow"), '
+                    'span:has-text("إلغاء المتابعة"), '
+                    'span:has-text("Unfollow")'
+                ).first
+                if menu_unfollow.is_visible(timeout=2000):
+                    menu_unfollow.click()
+                print("[+] تم إلغاء متابعة الحساب بنجاح.")
+                human_delay(2.0, 3.5)
+                return True
+        except Exception:
+            continue
+
+    more_selectors = [
+        'div[aria-label*="إعدادات الملف الشخصي"]',
+        'div[role="button"][aria-label*="المزيد"]',
+        'div[role="button"][aria-label*="More" i]'
+    ]
+    for m_sel in more_selectors:
+        try:
+            more_menu = page.locator(m_sel).first
+            if more_menu.is_visible(timeout=1500):
+                more_menu.click()
+                human_delay(1.0, 2.0)
+                inner_unfollow = page.locator(
+                    'div[role="menuitem"]:has-text("إلغاء المتابعة"), '
+                    'div[role="menuitem"]:has-text("Unfollow"), '
+                    'span:has-text("إلغاء المتابعة"), '
+                    'span:has-text("Unfollow")'
+                ).first
+                if inner_unfollow.is_visible(timeout=2000):
+                    inner_unfollow.click()
+                    print("[+] تم إلغاء متابعة الحساب عبر القائمة الجانبية بنجاح.")
+                    human_delay(2.0, 3.5)
+                    return True
+        except Exception:
+            continue
+
+    print("[-] لم يتم العثور على زر المتابَع لإلغائها.")
     return False
 
 def extract_facebook_target_id(url: str) -> str:
