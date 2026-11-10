@@ -170,7 +170,7 @@ def launch_account_browser(playwright_instance, profile_dir: str | Path, visible
     context.add_init_script(stealth_script)
     return context
 
-def auto_login_facebook(context: BrowserContext, page: Page, email: str, password: str, status_callback=None) -> bool:
+def auto_login_facebook(context: BrowserContext, page: Page, email: str, password: str, status_callback=None, max_wait: int = 90) -> bool:
     """
     تسجيل الدخول التلقائي في فيسبوك باستخدام الإيميل وكلمة السر المحفوظين
     مع كتابة بشرية والتعامل مع رمز التحقق (2FA) وتثبيت الجلسة
@@ -196,8 +196,9 @@ def auto_login_facebook(context: BrowserContext, page: Page, email: str, passwor
     dismiss_dialogs(page)
 
     # فحص مجدداً بعد فتح الصفحة
+    curr_after_open = (page.url or "").lower()
     is_logged, fb_id = check_facebook_login_cookies(context)
-    if is_logged:
+    if is_logged and not any(x in curr_after_open for x in ("checkpoint", "two_step_verification", "login.php", "suspended", "disabled")):
         log("تم التحقق من الجلسة، الحساب مسجل دخوله بالفعل.")
         return True
 
@@ -300,20 +301,21 @@ def auto_login_facebook(context: BrowserContext, page: Page, email: str, passwor
     start_time = time.time()
     warned_2fa = False
 
-    while time.time() - start_time < 90:
+    while time.time() - start_time < max_wait:
         if len(context.pages) == 0:
             log("تم إغلاق المتصفح من قبل المستخدم.")
             return False
 
-        # فحص نجاح الدخول عبر الكوكيز
+        # فحص نجاح الدخول عبر الكوكيز مع استبعاد صفحات التحقق أو التجميد
+        curr_url = (page.url or "").lower()
+        blocked_state = any(x in curr_url for x in ("checkpoint", "two_step_verification", "login.php", "suspended", "disabled"))
         is_logged, fb_id = check_facebook_login_cookies(context)
-        if is_logged:
+        if is_logged and not blocked_state:
             time.sleep(3.0)  # مهلة لتثبيت الجلسة على القرص
             log("تم تسجيل الدخول وتثبيت الجلسة الدائمة بنجاح!")
             return True
 
         # فحص إذا ظهرت صفحة رمز التحقق 2FA
-        curr_url = page.url
         if ("checkpoint" in curr_url or "two_step_verification" in curr_url) and not warned_2fa:
             log("تنبيه: فيسبوك يطلب رمز الأمان (2FA). يرجى إدخال الرمز في المتصفح الآن...")
             warned_2fa = True
@@ -332,8 +334,10 @@ def auto_login_facebook(context: BrowserContext, page: Page, email: str, passwor
         time.sleep(1.5)
 
     # فحص أخير
+    curr_final = (page.url or "").lower()
+    blocked_final = any(x in curr_final for x in ("checkpoint", "two_step_verification", "login.php", "suspended", "disabled"))
     is_logged, fb_id = check_facebook_login_cookies(context)
-    if is_logged:
+    if is_logged and not blocked_final:
         log("تم تسجيل الدخول بنجاح.")
         return True
 
