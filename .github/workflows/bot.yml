@@ -1,0 +1,42 @@
+name: FB Operator 24/7 Cloud Bot
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+  schedule:
+    # يتجدد التشغيل تلقائياً في سحابة مايكروسوفت كل 5 ساعات ليعمل 24 ساعة دون توقف
+    - cron: '0 */5 * * *'
+
+jobs:
+  run-fb-operator:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: 📥 جلب الكود
+        uses: actions/checkout@v4
+
+      - name: 🐍 إعداد بايثون 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 📦 تثبيت متطلبات النظام والخطوط العربية
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends fonts-noto-core fonts-noto-cjk fonts-noto-extra fonts-noto-ui-core fonts-noto-color-emoji
+          if [ -d "HUGGINGFACE_UPLOAD" ]; then
+            pip install -r HUGGINGFACE_UPLOAD/requirements.txt
+            playwright install chromium
+          else
+            pip install -r requirements.txt
+            playwright install chromium
+          fi
+
+      - name: 🚀 إطلاق بوت فيسبوك في السحاب
+        run: |
+          if [ -d "HUGGINGFACE_UPLOAD" ]; then
+            python HUGGINGFACE_UPLOAD/fb_operator/telegram_bot.py
+          else
+            python fb_operator/telegram_bot.py
+          fi
