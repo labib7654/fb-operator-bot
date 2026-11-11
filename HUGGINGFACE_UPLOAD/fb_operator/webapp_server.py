@@ -781,6 +781,8 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                     st["is_running"] = True
                     st["live_status_text"] = "تم إطلاق المهمة من لوحة التحكم الداخلية..."
 
+                if callable(hooks.get("persist_user_states")):
+                    hooks["persist_user_states"]()
                 hooks["record_user_operation"](uid, "تشغيل مهمة ميدانية (Mini App)")
                 hooks["record_audit_log"](uid, user_label, "LAUNCH_MISSION_WEBAPP", f"الهدف: {target_url[:80]} | تكلفة: {debit_res.get('cost', 0)} نقطة")
                 publish_event("mission", uid, "launch")

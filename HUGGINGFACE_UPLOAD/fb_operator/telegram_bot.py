@@ -24,6 +24,7 @@ if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
         pass
 
 import os
+import io
 import re
 import html
 import time
@@ -34,10 +35,13 @@ import telebot
 from telebot import types
 from playwright.sync_api import sync_playwright
 
+from fb_operator.config import BROKEN_ACCOUNT_TTL_HOURS
 from fb_operator.account_manager import (
     load_accounts, add_account, update_account, delete_account,
-    purge_broken_accounts, get_accounts_by_owner, get_accounts_breakdown_by_owner,
-    delete_accounts_by_owner, get_account_by_id, git_sync_save
+    purge_broken_accounts, purge_expired_broken_accounts,
+    get_accounts_by_owner, get_accounts_breakdown_by_owner,
+    delete_accounts_by_owner, get_account_by_id, git_sync_save,
+    parse_cookies_payload, save_account_cookies_session
 )
 from fb_operator.admin_manager import (
     is_super_admin, is_authorized_user, has_permission, get_user_permissions,
@@ -48,7 +52,8 @@ from fb_operator.admin_manager import (
 )
 from fb_operator.browser_manager import (
     launch_account_browser, auto_login_facebook, check_facebook_login_cookies,
-    human_delay, get_login_error, check_facebook_page_access
+    human_delay, get_login_error, check_facebook_page_access,
+    save_account_storage_state
 )
 from fb_operator.actions import (
     navigate_to_target, comment_on_posts, react_to_posts,
@@ -60,6 +65,14 @@ from fb_operator.webapp_server import (
     start_webapp_and_tunnel, get_public_webapp_url, update_menu_button_for_user
 )
 from fb_operator.state_events import publish_event, register_listener
+from fb_operator.persistence_manager import (
+    bootstrap_persistence, export_backup_zip_bytes, restore_backup_zip_bytes,
+    hf_dataset_sync_upload, flush_cloud_backups, get_persistence_status,
+    load_backup_settings, save_backup_settings, parse_backup_interval,
+    format_backup_interval, send_backup_to_channel, load_ui_states_data,
+    save_ui_states_data, register_pre_backup_callback, register_restore_callback,
+    MIN_BACKUP_INTERVAL_SEC, MAX_BACKUP_INTERVAL_SEC
+)
 from fb_operator.economy_manager import (
     OP_COST_LABELS_AR, load_economy_settings, update_economy_settings,
     is_points_enforced_for_user, can_user_invite, ensure_public_access_if_enabled,
@@ -71,7 +84,7 @@ from fb_operator.economy_manager import (
     reply_support_ticket, settle_payout, list_support_tickets, get_ticket_by_id,
 )
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8798272294:AAEY_LIYnVRIY2T-WUP63duCn5V7VFgGsCE")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8798272294:AAGzBDYCu3B9tks46u3_U0mxsH9r0Olofzg")
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 _bot_username_cache = ""
@@ -264,9 +277,37 @@ def default_user_state() -> dict:
 
 def get_user_state(user_id: int) -> dict:
     with state_lock:
+        st = user_states.get(user_id)
+        if st is not None:
+            return st
+    saved = load_ui_states_data().get(user_id, {})
+    with state_lock:
         if user_id not in user_states:
-            user_states[user_id] = default_user_state()
+            base = default_user_state()
+            if isinstance(saved, dict):
+                base.update(saved)
+            user_states[user_id] = base
         return user_states[user_id]
+
+
+def persist_user_states(mark_dirty: bool = True) -> None:
+    with state_lock:
+        snapshot = {uid: dict(st) for uid, st in user_states.items()}
+    save_ui_states_data(snapshot, mark_dirty=mark_dirty)
+
+
+def reload_user_states_from_disk() -> None:
+    loaded = load_ui_states_data()
+    with state_lock:
+        user_states.clear()
+        for uid, saved in loaded.items():
+            base = default_user_state()
+            base.update(saved)
+            user_states[uid] = base
+
+
+register_pre_backup_callback(lambda: persist_user_states(mark_dirty=False))
+register_restore_callback(reload_user_states_from_disk)
 
 
 def user_has_any_action_perm(user_id: int) -> bool:
@@ -519,7 +560,8 @@ def get_main_dashboard_markup(user_id: int) -> types.InlineKeyboardMarkup:
         react_lbl = REACTION_ICONS.get(st["reaction_type"], "👍 إعجاب")
         p_tag = "رابط مخصص" if st.get("react_post_url") else f"منشور {st['react_post_index']}"
         markup.row(
-            types.InlineKeyboardButton(f"{react_lbl} [{like_st}] ({p_tag})", callback_data="menu_wizard_react")
+            types.InlineKeyboardButton(f"{react_lbl} [{like_st}]", callback_data="toggle_react_main"),
+            types.InlineKeyboardButton(f"⚙️ خيارات ({p_tag})", callback_data="menu_wizard_react")
         )
 
     # 3. التعليقات
@@ -527,14 +569,16 @@ def get_main_dashboard_markup(user_id: int) -> types.InlineKeyboardMarkup:
         cmt_st = "✅" if st["comment"] else "❌"
         c_tag = "رابط مخصص" if st.get("comment_post_url") else f"منشور {st['comment_post_index']}"
         markup.row(
-            types.InlineKeyboardButton(f"💬 تعليق [{cmt_st}] ({c_tag})", callback_data="menu_wizard_comment")
+            types.InlineKeyboardButton(f"💬 تعليق [{cmt_st}]", callback_data="toggle_comment_main"),
+            types.InlineKeyboardButton(f"✏️ نص ومنشور ({c_tag})", callback_data="menu_wizard_comment")
         )
 
     # 4. التفاعل والرد على تعليق محدد
     if p_int:
-        cmt_int_tag = "✅ نشط" if st["interact_cmt"] else "❌ معطل"
+        cmt_int_tag = "✅" if st["interact_cmt"] else "❌"
         markup.row(
-            types.InlineKeyboardButton(f"🎯 تفاعل/رد على تعليق محدد [{cmt_int_tag}]", callback_data="menu_cmt_interact")
+            types.InlineKeyboardButton(f"🎯 رد على تعليق [{cmt_int_tag}]", callback_data="toggle_cmt_int_main"),
+            types.InlineKeyboardButton("⚙️ هدف الرد", callback_data="menu_cmt_interact")
         )
 
     # 5. الصداقة والمتابعة والإلغاء
@@ -556,9 +600,10 @@ def get_main_dashboard_markup(user_id: int) -> types.InlineKeyboardMarkup:
     if p_msg:
         msg_st = "✅" if st["message"] else "❌"
         raw_m = (st.get("message_text") or "").strip()
-        msg_snip = (raw_m[:15] + "..") if len(raw_m) > 15 else (raw_m or "بدون نص")
+        msg_snip = (raw_m[:12] + "..") if len(raw_m) > 12 else (raw_m or "بدون نص")
         markup.row(
-            types.InlineKeyboardButton(f"✉️ رسالة خاصة [{msg_st}] ({msg_snip})", callback_data="menu_wizard_message")
+            types.InlineKeyboardButton(f"✉️ رسالة خاصة [{msg_st}]", callback_data="toggle_msg_main"),
+            types.InlineKeyboardButton(f"✏️ النص ({msg_snip})", callback_data="menu_wizard_message")
         )
 
     # 7. البلاغات والحظر
@@ -579,7 +624,10 @@ def get_main_dashboard_markup(user_id: int) -> types.InlineKeyboardMarkup:
     if is_dev or p_add or p_del:
         if p_add and not has_any_action and not p_use and not is_dev:
             # واجهة نظيفة لوضع "إضافة حسابات للبوت فقط"
-            markup.row(types.InlineKeyboardButton("➕ إضافة حساب فيسبوك جديد للبوت", callback_data="act_add_acc"))
+            markup.row(
+                types.InlineKeyboardButton("➕ إضافة حساب", callback_data="act_add_acc"),
+                types.InlineKeyboardButton("🍪 استيراد جلسة/كوكيز", callback_data="act_import_cookies")
+            )
             markup.row(
                 types.InlineKeyboardButton(f"📋 حساباتي المضافة ({len(manageable_accs)})", callback_data="menu_manage_accs"),
                 types.InlineKeyboardButton("🔄 فحص جلساتي", callback_data="act_check_sessions")
@@ -589,8 +637,13 @@ def get_main_dashboard_markup(user_id: int) -> types.InlineKeyboardMarkup:
             if p_add:
                 row_acc.append(types.InlineKeyboardButton("➕ إضافة حساب", callback_data="act_add_acc"))
             markup.row(*row_acc)
+            sub_acc_row = []
+            if p_add:
+                sub_acc_row.append(types.InlineKeyboardButton("🍪 استيراد جلسة/كوكيز", callback_data="act_import_cookies"))
             if is_dev or len(manageable_accs) > 0:
-                markup.row(types.InlineKeyboardButton("🔄 فحص حالة الجلسات", callback_data="act_check_sessions"))
+                sub_acc_row.append(types.InlineKeyboardButton("🔄 فحص الجلسات", callback_data="act_check_sessions"))
+            if sub_acc_row:
+                markup.row(*sub_acc_row)
 
     # 9. قسم المحفظة والإحالات والدعم/البيع (يظهر عند امتلاك أي صلاحية أو رصيد)
     if is_dev:
@@ -607,6 +660,9 @@ def get_main_dashboard_markup(user_id: int) -> types.InlineKeyboardMarkup:
         markup.row(
             types.InlineKeyboardButton("💰 محفظتي وسجلي", callback_data="menu_wallet"),
             types.InlineKeyboardButton("🔗 روابط وأكواد الدعوة", callback_data="menu_referral")
+        )
+        markup.row(
+            types.InlineKeyboardButton("💾 الحفظ الدائم والنسخ الاحتياطي", callback_data="menu_backup_vault")
         )
     elif has_any_feature or wallet["points"] > 0:
         eco_row = [types.InlineKeyboardButton(f"🪙 نقاطي ({wallet['points']} = {wallet['yer_value']:,} ر.ي)", callback_data="menu_wallet")]
@@ -953,7 +1009,10 @@ def _render_manage_accs_view(user_id: int) -> tuple[str, types.InlineKeyboardMar
             markup.row(types.InlineKeyboardButton(f"{st_icon} {a['name']}", callback_data="noop"))
 
     if can_add:
-        markup.row(types.InlineKeyboardButton("➕ إضافة حساب جديد للبوت", callback_data="act_add_acc"))
+        markup.row(
+            types.InlineKeyboardButton("➕ إضافة حساب جديد", callback_data="act_add_acc"),
+            types.InlineKeyboardButton("🍪 استيراد جلسة/كوكيز", callback_data="act_import_cookies")
+        )
     if can_del:
         markup.row(types.InlineKeyboardButton("🧹 تنظيف وحذف الحسابات التالفة", callback_data="act_purge_broken"))
     markup.row(
@@ -963,16 +1022,236 @@ def _render_manage_accs_view(user_id: int) -> tuple[str, types.InlineKeyboardMar
 
     title = "👥 <b>إدارة كافة حسابات النظام:</b>\n\n" if is_dev else "📋 <b>حساباتك التي قمت بإضافتها للبوت:</b>\n\n"
     txt = title
+    now_ts = time.time()
     for i, a in enumerate(accs, 1):
-        st_text = "🟢 نشط ومسجل" if "نشط" in a.get("status", "") else f"🔴 غير نشط ({esc(a.get('diagnostic_reason') or 'يتطلب تسجيل دخول')})"
+        is_act = "نشط" in a.get("status", "")
+        if is_act:
+            st_text = "🟢 نشط ومسجل"
+        else:
+            ttl_note = ""
+            try:
+                f_ts = float(a.get("failed_at") or a.get("added_at") or 0)
+                if f_ts > 0:
+                    rem_h = max(0.0, BROKEN_ACCOUNT_TTL_HOURS - (now_ts - f_ts) / 3600.0)
+                    ttl_note = f" | ⏳ حذف تلقائي خلال {rem_h:.1f}س"
+            except Exception:
+                pass
+            st_text = f"🔴 غير نشط ({esc(a.get('diagnostic_reason') or 'يتطلب تسجيل دخول')}{ttl_note})"
         owner_lbl = a.get("owner_name") or a.get("owner_id") or "المطور الرئيسي"
         owner_badge = f" | المضيف: {esc(owner_lbl)}" if is_dev else ""
         txt += f"{i}. <b>{esc(a['name'])}</b> (<code>{esc(a['id'])}</code>){owner_badge}\n   📧 <code>{esc(a['email'])}</code> | {st_text}\n"
     if not accs:
         txt += "<i>لا توجد حسابات مسجلة في هذا السجل حتى الآن.</i>"
+    else:
+        txt += f"\nℹ️ <i>تنبيه: يتم حذف الحسابات غير النشطة تلقائياً بعد مرور {BROKEN_ACCOUNT_TTL_HOURS} ساعة لبقاء السجل نظيفاً.</i>"
     if len(txt) > 3950:
         txt = txt[:3920] + "\n..."
     return txt, markup
+
+
+def _extract_backup_channel_target(message) -> tuple[int | str | None, str, str]:
+    """استخراج معرف القناة المستهدفة من رسالة معاد توجيهها أو نص (@channel / رابط / ID رقمي)"""
+    origin = getattr(message, "forward_origin", None)
+    fwd_chat = getattr(origin, "chat", None) if origin is not None else None
+    if fwd_chat is None:
+        fwd_chat = getattr(message, "forward_from_chat", None)
+    if fwd_chat is not None and getattr(fwd_chat, "id", None) is not None:
+        title = getattr(fwd_chat, "title", "") or getattr(fwd_chat, "username", "") or str(fwd_chat.id)
+        return fwd_chat.id, title, ""
+
+    raw = (getattr(message, "text", None) or getattr(message, "caption", None) or "").strip()
+    if not raw:
+        return None, "", "أعد توجيه أي منشور من القناة إلى هنا أو أرسل معرف القناة (مثل @MyChannel أو -1001234567890)."
+
+    low = raw.lower()
+    if low.startswith("https://t.me/+") or low.startswith("http://t.me/+") or low.startswith("t.me/+") or "joinchat" in low:
+        return (
+            None,
+            "",
+            "روابط الدعوة الخاصة (+...) لا تكشف المعرف الرقمي للقناة؛ أعد توجيه أي رسالة من القناة إلى هنا أو أرسل معرفها الرقمي (-100...).",
+        )
+
+    cleaned = re.sub(r"^https?://(?:t\.me|telegram\.me)/", "", raw, flags=re.IGNORECASE).split("?")[0].strip("/")
+    if cleaned.lower().startswith("t.me/"):
+        cleaned = cleaned[5:].strip("/")
+    if "/" in cleaned and not cleaned.startswith("-"):
+        cleaned = cleaned.split("/", 1)[0]
+
+    if re.fullmatch(r"-?\d{5,20}", cleaned):
+        ch_num = int(cleaned)
+        return ch_num, str(ch_num), ""
+    if re.fullmatch(r"@?[A-Za-z][A-Za-z0-9_]{3,64}", cleaned):
+        handle = "@" + cleaned.lstrip("@")
+        return handle, handle, ""
+    return None, "", "صيغة القناة غير صحيحة. أرسل @username أو -100... أو أعد توجيه رسالة من القناة مباشرة."
+
+
+def _handle_backup_channel_binding(message, user_id: int) -> None:
+    st = get_user_state(user_id)
+    if not is_super_admin(user_id):
+        st["input_mode"] = None
+        return
+    target_ch, title_hint, err = _extract_backup_channel_target(message)
+    if err or target_ch is None:
+        bot.reply_to(
+            message,
+            f"⚠️ <b>تعذر قراءة القناة:</b> {esc(err)}\n<i>حاول مجدداً أو اضغط إلغاء للعودة.</i>",
+            reply_markup=_prompt_back_markup("menu_backup_vault"),
+        )
+        return
+
+    resolved_id = target_ch
+    resolved_title = title_hint or str(target_ch)
+    try:
+        if hasattr(bot, "get_chat"):
+            chat_obj = bot.get_chat(target_ch)
+            if chat_obj is not None and getattr(chat_obj, "id", None) is not None:
+                resolved_id = chat_obj.id
+                resolved_title = getattr(chat_obj, "title", "") or getattr(chat_obj, "username", "") or str(resolved_id)
+        bot.send_message(
+            resolved_id,
+            "✅ <b>تم ربط هذه القناة بنجاح كخزنة نسخ احتياطي شاملة!</b>\n"
+            "سيتم إرسال النسخ الكاملة هنا تلقائياً حسب التوقيت المجدول وبكامل البيانات والإعدادات.",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        bot.reply_to(
+            message,
+            "⚠️ <b>تعذر النشر في القناة!</b>\n"
+            "تأكد من إضافة البوت كـ <b>مشرف (Admin)</b> داخل القناة مع صلاحية <b>نشر الرسائل</b> ثم أعد إرسال المعرف أو التوجيه.\n"
+            f"<code>{esc(e)}</code>",
+            reply_markup=_prompt_back_markup("menu_backup_vault"),
+        )
+        return
+
+    st["input_mode"] = None
+    save_backup_settings(
+        {"channel_id": resolved_id, "channel_title": str(resolved_title), "enabled": True, "last_error": ""},
+        mark_dirty=True,
+    )
+    first_res = send_backup_to_channel(bot, channel_id=resolved_id, trigger_label="النسخة التأسيسية بعد ربط القناة")
+    record_audit_log(user_id, "المطور", "BACKUP_CHANNEL_LINKED", f"ربط قناة النسخ الاحتياطي: {resolved_title} ({resolved_id})")
+
+    bkp_note = (
+        f"🚀 وتم إرسال أول نسخة احتياطية شاملة للقناة بنجاح (#{first_res.get('backup_number', 1)})."
+        if first_res.get("ok")
+        else f"⚠️ رُبطت القناة ولكن تعذر إرسال أول نسخة تلقائياً: {esc(first_res.get('error', ''))}"
+    )
+    bot.reply_to(
+        message,
+        f"✅ <b>تم ربط قناة النسخ الاحتياطي بنجاح!</b>\n"
+        f"📡 <b>القناة:</b> {esc(resolved_title)} (<code>{esc(resolved_id)}</code>)\n"
+        f"{bkp_note}",
+        reply_markup=_back_home_markup("menu_backup_vault"),
+    )
+
+
+def _render_backup_schedule_view() -> tuple[str, types.InlineKeyboardMarkup]:
+    bkp = load_backup_settings()
+    lines = [
+        "⏱️ <b>جدولة النسخ الاحتياطي التلقائي للقناة</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"🕒 <b>التكرار الحالي:</b> {esc(bkp.get('interval_label', 'كل 1 ساعة'))} (<code>{bkp.get('interval_seconds', 3600)}</code> ثانية)",
+        f"🔄 <b>حالة الجدولة:</b> {'🟢 مفعلة' if bkp.get('enabled') else '🔴 متوقفة'}",
+        f"⚡ <b>نسخ إضافي عند أي تعديل:</b> {'🟢 مفعل' if bkp.get('on_change') else '⚪ معطل'}",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "اختر من الأوقات الجاهزة أو اضغط <b>وقت مخصص</b> لكتابة أي مدة (ثانية / دقيقة / ساعة / يوم / أسبوع / شهر / سنة):",
+    ]
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.row(
+        types.InlineKeyboardButton("⚡ كل 10 ثوانٍ", callback_data="bkp_iv_10"),
+        types.InlineKeyboardButton("⚡ كل 30 ثانية", callback_data="bkp_iv_30"),
+    )
+    markup.row(
+        types.InlineKeyboardButton("⏱️ كل 5 دقائق", callback_data="bkp_iv_300"),
+        types.InlineKeyboardButton("🕐 كل 1 ساعة", callback_data="bkp_iv_3600"),
+    )
+    markup.row(
+        types.InlineKeyboardButton("📅 يومياً (24س)", callback_data="bkp_iv_86400"),
+        types.InlineKeyboardButton("🗓️ أسبوعياً (7ي)", callback_data="bkp_iv_604800"),
+    )
+    markup.row(
+        types.InlineKeyboardButton("🌙 شهرياً (30ي)", callback_data="bkp_iv_2592000"),
+        types.InlineKeyboardButton("🌍 سنوياً (1 سنة)", callback_data="bkp_iv_31536000"),
+    )
+    markup.row(types.InlineKeyboardButton("✏️ إدخال وقت مخصص (ثانية..سنة)", callback_data="bkp_set_interval_custom"))
+    markup.row(types.InlineKeyboardButton("🔙 العودة لخزنة النسخ", callback_data="menu_backup_vault"))
+    return "\n".join(lines), markup
+
+
+def _render_backup_vault_view() -> tuple[str, types.InlineKeyboardMarkup]:
+    st_info = get_persistence_status()
+    bkp = st_info.get("backup_channel") or {}
+    ch_id = bkp.get("channel_id")
+    ch_title = bkp.get("channel_title") or (str(ch_id) if ch_id else "")
+    ch_badge = f"🟢 مرتبطة: <b>{esc(ch_title)}</b> (<code>{esc(ch_id)}</code>)" if ch_id else "🔴 غير مرتبطة بعد"
+
+    en_flag = bool(bkp.get("enabled", True))
+    och_flag = bool(bkp.get("on_change", False))
+    iv_sec = int(bkp.get("interval_seconds") or 3600)
+    last_ts = float(bkp.get("last_channel_backup_ts") or 0.0)
+    if not ch_id:
+        eta_txt = "اربط القناة أولاً"
+    elif not en_flag:
+        eta_txt = "الجدولة متوقفة مؤقتاً"
+    elif last_ts <= 0:
+        eta_txt = "مستحقة الآن"
+    else:
+        rem = int(iv_sec - (time.time() - last_ts))
+        eta_txt = "مستحقة الآن" if rem <= 0 else format_backup_interval(rem).replace("كل ", "بعد ", 1)
+
+    hf_badge = "🟢 مفعّل تلقائياً" if st_info.get("hf_enabled") else "⚪ غير مضبوط (اختياري عبر HF_TOKEN)"
+    has_vol = Path("/data").exists() and os.access("/data", os.W_OK)
+    lines = [
+        "💾 <b>خزنة النسخ الاحتياطي الشاملة والاستعادة الفورية</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"📡 <b>قناة النسخ الاحتياطي:</b> {ch_badge}",
+        f"⏱️ <b>التوقيت المجدول:</b> {esc(bkp.get('interval_label', 'كل 1 ساعة'))} | {'🟢 مفعّل' if en_flag else '🔴 متوقف'} ({esc(eta_txt)})",
+        f"⚡ <b>النسخ الفوري عند التعديل:</b> {'🟢 مفعّل' if och_flag else '⚪ معطل'} | <b>المُرسل للقناة:</b> {bkp.get('channel_backup_count', 0)} نسخة",
+        f"🕒 <b>آخر نسخة/استعادة:</b> {esc(st_info.get('last_backup_iso'))}",
+    ]
+    if bkp.get("last_error"):
+        lines.append(f"⚠️ <b>آخر تنبيه إرسال:</b> <code>{esc(bkp.get('last_error'))}</code>")
+    lines.extend([
+        "━━━━━━━━━━━━━━━━━━━━",
+        "📦 <b>المشمول في كل نسخة (بدون أي استثناء):</b>",
+        f"• 👥 المستخدمون والصلاحيات: <b>{st_info.get('users_count', 0)}</b> | 📱 الحسابات والإيميلات: <b>{st_info.get('accounts_count', 0)}</b> (🟢 {st_info.get('active_accounts', 0)})",
+        f"• 🍪 الجلسات: <b>{st_info.get('sessions_count', 0)}</b> | 💰 القيود المالية والتحويلات: <b>{st_info.get('ledger_count', 0)}</b>",
+        f"• 🎟️ الإحالات والتقديمات: <b>{st_info.get('invites_count', 0)}</b> | 💬 تذاكر الدعم والبيع: <b>{st_info.get('tickets_count', 0)}</b>",
+        f"• 🎛️ حالات الضبط والواجهة والأزرار: <b>{st_info.get('ui_states_count', 0)}</b> | 📜 السجل الأمني: <b>{st_info.get('audit_count', 0)}</b>",
+        f"☁️ <b>مزامنة HF:</b> {hf_badge} | 💾 <b>التخزين:</b> {'/data' if has_vol else 'معزول'}",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "📥 <b>لاسترجاع أي نسخة كما كانت تماماً:</b> أرسل ملف الـ <code>.zip</code> هنا أو أعد توجيهه من القناة وسيعود كل شيء فوراً.",
+    ])
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    if ch_id:
+        markup.row(
+            types.InlineKeyboardButton("📡 تغيير قناة النسخ", callback_data="bkp_set_channel"),
+            types.InlineKeyboardButton("🗑️ فصل القناة", callback_data="bkp_clear_channel"),
+        )
+    else:
+        markup.row(types.InlineKeyboardButton("📡 ربط قناة نسخ احتياطي الآن", callback_data="bkp_set_channel"))
+    markup.row(
+        types.InlineKeyboardButton(f"⏱️ التوقيت: {bkp.get('interval_label', 'كل 1 ساعة')[:20]}", callback_data="menu_bkp_schedule"),
+        types.InlineKeyboardButton("🚀 إرسال للقناة الآن", callback_data="act_backup_channel_now"),
+    )
+    markup.row(
+        types.InlineKeyboardButton(f"🔄 تلقائي بالوقت: {'✅' if en_flag else '❌'}", callback_data="bkp_tog_enabled"),
+        types.InlineKeyboardButton(f"⚡ عند التعديل: {'✅' if och_flag else '❌'}", callback_data="bkp_tog_onchange"),
+    )
+    markup.row(
+        types.InlineKeyboardButton("📦 تصدير نسخة هنا (.zip)", callback_data="act_export_backup"),
+        types.InlineKeyboardButton("📥 استعادة فورية من ملف", callback_data="bkp_restore_help"),
+    )
+    markup.row(
+        types.InlineKeyboardButton("☁️ مزامنة HF الآن", callback_data="act_hf_sync_now"),
+        types.InlineKeyboardButton(f"🧹 تنظيف التالفة > {BROKEN_ACCOUNT_TTL_HOURS}س", callback_data="act_purge_24h"),
+    )
+    markup.row(
+        types.InlineKeyboardButton("🔄 تحديث الحالة", callback_data="menu_backup_vault"),
+        types.InlineKeyboardButton("🔙 اللوحة الرئيسية", callback_data="back_to_main"),
+    )
+    return "\n".join(lines), markup
 
 
 def _render_wallet_view(uid: int) -> tuple[str, types.InlineKeyboardMarkup]:
@@ -1248,6 +1527,8 @@ def _refresh_tracked_inline_view(uid: int) -> None:
         txt, markup = _render_ticket_detail_view(uid, str(entry.get("ticket_id")))
     elif view == "economy" and is_super_admin(uid):
         txt, markup = _render_admin_economy_view()
+    elif view == "backup_vault" and is_super_admin(uid):
+        txt, markup = _render_backup_vault_view()
     else:
         return
 
@@ -1283,7 +1564,7 @@ def _on_state_event(scope: str, target_uid: int, reason: str) -> None:
     for uid in tracked_uids:
         if is_super_admin(uid):
             to_wake.append(uid)
-        elif target_uid == uid or (target_uid == 0 and scope == "economy") or (scope == "accounts" and has_permission(uid, "can_use_accounts")):
+        elif target_uid == uid or (target_uid == 0 and scope in ("economy", "system")) or (scope == "accounts" and has_permission(uid, "can_use_accounts")):
             to_wake.append(uid)
 
     if to_wake:
@@ -1343,6 +1624,16 @@ def cmd_start(message: types.Message):
 
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callbacks(call: types.CallbackQuery):
+    try:
+        return _handle_callbacks_impl(call)
+    finally:
+        try:
+            persist_user_states()
+        except Exception:
+            pass
+
+
+def _handle_callbacks_impl(call: types.CallbackQuery):
     user_id = call.from_user.id
     data = call.data or ""
 
@@ -1374,7 +1665,8 @@ def handle_callbacks(call: types.CallbackQuery):
         allowed_dests = {
             "back_to_main", "menu_wizard_react", "menu_wizard_comment", "menu_cmt_interact",
             "menu_wizard_message", "menu_manage_accs", "menu_wallet", "menu_referral",
-            "menu_support", "menu_admin_economy", "menu_surveillance_radar"
+            "menu_support", "menu_admin_economy", "menu_surveillance_radar", "menu_backup_vault",
+            "menu_bkp_schedule"
         }
         if dest not in allowed_dests:
             dest = "back_to_main"
@@ -1383,7 +1675,7 @@ def handle_callbacks(call: types.CallbackQuery):
         st["temp_acc_data"] = {}
         safe_answer(call.id, "تم الإلغاء والرجوع")
         call.data = dest
-        handle_callbacks(call)
+        _handle_callbacks_impl(call)
         return
 
     # 1. بوابة موافقة / حظر المطور الأكبر (حصرياً لـ SUPER_ADMIN_ID)
@@ -1629,6 +1921,225 @@ def handle_callbacks(call: types.CallbackQuery):
         txt, markup = _render_admin_economy_view()
         _track_view(user_id, call.message.chat.id, call.message.message_id, "economy")
         safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+        return
+
+    elif data == "menu_backup_vault":
+        if not is_super_admin(user_id):
+            record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", "محاولة فتح خزنة النسخ الاحتياطي بدون صلاحية")
+            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+            return
+        txt, markup = _render_backup_vault_view()
+        _track_view(user_id, call.message.chat.id, call.message.message_id, "backup_vault")
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+        return
+
+    elif data == "act_export_backup":
+        if not is_super_admin(user_id):
+            record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", "محاولة تصدير نسخة احتياطية بدون صلاحية")
+            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+            return
+        safe_answer(call.id, "📦 جاري تجهيز حزمة النسخ الاحتياطي...")
+        try:
+            raw_zip = export_backup_zip_bytes(include_sessions=True)
+            st_info = get_persistence_status()
+            bio = io.BytesIO(raw_zip)
+            bio.name = f"fb_operator_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+            bot.send_document(
+                call.message.chat.id,
+                bio,
+                caption=(
+                    f"📦 <b>نسخة احتياطية كاملة (#FB_BACKUP)</b>\n"
+                    f"👥 <b>المستخدمون:</b> {st_info.get('users_count', 0)} | "
+                    f"📌 <b>الحسابات:</b> {st_info.get('accounts_count', 0)} | "
+                    f"🔑 <b>الجلسات:</b> {st_info.get('sessions_count', 0)}\n"
+                    "<i>أعد إرسال هذا الملف هنا في أي وقت لاستعادة كل البيانات فوراً.</i>"
+                )
+            )
+            record_audit_log(user_id, call.from_user.first_name or "", "BACKUP_EXPORTED", f"تصدير نسخة يدوية ({st_info.get('accounts_count', 0)} حساب)")
+        except Exception as e:
+            safe_send(call.message.chat.id, f"❌ تعذر تصدير النسخة الاحتياطية: <code>{esc(e)}</code>")
+        return
+
+    elif data == "act_hf_sync_now":
+        if not is_super_admin(user_id):
+            record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", "محاولة مزامنة HF بدون صلاحية")
+            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+            return
+        res_hf = hf_dataset_sync_upload()
+        ok_hf = bool(res_hf.get("ok"))
+        hf_msg = (
+            f"تم رفع {res_hf.get('bytes', 0)} بايت إلى {res_hf.get('repo', 'HF')}"
+            if ok_hf
+            else str(res_hf.get("error") or res_hf.get("body") or f"HTTP {res_hf.get('status_code', '?')}")
+        )
+        safe_answer(call.id, ("✅ " if ok_hf else "⚠️ ") + hf_msg[:180], show_alert=True)
+        txt, markup = _render_backup_vault_view()
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+        return
+
+    elif data == "act_purge_24h":
+        if not is_super_admin(user_id):
+            record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", "محاولة تنظيف التالفة 24س بدون صلاحية")
+            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+            return
+        cnt_p, purged_ids = purge_expired_broken_accounts(BROKEN_ACCOUNT_TTL_HOURS)
+        if cnt_p > 0:
+            record_audit_log(user_id, call.from_user.first_name or "", "AUTO_PURGE_24H", f"تنظيف {cnt_p} حساب تالف مضى عليه {BROKEN_ACCOUNT_TTL_HOURS}س")
+            safe_answer(call.id, f"🧹 تم حذف {cnt_p} حساب تالف تجاوز {BROKEN_ACCOUNT_TTL_HOURS} ساعة!", show_alert=True)
+        else:
+            safe_answer(call.id, f"✨ لا توجد حسابات تالفة تجاوزت {BROKEN_ACCOUNT_TTL_HOURS} ساعة.", show_alert=True)
+        txt, markup = _render_backup_vault_view()
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+        return
+
+    elif data == "menu_bkp_schedule":
+        if not is_super_admin(user_id):
+            record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", "محاولة فتح جدولة النسخ الاحتياطي بدون صلاحية")
+            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+            return
+        txt, markup = _render_backup_schedule_view()
+        _track_view(user_id, call.message.chat.id, call.message.message_id, "backup_schedule")
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+        return
+
+    elif data == "bkp_set_channel":
+        if not is_super_admin(user_id):
+            record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", "محاولة تغيير قناة النسخ الاحتياطي بدون صلاحية")
+            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+            return
+        st["input_mode"] = "waiting_backup_channel"
+        safe_answer(call.id)
+        safe_send(
+            call.message.chat.id,
+            "📡 <b>ربط قناة النسخ الاحتياطي التلقائي</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "1️⃣ أضف البوت أولاً كـ <b>مشرف (Admin)</b> داخل قناتك بصلاحية نشر الرسائل.\n"
+            "2️⃣ ثم نفّذ إحدى الطرق التالية هنا الآن:\n"
+            "• <b>أعد توجيه (Forward) أي منشور من القناة</b> إلى هذه المحادثة (موصى به للقنوات الخاصة).\n"
+            "• أو أرسل معرف القناة: مثل <code>@MyBackupChannel</code> أو <code>-1001234567890</code>.",
+            reply_markup=_prompt_back_markup("menu_backup_vault"),
+        )
+        return
+
+    elif data == "bkp_clear_channel":
+        if not is_super_admin(user_id):
+            record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", "محاولة فصل قناة النسخ بدون صلاحية")
+            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+            return
+        save_backup_settings({"channel_id": None, "channel_title": "", "last_error": ""}, mark_dirty=True)
+        record_audit_log(user_id, call.from_user.first_name or "", "BACKUP_CHANNEL_CLEARED", "فصل قناة النسخ الاحتياطي")
+        safe_answer(call.id, "🗑️ تم فصل قناة النسخ الاحتياطي.", show_alert=True)
+        txt, markup = _render_backup_vault_view()
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+        return
+
+    elif data == "bkp_tog_enabled":
+        if not is_super_admin(user_id):
+            record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", "محاولة تبديل جدولة النسخ بدون صلاحية")
+            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+            return
+        bkp = load_backup_settings()
+        new_val = not bool(bkp.get("enabled", True))
+        save_backup_settings({"enabled": new_val}, mark_dirty=True)
+        safe_answer(call.id, "✅ تم تفعيل الجدولة التلقائية بالوقت." if new_val else "⏸️ تم إيقاف الجدولة بالوقت.")
+        txt, markup = _render_backup_vault_view()
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+        return
+
+    elif data == "bkp_tog_onchange":
+        if not is_super_admin(user_id):
+            record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", "محاولة تبديل النسخ عند التعديل بدون صلاحية")
+            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+            return
+        bkp = load_backup_settings()
+        new_val = not bool(bkp.get("on_change", False))
+        save_backup_settings({"on_change": new_val}, mark_dirty=True)
+        safe_answer(call.id, "⚡ تفعيل: نسخة تلقائية عند كل تغيير بيانات." if new_val else "⚪ تم إيقاف النسخ عند التعديل.")
+        txt, markup = _render_backup_vault_view()
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+        return
+
+    elif data == "bkp_set_interval_custom":
+        if not is_super_admin(user_id):
+            record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", "محاولة تعديل توقيت النسخ بدون صلاحية")
+            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+            return
+        st["input_mode"] = "waiting_backup_interval"
+        safe_answer(call.id)
+        safe_send(
+            call.message.chat.id,
+            "⏱️ <b>أرسل التوقيت المطلوب للنسخ الاحتياطي التلقائي:</b>\n"
+            "• بالثواني (الحد الأدنى 10 ثوانٍ): <code>15 ثانية</code> أو <code>45s</code>\n"
+            "• بالدقائق: <code>5 دقائق</code> أو <code>30m</code>\n"
+            "• بالساعات: <code>2 ساعة</code> أو <code>6h</code>\n"
+            "• بالأيام / الأسابيع / الشهور: <code>1 يوم</code> أو <code>1w</code> أو <code>1 شهر</code>\n"
+            "• بالسنوات: <code>1 سنة</code> أو <code>1y</code>\n"
+            "• أوقات مركبة: <code>1 ساعة و 30 دقيقة</code>",
+            reply_markup=_prompt_back_markup("menu_bkp_schedule"),
+        )
+        return
+
+    elif data in ("bkp_iv_10", "bkp_iv_30", "bkp_iv_300", "bkp_iv_3600", "bkp_iv_86400", "bkp_iv_604800", "bkp_iv_2592000", "bkp_iv_31536000") or data.startswith("bkp_iv_"):
+        if not is_super_admin(user_id):
+            record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", f"محاولة ضبط جدولة {data} بدون صلاحية")
+            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+            return
+        try:
+            sec_val = int(data.replace("bkp_iv_", "", 1))
+        except ValueError:
+            safe_answer(call.id, "⚠️ قيمة توقيت غير صالحة.", show_alert=True)
+            return
+        if sec_val < MIN_BACKUP_INTERVAL_SEC or sec_val > MAX_BACKUP_INTERVAL_SEC:
+            safe_answer(call.id, f"⚠️ المدة المسموحة من {MIN_BACKUP_INTERVAL_SEC} ثوانٍ حتى 10 سنوات.", show_alert=True)
+            return
+        saved_bkp = save_backup_settings({"interval_seconds": sec_val, "enabled": True}, mark_dirty=True)
+        record_audit_log(user_id, call.from_user.first_name or "", "BACKUP_SCHEDULE_UPDATED", f"تعيين جدولة النسخ الاحتياطي إلى: {saved_bkp['interval_label']} ({sec_val}s)")
+        safe_answer(call.id, f"✅ تم الضبط: {saved_bkp['interval_label']}", show_alert=True)
+        txt, markup = _render_backup_schedule_view()
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+        return
+
+    elif data == "act_backup_channel_now":
+        if not is_super_admin(user_id):
+            record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", "محاولة إرسال نسخة للقناة بدون صلاحية")
+            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+            return
+        safe_answer(call.id, "🚀 جاري تجهيز وإرسال النسخة الشاملة للقناة...")
+        res_ch = send_backup_to_channel(bot, trigger_label="إرسال يدوي فوري")
+        if res_ch.get("ok"):
+            record_audit_log(user_id, call.from_user.first_name or "", "BACKUP_CHANNEL_SENT", f"إرسال نسخة #{res_ch.get('backup_number')} للقناة")
+            safe_send(
+                call.message.chat.id,
+                f"✅ <b>تم إرسال النسخة الشاملة #{res_ch.get('backup_number')} إلى القناة بنجاح!</b>\n"
+                f"📦 الحجم: <code>{res_ch.get('size_bytes', 0):,}</code> بايت | 🕒 <code>{esc(res_ch.get('timestamp'))}</code>",
+                reply_markup=_back_home_markup("menu_backup_vault"),
+            )
+        else:
+            safe_send(
+                call.message.chat.id,
+                f"⚠️ <b>تعذر إرسال النسخة للقناة:</b> {esc(res_ch.get('error', 'خطأ غير معروف'))}",
+                reply_markup=_back_home_markup("menu_backup_vault"),
+            )
+        txt, markup = _render_backup_vault_view()
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+        return
+
+    elif data == "bkp_restore_help":
+        if not is_super_admin(user_id):
+            record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", "محاولة فتح الاستعادة الفورية بدون صلاحية")
+            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+            return
+        st["input_mode"] = "waiting_restore_zip"
+        safe_answer(call.id)
+        safe_send(
+            call.message.chat.id,
+            "📥 <b>الاستعادة الفورية الشاملة من أي نسخة احتياطية</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "• ارفع ملف النسخة (<code>.zip</code>) هنا مباشرة أو <b>أعد توجيهه من قناة النسخ الاحتياطي</b>.\n"
+            "• سيتم استرجاع كل شيء حرفياً كما كان لحظة التقاط النسخة في ثانية واحدة:\n"
+            "  الحسابات والإيميلات، الجلسات، المستخدمين وصلاحياتهم، الأرصدة والتحويلات، الدعوات والتقديمات، التذاكر، وإعدادات اللوحة والأزرار والضبط.",
+            reply_markup=_prompt_back_markup("menu_backup_vault"),
+        )
         return
 
     elif data.startswith("eco_tog_"):
@@ -1885,7 +2396,8 @@ def handle_callbacks(call: types.CallbackQuery):
             st["react_acc_count"] = int(data.replace("set_react_acc_", ""))
         except ValueError:
             return
-        safe_answer(call.id, f"عدد حسابات التفاعل: {'الكل' if st['react_acc_count'] == 0 else st['react_acc_count']}")
+        st["like"] = True
+        safe_answer(call.id, f"تم التفعيل | عدد حسابات التفاعل: {'الكل' if st['react_acc_count'] == 0 else st['react_acc_count']}")
         call.data = "menu_wizard_react"
         handle_callbacks(call)
 
@@ -1913,7 +2425,8 @@ def handle_callbacks(call: types.CallbackQuery):
                 st["react_post_url"] = ""
             except ValueError:
                 return
-            safe_answer(call.id, f"تم تحديد المنشور رقم {val}")
+            st["like"] = True
+            safe_answer(call.id, f"تم تحديد وتفعيل التفاعل على المنشور رقم {val}")
             call.data = "menu_wizard_react"
             handle_callbacks(call)
 
@@ -1936,6 +2449,13 @@ def handle_callbacks(call: types.CallbackQuery):
         safe_answer(call.id, f"التفاعل: {'مفعل ✅' if st['like'] else 'معطل ❌'}")
         call.data = "menu_wizard_react"
         handle_callbacks(call)
+
+    elif data == "toggle_react_main":
+        if not require_perm_or_deny(call, "can_react", "⛔ صلاحية التفاعلات غير مفعلة لحسابك."):
+            return
+        st["like"] = not st["like"]
+        safe_edit_reply_markup(call.message.chat.id, call.message.message_id, get_main_dashboard_markup(user_id))
+        safe_answer(call.id, f"التفاعل: {'مفعل ✅' if st['like'] else 'معطل ❌'}")
 
     # B) التعليقات (can_comment)
     elif data == "menu_wizard_comment":
@@ -2014,6 +2534,8 @@ def handle_callbacks(call: types.CallbackQuery):
                 st["comment_post_url"] = ""
             except ValueError:
                 return
+            if (st.get("comment_text") or "").strip():
+                st["comment"] = True
             safe_answer(call.id, f"تم تحديد المنشور رقم {val}")
             call.data = "menu_wizard_comment"
             handle_callbacks(call)
@@ -2026,9 +2548,27 @@ def handle_callbacks(call: types.CallbackQuery):
         except ValueError:
             return
         st["comment_acc_count"] = val
+        if (st.get("comment_text") or "").strip():
+            st["comment"] = True
         safe_answer(call.id, f"عدد الحسابات: {'الكل' if val == 0 else val}")
         call.data = "menu_wizard_comment"
         handle_callbacks(call)
+
+    elif data == "toggle_comment_main":
+        if not require_perm_or_deny(call, "can_comment", "⛔ صلاحية التعليقات غير مفعلة لحسابك."):
+            return
+        if not st["comment"] and not (st.get("comment_text") or "").strip():
+            st["input_mode"] = "waiting_comment_text"
+            safe_answer(call.id, "أرسل نص التعليق أولاً لتفعيله")
+            safe_send(
+                call.message.chat.id,
+                "💬 <b>أرسل الآن نص التعليق الجديد الذي ترغب بنشره:</b>",
+                reply_markup=_prompt_back_markup("back_to_main")
+            )
+            return
+        st["comment"] = not st["comment"]
+        safe_edit_reply_markup(call.message.chat.id, call.message.message_id, get_main_dashboard_markup(user_id))
+        safe_answer(call.id, f"التعليق: {'مفعل ✅' if st['comment'] else 'معطل ❌'}")
 
     elif data == "toggle_comment_active":
         if not require_perm_or_deny(call, "can_comment", "⛔ صلاحية التعليقات غير مفعلة لحسابك."):
@@ -2117,6 +2657,22 @@ def handle_callbacks(call: types.CallbackQuery):
         safe_answer(call.id, f"الرسائل الخاصة: {'مفعل ✅' if st['message'] else 'معطل ❌'}")
         call.data = "menu_wizard_message"
         handle_callbacks(call)
+
+    elif data == "toggle_msg_main":
+        if not require_perm_or_deny(call, "can_message", "⛔ صلاحية الرسائل الخاصة غير مفعلة لحسابك."):
+            return
+        if not st["message"] and not (st.get("message_text") or "").strip():
+            st["input_mode"] = "waiting_msg_text"
+            safe_answer(call.id, "أرسل نص الرسالة الخاصة أولاً لتفعيلها")
+            safe_send(
+                call.message.chat.id,
+                "✍️ <b>اكتب الآن نص الرسالة الخاصة التي تريد إرسالها عبر ماسنجر:</b>",
+                reply_markup=_prompt_back_markup("back_to_main")
+            )
+            return
+        st["message"] = not st["message"]
+        safe_edit_reply_markup(call.message.chat.id, call.message.message_id, get_main_dashboard_markup(user_id))
+        safe_answer(call.id, f"الرسائل الخاصة: {'مفعل ✅' if st['message'] else 'معطل ❌'}")
 
     elif data == "menu_msg_config":
         if not require_perm_or_deny(call, "can_message", "⛔ صلاحية الرسائل الخاصة غير مفعلة لحسابك."):
@@ -2234,12 +2790,20 @@ def handle_callbacks(call: types.CallbackQuery):
         call.data = "menu_cmt_interact"
         handle_callbacks(call)
 
+    elif data == "toggle_cmt_int_main":
+        if not require_perm_or_deny(call, "can_interact_comments", "⛔ صلاحية التفاعل مع التعليقات غير مفعلة."):
+            return
+        st["interact_cmt"] = not st["interact_cmt"]
+        safe_edit_reply_markup(call.message.chat.id, call.message.message_id, get_main_dashboard_markup(user_id))
+        safe_answer(call.id, f"الرد على التعليق: {'مفعل ✅' if st['interact_cmt'] else 'معطل ❌'}")
+
     elif data == "cycle_cmt_mode":
         if not require_perm_or_deny(call, "can_interact_comments", "⛔ صلاحية التفاعل مع التعليقات غير مفعلة."):
             return
         modes = ["first", "author", "keyword", "index"]
         curr_idx = modes.index(st["cmt_target_mode"]) if st["cmt_target_mode"] in modes else 0
         st["cmt_target_mode"] = modes[(curr_idx + 1) % len(modes)]
+        st["interact_cmt"] = True
         call.data = "menu_cmt_interact"
         handle_callbacks(call)
 
@@ -2249,6 +2813,7 @@ def handle_callbacks(call: types.CallbackQuery):
         reactions = ["like", "love", "care", "haha", "wow", "sad", "angry", "none"]
         curr_idx = reactions.index(st["cmt_reaction"]) if st["cmt_reaction"] in reactions else 0
         st["cmt_reaction"] = reactions[(curr_idx + 1) % len(reactions)]
+        st["interact_cmt"] = True
         call.data = "menu_cmt_interact"
         handle_callbacks(call)
 
@@ -2377,6 +2942,20 @@ def handle_callbacks(call: types.CallbackQuery):
             reply_markup=_prompt_back_markup("menu_manage_accs")
         )
 
+    elif data == "act_import_cookies":
+        if not require_perm_or_deny(call, "can_add_accounts", "⛔ ليس لديك صلاحية إضافة حسابات للبوت."):
+            return
+        st["input_mode"] = "import_ck_name"
+        st["temp_acc_data"] = {}
+        safe_send(
+            call.message.chat.id,
+            "🍪 <b>استيراد حساب عبر جلسة/كوكيز متصفح جاهزة</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "💡 هذه الطريقة تتجنب تحدي الروبوتات (Arkose CAPTCHA) تماماً لأنك تسجّل دخولك من جهازك ثم تستورد الجلسة مباشرة.\n\n"
+            "1️⃣ أولاً: أرسل الآن <b>اسماً أو لقباً للحساب</b> (مثال: حسابي الشخصي 1):",
+            reply_markup=_prompt_back_markup("menu_manage_accs")
+        )
+
     elif data == "act_check_sessions":
         if not (is_super_admin(user_id) or has_permission(user_id, "can_add_accounts") or has_permission(user_id, "can_use_accounts")):
             safe_answer(call.id, "⛔ ليس لديك صلاحية فحص الجلسات.", show_alert=True)
@@ -2472,6 +3051,8 @@ def check_all_sessions_worker(chat_id: int, requester_id: int):
                         ok_live, live_reason = check_facebook_page_access(page)
                         is_logged, fb_id = check_facebook_login_cookies(ctx)
                         is_active = bool(is_logged and ok_live)
+                        if is_active:
+                            save_account_storage_state(ctx, a["profile_dir"])
                     finally:
                         try:
                             ctx.close()
@@ -2520,8 +3101,26 @@ def check_all_sessions_worker(chat_id: int, requester_id: int):
 
 # ----------------- معالجة مدخلات النصوص التفاعلية -----------------
 
+@bot.message_handler(
+    content_types=['photo', 'video', 'audio', 'voice', 'animation', 'sticker'],
+    func=lambda msg: bool(msg.from_user and is_super_admin(msg.from_user.id) and get_user_state(msg.from_user.id).get("input_mode") == "waiting_backup_channel")
+)
+def handle_forwarded_channel_media(message: types.Message):
+    _handle_backup_channel_binding(message, message.from_user.id)
+
+
 @bot.message_handler(func=lambda msg: True)
 def handle_text_inputs(message: types.Message):
+    try:
+        return _handle_text_inputs_impl(message)
+    finally:
+        try:
+            persist_user_states()
+        except Exception:
+            pass
+
+
+def _handle_text_inputs_impl(message: types.Message):
     user_id = message.from_user.id
     full_name = f"{message.from_user.first_name or ''} {message.from_user.last_name or ''}".strip() or f"مستخدم_{user_id}"
     username = message.from_user.username or ""
@@ -2573,7 +3172,46 @@ def handle_text_inputs(message: types.Message):
     if not check_user_access_gate(message.from_user, message.chat.id):
         return
 
-    if mode == "waiting_url":
+    if mode == "waiting_backup_channel":
+        _handle_backup_channel_binding(message, user_id)
+        return
+
+    elif mode == "waiting_backup_interval":
+        if not is_super_admin(user_id):
+            st["input_mode"] = None
+            return
+        parsed_iv = parse_backup_interval(text)
+        if not parsed_iv.get("ok"):
+            bot.reply_to(
+                message,
+                f"⚠️ {parsed_iv.get('error', 'صيغة غير صالحة')}",
+                reply_markup=_prompt_back_markup("menu_bkp_schedule"),
+            )
+            return
+        sec_val = int(parsed_iv["seconds"])
+        saved_bkp = save_backup_settings({"interval_seconds": sec_val, "enabled": True}, mark_dirty=True)
+        st["input_mode"] = None
+        record_audit_log(user_id, full_name, "BACKUP_SCHEDULE_UPDATED", f"ضبط جدولة النسخ إلى {saved_bkp['interval_label']} ({sec_val}s)")
+        bot.reply_to(
+            message,
+            f"✅ <b>تم ضبط جدولة النسخ الاحتياطي بنجاح!</b>\n"
+            f"⏱️ <b>التوقيت المعتمد:</b> {esc(saved_bkp['interval_label'])} (<code>{sec_val}</code> ثانية)",
+            reply_markup=_back_home_markup("menu_backup_vault"),
+        )
+        return
+
+    elif mode == "waiting_restore_zip":
+        if not is_super_admin(user_id):
+            st["input_mode"] = None
+            return
+        bot.reply_to(
+            message,
+            "📥 أرسل ملف النسخة الاحتياطية (<code>.zip</code>) كمستند (File/Document) أو أعد توجيهه مباشرة من قناة النسخ الاحتياطي.",
+            reply_markup=_prompt_back_markup("menu_backup_vault"),
+        )
+        return
+
+    elif mode == "waiting_url":
         if not user_has_any_action_perm(user_id):
             st["input_mode"] = None
             return
@@ -2609,8 +3247,10 @@ def handle_text_inputs(message: types.Message):
         if text.isdigit() and int(text) > 0:
             st["comment_post_index"] = int(text)
             st["comment_post_url"] = ""
+            if (st.get("comment_text") or "").strip():
+                st["comment"] = True
             st["input_mode"] = None
-            bot.reply_to(message, f"✅ تم تحديد التعليق على المنشور رقم: <b>{text}</b>")
+            bot.reply_to(message, f"✅ تم تحديد وتفعيل التعليق على المنشور رقم: <b>{text}</b>")
             cmd_start(message)
         else:
             bot.reply_to(
@@ -2624,8 +3264,10 @@ def handle_text_inputs(message: types.Message):
             st["input_mode"] = None
             return
         st["comment_post_url"] = text
+        if (st.get("comment_text") or "").strip():
+            st["comment"] = True
         st["input_mode"] = None
-        bot.reply_to(message, f"✅ تم حفظ رابط المنشور المباشر للتعليق:\n<code>{esc(text)}</code>")
+        bot.reply_to(message, f"✅ تم حفظ وتفعيل رابط المنشور المباشر للتعليق:\n<code>{esc(text)}</code>")
         cmd_start(message)
 
     elif mode == "waiting_react_post_num":
@@ -2635,8 +3277,9 @@ def handle_text_inputs(message: types.Message):
         if text.isdigit() and int(text) > 0:
             st["react_post_index"] = int(text)
             st["react_post_url"] = ""
+            st["like"] = True
             st["input_mode"] = None
-            bot.reply_to(message, f"✅ تم تحديد التفاعل مع المنشور رقم: <b>{text}</b>")
+            bot.reply_to(message, f"✅ تم تحديد وتفعيل التفاعل مع المنشور رقم: <b>{text}</b>")
             cmd_start(message)
         else:
             bot.reply_to(
@@ -2650,8 +3293,9 @@ def handle_text_inputs(message: types.Message):
             st["input_mode"] = None
             return
         st["react_post_url"] = text
+        st["like"] = True
         st["input_mode"] = None
-        bot.reply_to(message, f"✅ تم حفظ رابط المنشور المباشر للتفاعل:\n<code>{esc(text)}</code>")
+        bot.reply_to(message, f"✅ تم حفظ وتفعيل رابط المنشور المباشر للتفاعل:\n<code>{esc(text)}</code>")
         cmd_start(message)
 
     elif mode == "waiting_cmt_val":
@@ -2659,8 +3303,9 @@ def handle_text_inputs(message: types.Message):
             st["input_mode"] = None
             return
         st["cmt_target_val"] = text
+        st["interact_cmt"] = True
         st["input_mode"] = None
-        bot.reply_to(message, f"✅ تم حفظ هدف التعليق: <b>{esc(text)}</b>")
+        bot.reply_to(message, f"✅ تم حفظ وتفعيل هدف التعليق: <b>{esc(text)}</b>")
         cmd_start(message)
 
     elif mode == "waiting_cmt_reply":
@@ -2668,8 +3313,9 @@ def handle_text_inputs(message: types.Message):
             st["input_mode"] = None
             return
         st["cmt_reply"] = text
+        st["interact_cmt"] = True
         st["input_mode"] = None
-        bot.reply_to(message, f"✅ تم حفظ نص الرد: <b>{esc(text)}</b>")
+        bot.reply_to(message, f"✅ تم حفظ وتفعيل نص الرد: <b>{esc(text)}</b>")
         cmd_start(message)
 
     elif mode in ("waiting_sell_msg", "waiting_sup_msg"):
@@ -2870,11 +3516,161 @@ def handle_text_inputs(message: types.Message):
 
         record_audit_log(user_id, owner_name, "ACCOUNT_SUBMITTED", f"إرسال حساب جديد للفحص: {name} ({email}) [{acc['id']}]")
         wait_msg = bot.reply_to(message, f"⏳ <b>جاري فحص وتسجيل دخول الحساب '{esc(name)}' في المتصفح الخلفي...</b>")
+        wait_msg_id = getattr(wait_msg, "message_id", None)
         threading.Thread(
             target=async_login_account_worker,
-            args=(message.chat.id, wait_msg.message_id, acc, user_id, owner_name, owner_username),
+            args=(message.chat.id, wait_msg_id, acc, user_id, owner_name, owner_username),
             daemon=True
         ).start()
+
+    elif mode == "import_ck_name":
+        if not (is_super_admin(user_id) or has_permission(user_id, "can_add_accounts")):
+            st["input_mode"] = None
+            bot.reply_to(message, "⛔ تم سحب صلاحية إضافة الحسابات من حسابك.")
+            return
+        st["temp_acc_data"] = {"name": text[:80] or "حساب بكوكيز"}
+        st["input_mode"] = "waiting_acc_cookies"
+        bot.reply_to(
+            message,
+            "2️⃣ <b>أرسل الآن كوكيز/جلسة الحساب:</b>\n"
+            "• لصق ملف JSON من إضافة المتصفح (Cookie-Editor) أو <code>storage_state.json</code>،\n"
+            "• أو إرسال نص الكوكيز بصيغة: <code>c_user=123456; xs=abc...;</code>،\n"
+            "• أو إرفاق ملف <code>.json</code> / <code>.txt</code> هنا مباشرة.",
+            reply_markup=_prompt_back_markup("menu_manage_accs")
+        )
+
+    elif mode == "waiting_acc_cookies":
+        _process_cookie_import_submission(message, text)
+
+
+def _process_cookie_import_submission(message: types.Message, raw_payload: str) -> None:
+    """معالج مشترك لاستيراد جلسة كوكيز الحساب عبر النص أو ملف JSON/TXT بدون تكرار"""
+    user_id = message.from_user.id
+    st = get_user_state(user_id)
+    if not (is_super_admin(user_id) or has_permission(user_id, "can_add_accounts")):
+        st["input_mode"] = None
+        st["temp_acc_data"] = {}
+        bot.reply_to(message, "⛔ ليس لديك صلاحية إضافة حسابات.")
+        return
+
+    cookies, c_user_val = parse_cookies_payload(raw_payload)
+    if not cookies or not c_user_val:
+        bot.reply_to(
+            message,
+            "⚠️ <b>تعذر قبول الجلسة:</b> صيغة الكوكيز غير مكتملة.\n"
+            "تأكد من احتواء الكوكيز على <code>c_user</code> و <code>xs</code> (بصيغة JSON أو <code>c_user=...; xs=...;</code>) وأعد الإرسال.",
+            reply_markup=_prompt_back_markup("menu_manage_accs")
+        )
+        return
+
+    name = (st.get("temp_acc_data") or {}).get("name") or f"حساب {c_user_val[-6:]}"
+    st["input_mode"] = None
+    st["temp_acc_data"] = {}
+
+    owner_name = f"{message.from_user.first_name or ''} {message.from_user.last_name or ''}".strip() or str(user_id)
+    owner_username = message.from_user.username or ""
+    email_tag = f"fb_{c_user_val}"
+
+    acc = add_account(name, email_tag, "[SESSION_COOKIES]", owner_id=user_id, owner_name=owner_name, fb_id=c_user_val)
+    if "error" in acc:
+        record_audit_log(user_id, owner_name, "DUPLICATE_ATTEMPT", f"محاولة استيراد جلسة لحساب مكرر FB={c_user_val} (يطابق {acc.get('existing_id')})")
+        if not is_super_admin(user_id):
+            safe_send(
+                SUPER_ADMIN_ID,
+                "⚠️ <b>رادار المطور | محاولة تكرار حساب عبر استيراد كوكيز تم صدها</b>\n"
+                f"👤 <b>المستخدم:</b> {esc(owner_name)} (<code>{user_id}</code>)\n"
+                f"🆔 <b>FB ID:</b> <code>{esc(c_user_val)}</code>\n"
+                f"📌 <b>مسجل مسبقاً كـ:</b> {esc(acc.get('existing_name'))} (<code>{esc(acc.get('existing_id'))}</code>)"
+            )
+        bot.reply_to(
+            message,
+            f"⛔ <b>تنبيه:</b> هذا الحساب (<code>{esc(c_user_val)}</code>) مسجل مسبقاً باسم '{esc(acc.get('existing_name'))}' ({esc(acc.get('existing_id'))}).\nيمنع تكرار الحسابات نهائياً!"
+        )
+        cmd_start(message)
+        return
+
+    save_account_cookies_session(acc["id"], cookies)
+    record_audit_log(user_id, owner_name, "ACCOUNT_SUBMITTED", f"استيراد جلسة كوكيز لحساب: {name} [FB={c_user_val}] [{acc['id']}]")
+    wait_msg = bot.reply_to(message, f"⏳ <b>تم حفظ الجلسة! جاري التحقق من صلاحيتها مباشرة لـ '{esc(name)}'...</b>")
+    wait_msg_id = getattr(wait_msg, "message_id", None)
+    threading.Thread(
+        target=async_login_account_worker,
+        args=(message.chat.id, wait_msg_id, acc, user_id, owner_name, owner_username),
+        daemon=True
+    ).start()
+
+
+@bot.message_handler(content_types=['document'])
+def handle_document_uploads(message: types.Message):
+    """استقبال ملفات النسخ الاحتياطي (.zip) للمطور فقط، وملفات الجلسات (.json/.txt) لمن يملك صلاحية الإضافة"""
+    user_id = message.from_user.id
+    full_name = f"{message.from_user.first_name or ''} {message.from_user.last_name or ''}".strip() or f"مستخدم_{user_id}"
+    username = message.from_user.username or ""
+    register_or_update_user(user_id, full_name, username)
+
+    doc = getattr(message, "document", None)
+    if not doc:
+        return
+    st_pre = get_user_state(user_id)
+    if is_super_admin(user_id) and st_pre.get("input_mode") == "waiting_backup_channel":
+        if getattr(message, "forward_origin", None) is not None or getattr(message, "forward_from_chat", None) is not None:
+            _handle_backup_channel_binding(message, user_id)
+            return
+
+    fname = (getattr(doc, "file_name", "") or "").lower()
+    fsize = int(getattr(doc, "file_size", 0) or 0)
+
+    if fname.endswith(".zip"):
+        if not is_super_admin(user_id):
+            record_audit_log(user_id, full_name, "SECURITY_BLOCK", f"محاولة استعادة ملف احتياطي غير مصرحة: {fname}")
+            bot.reply_to(message, "⛔ استعادة النسخ الاحتياطية (.zip) متاحة للمطور الرئيسي فقط.")
+            return
+        if fsize > 25 * 1024 * 1024:
+            bot.reply_to(message, "⚠️ حجم ملف النسخة الاحتياطية يتجاوز الحد المسموح (25MB).")
+            return
+        try:
+            finfo = bot.get_file(doc.file_id)
+            raw_bytes = bot.download_file(finfo.file_path)
+            res = restore_backup_zip_bytes(raw_bytes)
+            if res.get("ok"):
+                get_user_state(user_id)["input_mode"] = None
+                try:
+                    update_menu_button_for_user(bot, user_id, is_allowed=True)
+                except Exception:
+                    pass
+                record_audit_log(user_id, full_name, "BACKUP_RESTORED", f"استعادة نسخة احتياطية: users={res.get('users_count', 0)}, accs={res.get('accounts_count', 0)}, sessions={res.get('sessions_restored', 0)}")
+                bot.reply_to(
+                    message,
+                    "✅ <b>تمت استعادة النسخة الاحتياطية بالكامل كما كانت تماماً!</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    f"👥 <b>المستخدمون والصلاحيات:</b> {res.get('users_count', 0)}\n"
+                    f"📱 <b>الحسابات والإيميلات:</b> {res.get('accounts_count', 0)}\n"
+                    f"🔑 <b>الجلسات المحفوظة:</b> {res.get('sessions_restored', 0)}\n"
+                    f"🎛️ <b>إعدادات اللوحة والأزرار الظاهرية/الداخلية:</b> {'✅ استعيدت' if res.get('ui_states_restored') else 'افتراضي'}\n"
+                    f"📡 <b>قناة النسخ والجدولة:</b> {'✅ استعيدت' if res.get('backup_settings_restored') else 'كما هي'}\n"
+                    f"📄 <b>إجمالي ملفات البيانات المستعادة:</b> {len(res.get('restored_files', []))}"
+                )
+                cmd_start(message)
+            else:
+                bot.reply_to(message, f"⚠️ <b>تعذر استعادة النسخة الاحتياطية:</b> {esc(res.get('error', 'خطأ غير معروف'))}")
+        except Exception as e:
+            bot.reply_to(message, f"❌ خطأ أثناء معالجة ملف النسخة الاحتياطية: <code>{esc(e)}</code>")
+        return
+
+    st = get_user_state(user_id)
+    if st.get("input_mode") == "waiting_acc_cookies":
+        if not check_user_access_gate(message.from_user, message.chat.id):
+            return
+        if fsize > 1024 * 1024:
+            bot.reply_to(message, "⚠️ ملف الكوكيز كبير جداً (الحد الأقصى 1MB).", reply_markup=_prompt_back_markup("menu_manage_accs"))
+            return
+        try:
+            finfo = bot.get_file(doc.file_id)
+            raw_bytes = bot.download_file(finfo.file_path)
+            _process_cookie_import_submission(message, raw_bytes.decode("utf-8", errors="ignore"))
+        except Exception as e:
+            bot.reply_to(message, f"❌ تعذر قراءة ملف الجلسة: <code>{esc(e)}</code>", reply_markup=_prompt_back_markup("menu_manage_accs"))
+        return
 
 
 def _notify_developer_account_result(
@@ -2909,6 +3705,8 @@ def _notify_developer_account_result(
     )
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("🛰️ فتح بطاقة المستخدم في الرادار", callback_data=f"surv_user_{owner_id}"))
+    if not is_active:
+        markup.add(types.InlineKeyboardButton("🗑️ حذف هذا الحساب التالف فوراً", callback_data=f"del_acc_{acc['id']}"))
     safe_send(SUPER_ADMIN_ID, alert_txt, reply_markup=markup)
 
     if shot_path and os.path.exists(shot_path):
@@ -2945,7 +3743,10 @@ def async_login_account_worker(
                 ctx = launch_account_browser(p, acc["profile_dir"], visible=False)
                 try:
                     page = ctx.pages[0] if ctx.pages else ctx.new_page()
-                    logged = auto_login_facebook(ctx, page, acc["email"], acc["password"], max_wait=45)
+                    is_cookie_mode = acc.get("password") == "[SESSION_COOKIES]"
+                    login_email = "" if is_cookie_mode else acc.get("email", "")
+                    login_pass = "" if is_cookie_mode else acc.get("password", "")
+                    logged = auto_login_facebook(ctx, page, login_email, login_pass, max_wait=45)
                     _, fb_id = check_facebook_login_cookies(ctx)
 
                     try:
@@ -2955,10 +3756,13 @@ def async_login_account_worker(
                         pass
 
                     if not logged:
+                        ctx_err = get_login_error(ctx)
                         page_content = (page.content() or "").lower()
                         page_url = (page.url or "").lower()
-                        if "arkose" in page_content or "matchkey" in page_content or "captcha" in page_url:
-                            diag_reason = "لغز أمني تفاعلي Arkose Labs CAPTCHA"
+                        if ctx_err and any(k in ctx_err for k in ("Arkose", "CAPTCHA", "Checkpoint", "غير صحيحين", "معطل", "مقيد")):
+                            diag_reason = ctx_err
+                        elif "arkose" in page_content or "matchkey" in page_content or "أكمل تحدي" in page_content or "captcha" in page_url:
+                            diag_reason = "لغز تحقق من الإنسان Arkose Labs CAPTCHA — يتطلب استيراد جلسة صالحة من متصفحك"
                         elif "checkpoint" in page_url or "two_step_verification" in page_url or "approval" in page_url:
                             diag_reason = "يطلب رمز أمان 2FA أو تأكيد هوية (Checkpoint)"
                         elif "suspended" in page_url or "disabled" in page_url or "موقوف" in page_content:
@@ -2966,9 +3770,11 @@ def async_login_account_worker(
                         elif "incorrect" in page_content or "غير صحيحة" in page_content or "wrong credentials" in page_content:
                             diag_reason = "البريد الإلكتروني أو كلمة المرور غير صحيحة"
                         else:
-                            diag_reason = "تعذر إكمال الجلسة تلقائياً (انظر لقطة الشاشة)"
+                            diag_reason = ctx_err or "تعذر إكمال الجلسة تلقائياً (انظر لقطة الشاشة)"
                 finally:
                     try:
+                        if logged:
+                            save_account_storage_state(ctx, acc["profile_dir"])
                         ctx.close()
                     except Exception:
                         pass
@@ -3020,11 +3826,21 @@ def async_login_account_worker(
                 owner_id, owner_name, "ACCOUNT_INACTIVE",
                 f"حساب غير نشط/فاشل: {acc['name']} ({acc['email']}) [{acc['id']}] | السبب: {diag_reason}"
             )
+            fail_markup = _back_home_markup("menu_manage_accs")
+            can_del = is_super_admin(owner_id) or has_permission(owner_id, "can_delete_accounts")
+            can_add = is_super_admin(owner_id) or has_permission(owner_id, "can_add_accounts")
+            if can_del:
+                fail_markup.row(types.InlineKeyboardButton("🗑️ حذف الحساب التالف الآن", callback_data=f"del_acc_{acc['id']}"))
+            if can_add:
+                fail_markup.row(types.InlineKeyboardButton("🍪 استيراد جلسة/كوكيز من متصفحك", callback_data="act_import_cookies"))
             safe_edit_message(
                 f"⚠️ <b>تم حفظ بيانات الحساب '<code>{esc(acc['email'])}</code>' ولكن لم تكتمل الجلسة تلقائياً.</b>\n"
-                f"🔍 <b>السبب المشخص:</b> {esc(diag_reason)}",
+                f"🔍 <b>السبب المشخص:</b> {esc(diag_reason)}\n\n"
+                f"💡 <i>فيسبوك يحجب أحياناً تسجيل الدخول من السيرفرات السحابية بلُغز أمني (CAPTCHA). "
+                f"الحل المضمون: سجل دخولك من متصفحك واستورد الجلسة عبر (🍪 استيراد جلسة/كوكيز).\n"
+                f"⏳ يُحذف الحساب التالف تلقائياً بعد {BROKEN_ACCOUNT_TTL_HOURS} ساعة إن لم يتفعّل.</i>",
                 chat_id, msg_id,
-                reply_markup=_back_home_markup("menu_manage_accs")
+                reply_markup=fail_markup
             )
             if has_shot:
                 try:
@@ -3125,6 +3941,7 @@ def execute_mission_worker(chat_id: int, user_id: int):
         total_accounts = len(target_accounts)
         target_url = st["target_url"]
         run_issues = []
+        done_logs = []
 
         for idx, acc in enumerate(target_accounts, 1):
             # التحقق الفوري أثناء التشغيل تحسباً لحظْر أو سحب الصلاحيات في المنتصف
@@ -3137,7 +3954,7 @@ def execute_mission_worker(chat_id: int, user_id: int):
 
             label_acc = acc["name"] if is_super_admin(user_id) else f"{acc['name']}"
             update_live_status(
-                f"🚀 <b>جاري تشغيل الحساب ({idx}/{total_accounts}):</b>\n"
+                f"🚀 <b>جاري التنفيذ بالخلفية ({idx}/{total_accounts}):</b>\n"
                 f"👤 <b>{esc(label_acc)}</b>\n"
                 f"🔗 <b>الهدف:</b> <code>{esc(target_url[:48])}</code>"
             )
@@ -3157,6 +3974,13 @@ def execute_mission_worker(chat_id: int, user_id: int):
                                 msg_line = f"• <b>{esc(label_acc)} ({step_lbl}):</b> {esc(diag)}"
                                 run_issues.append(msg_line)
                                 update_live_status(f"⚠️ {msg_line}")
+
+                            def _record_success(step_lbl: str):
+                                msg_line = f"• <b>{esc(label_acc)}:</b> {step_lbl}"
+                                done_logs.append(msg_line)
+                                update_live_status(
+                                    f"⚙️ <b>تقدم الخلفية ({idx}/{total_accounts}):</b> {esc(label_acc)} — {step_lbl}"
+                                )
 
                             logged = auto_login_facebook(ctx, page, acc.get("email", ""), acc.get("password", ""), max_wait=35)
                             if not logged:
@@ -3194,14 +4018,14 @@ def execute_mission_worker(chat_id: int, user_id: int):
                                     if send_friend_request(page):
                                         actions_done += 1
                                         acc_actions += 1
-                                        safe_send(chat_id, f"➕ <b>تم إرسال طلب صداقة بـ {esc(label_acc)}.</b>")
+                                        _record_success("إرسال طلب صداقة")
                                     else:
                                         _record_issue("طلب صداقة", "زر إضافة صديق غير متاح بالصفحة")
                                 elif st["cancel_friend"]:
                                     if cancel_friend_request(page):
                                         actions_done += 1
                                         acc_actions += 1
-                                        safe_send(chat_id, f"❌ <b>تم إلغاء طلب الصداقة بـ {esc(label_acc)}.</b>")
+                                        _record_success("إلغاء طلب الصداقة")
                                     else:
                                         _record_issue("إلغاء الصداقة", "لا يوجد طلب صداقة معلق أو علاقة لإلغائها")
 
@@ -3209,14 +4033,14 @@ def execute_mission_worker(chat_id: int, user_id: int):
                                     if follow_profile(page):
                                         actions_done += 1
                                         acc_actions += 1
-                                        safe_send(chat_id, f"🔔 <b>تمت متابعة الحساب بـ {esc(label_acc)}.</b>")
+                                        _record_success("متابعة الحساب")
                                     else:
                                         _record_issue("متابعة", "زر المتابعة غير متوفر أو الحساب متابَع مسبقاً")
                                 elif st["unfollow"]:
                                     if unfollow_profile(page):
                                         actions_done += 1
                                         acc_actions += 1
-                                        safe_send(chat_id, f"🔕 <b>تم إلغاء المتابعة بـ {esc(label_acc)}.</b>")
+                                        _record_success("إلغاء المتابعة")
                                     else:
                                         _record_issue("إلغاء المتابعة", "لم يتم العثور على زر إلغاء المتابعة")
 
@@ -3224,7 +4048,7 @@ def execute_mission_worker(chat_id: int, user_id: int):
                                 if send_direct_message(page, st["message_text"], target_url=target_url):
                                     actions_done += 1
                                     acc_actions += 1
-                                    safe_send(chat_id, f"✉️ <b>تم إرسال رسالة خاصة بـ {esc(label_acc)}.</b>")
+                                    _record_success("إرسال رسالة خاصة")
                                 else:
                                     _record_issue("رسالة خاصة", "تعذر إرسال الرسالة بالماسنجر أو الحساب يمنع الرسائل")
 
@@ -3233,7 +4057,7 @@ def execute_mission_worker(chat_id: int, user_id: int):
                                 if report_profile(page, reason=st["rep_reason"], victim=st["rep_victim"]):
                                     actions_done += 1
                                     acc_actions += 1
-                                    safe_send(chat_id, f"🛡️ <b>تم تأكيد استلام بلاغ الحساب بـ {esc(label_acc)}!</b>")
+                                    _record_success("تأكيد استلام بلاغ الحساب")
                                 else:
                                     _record_issue("بلاغ حساب", "تعذر إتمام خطوات بلاغ الحساب")
 
@@ -3241,7 +4065,7 @@ def execute_mission_worker(chat_id: int, user_id: int):
                                 if block_profile(page):
                                     actions_done += 1
                                     acc_actions += 1
-                                    safe_send(chat_id, f"🚫 <b>تم حظر الحساب المستهدف بـ {esc(label_acc)}.</b>")
+                                    _record_success("حظر الحساب")
                                 else:
                                     _record_issue("حظر", "تعذر العثور على خيار حظر الحساب")
 
@@ -3259,7 +4083,7 @@ def execute_mission_worker(chat_id: int, user_id: int):
                                         actions_done += 1
                                         acc_actions += 1
                                         r_name = REACTION_ICONS.get(st["reaction_type"], st["reaction_type"])
-                                        safe_send(chat_id, f"💖 <b>تم وضع التفاعل ({r_name}) بـ {esc(label_acc)}.</b>")
+                                        _record_success(f"تفاعل ({esc(r_name)})")
                                     else:
                                         _record_issue("التفاعل", "لم يتم العثور على المنشور أو زر التفاعل")
 
@@ -3281,7 +4105,7 @@ def execute_mission_worker(chat_id: int, user_id: int):
                                     if c_cnt > 0:
                                         actions_done += c_cnt
                                         acc_actions += c_cnt
-                                        safe_send(chat_id, f"💬 <b>تم نشر التعليق بـ {esc(label_acc)}:</b>\n<i>'{esc(st['comment_text'])}'</i>")
+                                        _record_success("نشر تعليق")
                                     else:
                                         _record_issue("التعليق", "التعليقات مقيدة أو تعذر الوصول لصندوق التعليق")
 
@@ -3298,7 +4122,7 @@ def execute_mission_worker(chat_id: int, user_id: int):
                                 ):
                                     actions_done += 1
                                     acc_actions += 1
-                                    safe_send(chat_id, f"🎯 <b>تم التفاعل والرد على التعليق المحدد بـ {esc(label_acc)}!</b>")
+                                    _record_success("التفاعل/الرد على تعليق")
                                 else:
                                     _record_issue("رد على تعليق", "لم يتم العثور على التعليق المطابق")
 
@@ -3309,24 +4133,30 @@ def execute_mission_worker(chat_id: int, user_id: int):
                                 if report_post(page, reason=st["rep_reason"], victim=st["rep_victim"]):
                                     actions_done += 1
                                     acc_actions += 1
-                                    safe_send(chat_id, f"🛡️ <b>تم تأكيد استلام بلاغ المنشور بـ {esc(label_acc)}!</b>")
+                                    _record_success("بلاغ منشور")
                                 else:
                                     _record_issue("بلاغ منشور", "تعذر إتمام خطوات بلاغ المنشور")
 
-                            try:
-                                page.screenshot(path=shot_path)
-                                shot_caption = (
-                                    f"📸 <b>إثبات التنفيذ بالحساب:</b> {esc(label_acc)}"
-                                    if acc_actions > 0
-                                    else f"📸 <b>لقطة تشخيصية لصفحة المتصفح (0 إجراءات بالحساب):</b> {esc(label_acc)}"
-                                )
-                                with open(shot_path, "rb") as shot_file:
-                                    bot.send_photo(chat_id, shot_file, caption=shot_caption)
-                            except Exception:
-                                pass
+                            # تقليل الإشعارات: إرفاق لقطة الشاشة فقط عند تعذر تنفيذ أي إجراء (0) لتشخيص السبب
+                            if acc_actions == 0:
+                                try:
+                                    page.screenshot(path=shot_path)
+                                    with open(shot_path, "rb") as shot_file:
+                                        bot.send_photo(
+                                            chat_id,
+                                            shot_file,
+                                            caption=f"📸 <b>لقطة تشخيصية (0 إجراءات بالحساب):</b> {esc(label_acc)}"
+                                        )
+                                except Exception:
+                                    pass
 
                             human_delay(1.5, 2.5)
                         finally:
+                            try:
+                                if acc_actions > 0:
+                                    save_account_storage_state(ctx, acc["profile_dir"])
+                            except Exception:
+                                pass
                             try:
                                 ctx.close()
                             except Exception:
@@ -3334,7 +4164,7 @@ def execute_mission_worker(chat_id: int, user_id: int):
                     except Exception as err:
                         err_txt = f"• <b>{esc(label_acc)} (خطأ متصفح):</b> <code>{esc(err)}</code>"
                         run_issues.append(err_txt)
-                        safe_send(chat_id, f"❌ <b>خطأ بالحساب {esc(label_acc)}:</b> <code>{esc(err)}</code>")
+                        update_live_status(f"❌ <b>خطأ بالحساب {esc(label_acc)}:</b> <code>{esc(err)}</code>")
                     finally:
                         if os.path.exists(shot_path):
                             try:
@@ -3346,6 +4176,9 @@ def execute_mission_worker(chat_id: int, user_id: int):
                 time.sleep(3)
 
         if actions_done > 0:
+            done_block = ""
+            if done_logs:
+                done_block = "\n\n📋 <b>ملخص المنفذ:</b>\n" + "\n".join(done_logs[:6])
             notes_block = ""
             if run_issues:
                 notes_block = "\n\n⚠️ <b>ملاحظات لبعض المحاولات:</b>\n" + "\n".join(run_issues[:5])
@@ -3353,8 +4186,9 @@ def execute_mission_worker(chat_id: int, user_id: int):
                 "🎉 <b>اكتملت المهمة بنجاح!</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━\n"
                 f"✅ <b>إجمالي الإجراءات المنفذة:</b> {actions_done}\n"
-                f"👥 <b>الحسابات المشاركة:</b> {total_accounts}\n"
-                f"━━━━━━━━━━━━━━━━━━━━{notes_block}",
+                f"👥 <b>الحسابات المشاركة:</b> {total_accounts}"
+                f"{done_block}"
+                f"{notes_block}",
                 reply_markup=_back_home_markup()
             )
         else:
@@ -3392,6 +4226,7 @@ def _build_webapp_hooks() -> dict:
         "get_usable_accounts_for_user": get_usable_accounts_for_user,
         "get_manageable_accounts_for_user": get_manageable_accounts_for_user,
         "get_user_state": get_user_state,
+        "persist_user_states": persist_user_states,
         "record_audit_log": record_audit_log,
         "load_audit_logs": load_audit_logs,
         "record_user_operation": record_user_operation,
@@ -3417,10 +4252,35 @@ def _build_webapp_hooks() -> dict:
     }
 
 
+def _maintenance_sync_worker() -> None:
+    """مراقبة خلفية لجدولة قناة النسخ الاحتياطي (من 10 ثوانٍ حتى سنوات) والمزامنة السحابية وحذف الحسابات التالفة"""
+    last_purge = time.time()
+    while True:
+        time.sleep(2)
+        try:
+            flush_cloud_backups(bot, SUPER_ADMIN_ID)
+        except Exception:
+            pass
+        if time.time() - last_purge >= 1800:
+            last_purge = time.time()
+            try:
+                cnt, _ = purge_expired_broken_accounts(BROKEN_ACCOUNT_TTL_HOURS)
+                if cnt > 0:
+                    print(f"[AutoPurge] تم حذف {cnt} حساب غير نشط تجاوز {BROKEN_ACCOUNT_TTL_HOURS} ساعة.")
+            except Exception:
+                pass
+
+
 def run_telegram_bot():
     global _live_sync_started
     print("=" * 60)
     print("🚀 بدء تشغيل بوت تلغرام FB Operator في السحاب 24/7...")
+    boot_info = bootstrap_persistence()
+    reload_user_states_from_disk()
+    print(f"💾 مسار البيانات الدائم: {boot_info.get('data_dir')}")
+    bkp_cfg = load_backup_settings()
+    if bkp_cfg.get("channel_id"):
+        print(f"📡 قناة النسخ الاحتياطي: {bkp_cfg.get('channel_title')} ({bkp_cfg.get('channel_id')}) | {bkp_cfg.get('interval_label')}")
     try:
         print(f"🤖 معرف البوت: @{bot.get_me().username}")
     except Exception:
@@ -3431,15 +4291,30 @@ def run_telegram_bot():
     if not _live_sync_started:
         register_listener(_on_state_event)
         threading.Thread(target=_live_inline_sync_worker, daemon=True).start()
+        threading.Thread(target=_maintenance_sync_worker, daemon=True).start()
         _live_sync_started = True
 
     start_webapp_and_tunnel(BOT_TOKEN, _build_webapp_hooks())
 
+    try:
+        bot.delete_webhook(drop_pending_updates=False)
+    except Exception:
+        pass
+
     while True:
         try:
-            bot.infinity_polling(timeout=25, long_polling_timeout=25)
+            bot.infinity_polling(
+                timeout=25,
+                long_polling_timeout=25,
+                skip_pending=True,
+                allowed_updates=["message", "callback_query"],
+            )
         except Exception as e:
-            print(f"[Bot Warning] خطأ بالاتصال، إعادة المحاولة بعد 5 ثوانٍ: {e}")
+            err_s = str(e)
+            if "409" in err_s or "terminated by other getUpdates" in err_s:
+                print("[CONFLICT 409] تحذير خطير: توجد نسخة أخرى تعمل بنفس BOT_TOKEN (مثل GitHub Actions أو Space قديم) وتسبب تضارب الردود! ألغِ النسخة القديمة أو جدّد التوكن عبر @BotFather (/revoke).")
+            else:
+                print(f"[Bot Warning] خطأ بالاتصال، إعادة المحاولة بعد 5 ثوانٍ: {e}")
             time.sleep(5)
 
 

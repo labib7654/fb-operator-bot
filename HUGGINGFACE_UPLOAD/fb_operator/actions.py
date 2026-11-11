@@ -146,13 +146,33 @@ def get_target_post(page: Page, post_index: int = 1):
 
     url = (getattr(page, "url", "") or "").lower()
     if any(k in url for k in ["/posts/", "/permalink/", "/photo", "fbid=", "/videos/", "/reel/", "/share/", "story_fbid=", "pfbid"]):
+        action_probe_sel = (
+            'div[role="button"][aria-label*="أعجبني"], '
+            'div[role="button"][aria-label*="اعجبني"], '
+            'div[role="button"][aria-label*="إعجبني"], '
+            'div[role="button"][aria-label*="Like" i], '
+            'div[role="button"][aria-label*="تعليق"], '
+            'div[role="button"][aria-label*="Comment" i]'
+        )
         article = page.locator('div[role="article"]').first
-        if article.is_visible(timeout=3000):
-            return article
+        try:
+            if article.is_visible(timeout=2500) and article.locator(action_probe_sel).count() > 0:
+                return article
+        except Exception:
+            pass
         dialog = page.locator('div[role="dialog"]').first
-        if dialog.is_visible(timeout=2000):
-            return dialog
-        return page.locator('div[role="main"]').first
+        try:
+            if dialog.is_visible(timeout=2000) and dialog.locator(action_probe_sel).count() > 0:
+                return dialog
+        except Exception:
+            pass
+        main_el = page.locator('div[role="main"]').first
+        try:
+            if main_el.is_visible(timeout=2000):
+                return main_el
+        except Exception:
+            pass
+        return article
 
     attempts = 0
     while attempts < 6:
@@ -206,12 +226,28 @@ def react_to_posts(page: Page, reaction: str = "like", post_index: int = 1) -> b
         print(f"[-] لم يتم العثور على المنشور رقم {post_index}.")
         return False
 
-    like_btn = target_post.locator(
+    like_btn_sel = (
         'div[role="button"][aria-label*="أعجبني"], '
+        'div[role="button"][aria-label*="اعجبني"], '
+        'div[role="button"][aria-label*="إعجبني"], '
         'div[role="button"][aria-label*="Like" i], '
         'div[role="button"]:has-text("أعجبني"), '
+        'div[role="button"]:has-text("اعجبني"), '
         'div[role="button"]:has-text("Like")'
-    ).first
+    )
+    like_btn = target_post.locator(like_btn_sel).first
+    try:
+        if not like_btn.is_visible(timeout=2000):
+            for fallback_sel in ('div[role="dialog"]', 'div[role="main"]'):
+                fb_cont = page.locator(fallback_sel).first
+                if fb_cont.is_visible(timeout=1000):
+                    cand = fb_cont.locator(like_btn_sel).first
+                    if cand.is_visible(timeout=1500):
+                        target_post = fb_cont
+                        like_btn = cand
+                        break
+    except Exception:
+        pass
 
     if not like_btn.is_visible(timeout=3000):
         try:
@@ -224,6 +260,16 @@ def react_to_posts(page: Page, reaction: str = "like", post_index: int = 1) -> b
         print(f"[-] المنشور رقم {post_index}: لم يتم العثور على زر التفاعل/الإعجاب.")
         return False
 
+    def _safe_click_btn(btn) -> None:
+        try:
+            btn.scroll_into_view_if_needed(timeout=1500)
+        except Exception:
+            pass
+        try:
+            btn.click(timeout=4000)
+        except Exception:
+            btn.click(force=True, timeout=3000)
+
     aria_label = (like_btn.get_attribute("aria-label") or "").strip().lower()
     btn_text = (like_btn.inner_text() or "").strip().lower()
     is_pressed = like_btn.get_attribute("aria-pressed") == "true"
@@ -233,7 +279,7 @@ def react_to_posts(page: Page, reaction: str = "like", post_index: int = 1) -> b
 
     if reaction in ["unlike", "remove", "cancel"]:
         if is_already_reacted:
-            like_btn.click()
+            _safe_click_btn(like_btn)
             print(f"[+] المنشور {post_index}: تم إلغاء الإعجاب بنجاح.")
             human_delay(2.0, 3.5)
             return True
@@ -245,7 +291,7 @@ def react_to_posts(page: Page, reaction: str = "like", post_index: int = 1) -> b
         if is_already_reacted:
             print(f"[+] المنشور {post_index}: معجب به مسبقاً.")
             return True
-        like_btn.click()
+        _safe_click_btn(like_btn)
         print(f"[+] المنشور {post_index}: تم الإعجاب بنجاح (Like).")
         human_delay(2.0, 3.5)
         return True
@@ -268,7 +314,7 @@ def react_to_posts(page: Page, reaction: str = "like", post_index: int = 1) -> b
             for kw in keywords:
                 react_btn = page.locator(f'div[role="toolbar"] div[aria-label*="{kw}" i], div[aria-label*="{kw}" i][role="button"]').first
                 if react_btn.is_visible(timeout=1800):
-                    react_btn.click()
+                    _safe_click_btn(react_btn)
                     print(f"[+] المنشور {post_index}: تم وضع التفاعل بنجاح ({reaction}).")
                     human_delay(2.0, 3.5)
                     return True
@@ -280,7 +326,7 @@ def react_to_posts(page: Page, reaction: str = "like", post_index: int = 1) -> b
                     pass
                 human_delay(0.8, 1.2)
 
-        like_btn.click()
+        _safe_click_btn(like_btn)
         print(f"[+] المنشور {post_index}: تم وضع الإعجاب الافتراضي.")
         human_delay(2.0, 3.0)
         return True
@@ -429,26 +475,58 @@ def comment_on_posts(page: Page, comment_text: str, mode: str = "latest", count:
             human_delay(0.4, 0.8)
             page.keyboard.type(comment_text, delay=random.randint(40, 75))
             human_delay(1.0, 1.8)
+            typed_ok = False
+            try:
+                cur_val = (input_box.inner_text(timeout=1000) or "").strip()
+                if not cur_val:
+                    cur_val = (input_box.input_value(timeout=1000) or "").strip()
+                typed_ok = len(cur_val) > 0
+            except Exception:
+                typed_ok = False
+
+            if not typed_ok:
+                set_page_diag(page, "تعذر إدخال نص التعليق داخل مربع الكتابة")
+                return 0
+
             page.keyboard.press("Enter")
+            human_delay(1.2, 1.8)
 
-            # البحث عن زر الإرسال الصريح والنقر عليه إن لم يرسل عبر Enter
-            send_btns = [
-                'div[role="button"][aria-label*="تعليق"][tabindex="0"]',
-                'div[role="button"][aria-label*="Comment" i][tabindex="0"]',
-                'div[role="button"][aria-label*="إرسال"]',
-                'div[role="button"][aria-label*="نشر"]',
-                'div[role="button"][aria-label*="Post" i]'
-            ]
-            for sb in send_btns:
-                try:
-                    b = page.locator(sb).first
-                    if b.is_visible(timeout=1000):
-                        b.click(timeout=1000)
-                        break
-                except Exception:
-                    pass
+            # إذا بقي النص داخل الصندوق بعد Enter، نحاول النقر على زر الإرسال المحدود بنفس المنشور/الحوار فقط
+            still_has_text = False
+            try:
+                rem = (input_box.inner_text(timeout=800) or "").strip()
+                if not rem:
+                    rem = (input_box.input_value(timeout=800) or "").strip()
+                still_has_text = len(rem) > 0
+            except Exception:
+                still_has_text = False
 
-            human_delay(3.5, 5.0)
+            if still_has_text:
+                send_btns = [
+                    'div[role="button"][aria-label*="إرسال تعليق"]',
+                    'div[role="button"][aria-label*="Submit comment" i]',
+                    'div[role="button"][aria-label*="إرسال"]',
+                    'div[role="button"][aria-label*="نشر"]',
+                    'div[role="button"][aria-label*="Post" i]',
+                    'div[role="button"][aria-label*="تعليق"][tabindex="0"]',
+                    'div[role="button"][aria-label*="Comment" i][tabindex="0"]'
+                ]
+                dlg = page.locator('div[role="dialog"]').first
+                scope_root = dlg if (dlg.is_visible(timeout=500) and dlg.locator('div[role="textbox"]').count() > 0) else target_post
+                clicked_submit = False
+                for sb in send_btns:
+                    try:
+                        b = scope_root.locator(sb).first
+                        if b.is_visible(timeout=800):
+                            b.click(timeout=1000)
+                            clicked_submit = True
+                            break
+                    except Exception:
+                        pass
+                if clicked_submit:
+                    human_delay(1.5, 2.2)
+
+            human_delay(2.5, 4.0)
             print(f"[+] تم إرسال ونشر التعليق بنجاح: '{comment_text}'")
             return 1
         else:

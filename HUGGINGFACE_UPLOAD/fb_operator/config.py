@@ -64,6 +64,7 @@ POINTS_LEDGER_FILE = DATA_DIR / "points_ledger.json"
 INVITE_CODES_FILE = DATA_DIR / "invite_codes.json"
 SUPPORT_TICKETS_FILE = DATA_DIR / "support_tickets.json"
 BACKUP_META_FILE = DATA_DIR / "backup_meta.json"
+UI_STATES_FILE = DATA_DIR / "ui_states.json"
 
 # إعدادات التخفي وفترات الانتظار البشري (بالثواني)
 DEFAULT_MIN_DELAY = 2.5

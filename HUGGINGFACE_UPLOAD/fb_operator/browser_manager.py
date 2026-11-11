@@ -5,15 +5,34 @@
 """
 
 import os
+import re
+import json
 import time
 import random
 import threading
 from pathlib import Path
 from playwright.sync_api import sync_playwright, BrowserContext, Page
-from fb_operator.config import DEFAULT_MIN_DELAY, DEFAULT_MAX_DELAY, PROFILES_DIR
+from fb_operator.config import DEFAULT_MIN_DELAY, DEFAULT_MAX_DELAY, PROFILES_DIR, SESSIONS_DIR
 
 _LOGIN_ERROR_LOCK = threading.Lock()
 _LOGIN_ERRORS: dict[int, str] = {}
+_CTX_PROFILES: dict[int, Path] = {}
+
+
+def _get_profiles_dir() -> Path:
+    try:
+        from fb_operator import account_manager as _acc_mgr
+        return Path(_acc_mgr.PROFILES_DIR)
+    except Exception:
+        return Path(PROFILES_DIR)
+
+
+def _get_sessions_dir() -> Path:
+    try:
+        from fb_operator import account_manager as _acc_mgr
+        return Path(_acc_mgr.SESSIONS_DIR)
+    except Exception:
+        return Path(SESSIONS_DIR)
 
 
 def set_login_error(context, reason: str) -> None:
@@ -42,11 +61,141 @@ def _cleanup_stale_profile_locks(profile_path: Path) -> None:
             pass
 
 
+def resolve_cross_platform_profile(profile_dir: str | Path) -> Path:
+    """توحيد مسار مجلد البروفايل ليعمل على ويندوز ولينكس السحابي بسلاسة دون أخطاء المسارات"""
+    s = str(profile_dir)
+    norm = s.replace("\\", "/").rstrip("/")
+    acc_folder = norm.split("/")[-1]
+    base_profiles = _get_profiles_dir()
+    target = (base_profiles / acc_folder).resolve()
+    raw_path = Path(s)
+    if os.name == "nt" and raw_path.exists():
+        raw_has_cookies = (raw_path / "Default" / "Network" / "Cookies").exists() or (raw_path / "Default" / "Cookies").exists()
+        target_has_cookies = (target / "Default" / "Network" / "Cookies").exists() or (target / "Default" / "Cookies").exists()
+        if raw_has_cookies and not target_has_cookies:
+            return raw_path.resolve()
+    if (os.name != "nt" and (":" in s or "\\" in s)) or (
+        acc_folder.startswith("acc_") and "/fb_operator/profiles/" in norm
+    ):
+        return target
+    return raw_path.resolve()
+
+
+def _resolve_session_file(profile_dir_or_id: str | Path) -> Path:
+    """تحديد مسار ملف الجلسة المحمول storage_state بصيغة آمنة"""
+    raw = str(profile_dir_or_id).replace("\\", "/").rstrip("/")
+    name = raw.split("/")[-1] or "default"
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
+        name = re.sub(r"[^A-Za-z0-9_.-]", "_", name) or "default"
+    return (_get_sessions_dir() / f"{name}.json").resolve()
+
+
+def save_account_storage_state(context: BrowserContext, profile_dir_or_id: str | Path | None = None) -> bool:
+    """حفظ حالة الجلسة كاملة (Cookies + LocalStorage) خارج مجلد الكود لاستعادة الدخول الفوري بعد التحديثات"""
+    target = profile_dir_or_id or _CTX_PROFILES.get(id(context))
+    if not target:
+        return False
+    session_file = _resolve_session_file(target)
+    try:
+        if hasattr(context, "storage_state"):
+            state = context.storage_state()
+        else:
+            state = {"cookies": list(context.cookies()), "origins": []}
+        cookies = state.get("cookies", []) if isinstance(state, dict) else []
+        has_c_user = any(str(c.get("name", "")) == "c_user" and str(c.get("value", "")).strip() for c in cookies)
+        if not has_c_user:
+            return False
+        session_file.parent.mkdir(parents=True, exist_ok=True)
+        tmp_file = session_file.with_suffix(".tmp")
+        tmp_file.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp_file, session_file)
+        try:
+            from fb_operator import persistence_manager as _pm
+            _pm.notify_data_changed("session_saved")
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+def restore_account_storage_state(context: BrowserContext, profile_dir_or_id: str | Path) -> bool:
+    """استعادة الجلسة المحفوظة (storage_state) إلى المتصفح قبل التوجه إلى فيسبوك"""
+    session_file = _resolve_session_file(profile_dir_or_id)
+    if not session_file.exists():
+        return False
+    try:
+        data = json.loads(session_file.read_text(encoding="utf-8"))
+        cookies = data.get("cookies", []) if isinstance(data, dict) else []
+        valid_cookies = []
+        for c in cookies:
+            if not isinstance(c, dict) or not c.get("name") or c.get("value") is None:
+                continue
+            item = {
+                "name": str(c["name"]),
+                "value": str(c["value"]),
+                "domain": str(c.get("domain") or ".facebook.com"),
+                "path": str(c.get("path") or "/"),
+            }
+            if c.get("expires") is not None:
+                try:
+                    item["expires"] = float(c["expires"])
+                except Exception:
+                    pass
+            for flag in ("httpOnly", "secure"):
+                if flag in c:
+                    item[flag] = bool(c[flag])
+            if c.get("sameSite") in ("Strict", "Lax", "None"):
+                item["sameSite"] = c["sameSite"]
+            valid_cookies.append(item)
+        if not valid_cookies:
+            return False
+        context.add_cookies(valid_cookies)
+        return True
+    except Exception:
+        return False
+
+
+def _detect_arkose_captcha(page: Page) -> str:
+    """الكشف السلبي عن تحدي Arkose MatchKey أو تحقق الإنسان للتوقف الآمن دون التفاعل معه"""
+    curr_url = (getattr(page, "url", "") or "").lower()
+    if any(k in curr_url for k in ("arkoselabs", "funcaptcha", "/challenge")):
+        return "لغز تحقق من الإنسان Arkose Labs CAPTCHA — يتطلب استيراد جلسة صالحة من متصفحك"
+    try:
+        iframe_loc = page.locator('iframe[src*="arkose"], iframe[src*="funcaptcha"], iframe[src*="captcha"]')
+        if iframe_loc.count() > 0:
+            return "لغز تحقق من الإنسان Arkose Labs CAPTCHA — يتطلب استيراد جلسة صالحة من متصفحك"
+    except Exception:
+        pass
+    try:
+        snippet = page.evaluate("() => (document.body && document.body.innerText ? document.body.innerText.slice(0, 1800) : '')")
+        if isinstance(snippet, str) and snippet:
+            low = snippet.lower()
+            if any(k in low for k in (
+                "arkose labs",
+                "matchkey",
+                "أكمل تحدي",
+                "تحقق من أنك إنسان",
+                "verify that you're human",
+                "complete a challenge",
+                "confirm you're human",
+                "solve a puzzle",
+            )):
+                return "لغز تحقق من الإنسان Arkose Labs CAPTCHA — يتطلب استيراد جلسة صالحة من متصفحك"
+    except Exception:
+        pass
+    return ""
+
+
 def check_facebook_page_access(page: Page) -> tuple[bool, str]:
     """
-    فحص حالة الصفحة الحية في فيسبوك لاكتشاف الحجب أو انتهاء الجلسة أو عدم توفر المحتوى فوراً
+    فحص حالة الصفحة الحية في فيسبوك لاكتشاف الحجب أو انتهاء الجلسة أو تحدي CAPTCHA أو عدم توفر المحتوى فوراً
     بدلاً من إهدار الوقت في البحث عن أزرار غير موجودة.
     """
+    arkose_msg = _detect_arkose_captcha(page)
+    if arkose_msg:
+        return False, arkose_msg
+
     curr_url = (getattr(page, "url", "") or "").lower()
     if any(x in curr_url for x in ("checkpoint", "two_step_verification", "/recover/")):
         return False, "الحساب يطلب تحقق أمان (Checkpoint / 2FA)"
@@ -78,14 +227,6 @@ def check_facebook_page_access(page: Page) -> tuple[bool, str]:
         pass
 
     return True, ""
-
-def resolve_cross_platform_profile(profile_dir: str | Path) -> Path:
-    """توحيد مسار مجلد البروفايل ليعمل على ويندوز ولينكس السحابي بسلاسة دون أخطاء المسارات"""
-    s = str(profile_dir)
-    if os.name != "nt" and (":" in s or "\\" in s):
-        acc_folder = s.replace("\\", "/").rstrip("/").split("/")[-1]
-        return (PROFILES_DIR / acc_folder).resolve()
-    return Path(profile_dir).resolve()
 
 def human_delay(min_seconds: float = DEFAULT_MIN_DELAY, max_seconds: float = DEFAULT_MAX_DELAY) -> None:
     """توقف عشوائي لمحاكاة التردد البشري وتجنب كشف الروبوتات"""
@@ -237,6 +378,8 @@ def launch_account_browser(playwright_instance, profile_dir: str | Path, visible
         }
     """
     context.add_init_script(stealth_script)
+    _CTX_PROFILES[id(context)] = profile_path
+    restore_account_storage_state(context, profile_path)
     return context
 
 def auto_login_facebook(context: BrowserContext, page: Page, email: str, password: str, status_callback=None, max_wait: int = 90) -> bool:
@@ -266,10 +409,11 @@ def auto_login_facebook(context: BrowserContext, page: Page, email: str, passwor
         ok_live, live_reason = check_facebook_page_access(page)
         is_still_logged, _ = check_facebook_login_cookies(context)
         if is_still_logged and ok_live:
+            save_account_storage_state(context)
             log("تم التحقق من الجلسة الحية: الحساب نشط ومسجل دخوله بنجاح.")
             return True
 
-        if any(tag in live_reason for tag in ("Checkpoint", "2FA", "معطل", "مقيد")):
+        if any(tag in live_reason for tag in ("Checkpoint", "2FA", "معطل", "مقيد", "Arkose", "CAPTCHA")):
             set_login_error(context, live_reason)
             log(f"[-] {live_reason}")
             return False
@@ -289,8 +433,14 @@ def auto_login_facebook(context: BrowserContext, page: Page, email: str, passwor
     ok_after, after_reason = check_facebook_page_access(page)
     is_logged, fb_id = check_facebook_login_cookies(context)
     if is_logged and ok_after:
+        save_account_storage_state(context)
         log("تم التحقق من الجلسة، الحساب مسجل دخوله بالفعل.")
         return True
+
+    if any(tag in after_reason for tag in ("Arkose", "CAPTCHA", "معطل", "مقيد")):
+        set_login_error(context, after_reason)
+        log(f"[-] {after_reason}")
+        return False
 
     if not email or not password:
         reason = after_reason or "لا توجد بيانات دخول محفوظة والجلسة غير نشطة"
@@ -406,8 +556,16 @@ def auto_login_facebook(context: BrowserContext, page: Page, email: str, passwor
         is_logged, fb_id = check_facebook_login_cookies(context)
         if is_logged and not blocked_state:
             time.sleep(3.0)  # مهلة لتثبيت الجلسة على القرص
+            save_account_storage_state(context)
             log("تم تسجيل الدخول وتثبيت الجلسة الدائمة بنجاح!")
             return True
+
+        # التوقف الآمن الفوري إذا ظهر لغز Arkose CAPTCHA أو حساب موقوف
+        arkose_reason = _detect_arkose_captcha(page)
+        if arkose_reason:
+            set_login_error(context, arkose_reason)
+            log(f"[-] {arkose_reason}")
+            return False
 
         # فحص إذا ظهرت صفحة رمز التحقق 2FA
         if ("checkpoint" in curr_url or "two_step_verification" in curr_url) and not warned_2fa:
@@ -433,6 +591,7 @@ def auto_login_facebook(context: BrowserContext, page: Page, email: str, passwor
     blocked_final = any(x in curr_final for x in ("checkpoint", "two_step_verification", "login.php", "suspended", "disabled"))
     is_logged, fb_id = check_facebook_login_cookies(context)
     if is_logged and not blocked_final:
+        save_account_storage_state(context)
         log("تم تسجيل الدخول بنجاح.")
         return True
 
@@ -478,3 +637,20 @@ def smooth_scroll(page: Page, scrolls: int = 2) -> None:
         delta = random.randint(350, 650)
         page.mouse.wheel(0, delta)
         time.sleep(random.uniform(0.8, 1.6))
+
+
+def human_click(page: Page, locator, timeout: int = 4000) -> bool:
+    """نقر بشري سلس مع حركة مؤشر طبيعية داخل بيئة سطح المكتب 1920x1080"""
+    try:
+        locator.scroll_into_view_if_needed(timeout=timeout)
+        box = locator.bounding_box(timeout=timeout)
+        if box:
+            tx = box["x"] + box["width"] * random.uniform(0.32, 0.68)
+            ty = box["y"] + box["height"] * random.uniform(0.32, 0.68)
+            page.mouse.move(tx, ty, steps=random.randint(6, 12))
+            time.sleep(random.uniform(0.08, 0.22))
+        locator.click(timeout=timeout)
+        return True
+    except Exception:
+        return False
+

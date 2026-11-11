@@ -14,7 +14,8 @@
     "email": "hiwekid975@simense.com",
     "password": "hccgchGshqy75gg",
     "profile_dir": "D:\\platform-tools\\fb_operator\\profiles\\acc_2",
-    "status": "نشط ومسجل"
+    "status": "نشط ومسجل",
+    "fb_id": "61596047234805"
   },
   {
     "id": "acc_3",
@@ -22,7 +23,8 @@
     "email": "serihog592@prejuge.com",
     "password": "jsgsosh86Agsg",
     "profile_dir": "D:\\platform-tools\\fb_operator\\profiles\\acc_3",
-    "status": "نشط ومسجل"
+    "status": "نشط ومسجل",
+    "fb_id": "61596063074519"
   },
   {
     "id": "acc_4",
@@ -30,7 +32,8 @@
     "email": "lehel87795@prejuge.com",
     "password": "jsvsjshGsgsi865fFsg",
     "profile_dir": "D:\\platform-tools\\fb_operator\\profiles\\acc_4",
-    "status": "نشط ومسجل"
+    "status": "نشط ومسجل",
+    "fb_id": "61596276155083"
   },
   {
     "id": "acc_5",
@@ -38,7 +41,8 @@
     "email": "sohaf71097@prejuge.com",
     "password": "sjshshwhwgGscs276@#$",
     "profile_dir": "D:\\platform-tools\\fb_operator\\profiles\\acc_5",
-    "status": "نشط ومسجل"
+    "status": "نشط ومسجل",
+    "fb_id": "61596340262242"
   },
   {
     "id": "acc_6",
@@ -46,22 +50,7 @@
     "email": "fvhuxichlv@oemails.com",
     "password": "æð;lknewr12@",
     "profile_dir": "D:\\platform-tools\\fb_operator\\profiles\\acc_6",
-    "status": "نشط ومسجل"
-  },
-  {
-    "id": "acc_7",
-    "name": "حسابي الثاني",
-    "email": "ukxzeicfcj@oemails.com",
-    "password": "yyopkkngdswxf&",
-    "profile_dir": "D:\\platform-tools\\fb_operator\\profiles\\acc_7",
-    "status": "يتطلب تسجيل الدخول"
-  },
-  {
-    "id": "acc_8",
-    "name": "حسابي الثاني",
-    "email": "ukxzeicfcj@oemails.com",
-    "password": "yyopkkngdswxf&",
-    "profile_dir": "D:\\platform-tools\\fb_operator\\profiles\\acc_8",
-    "status": "يتطلب تسجيل الدخول"
+    "status": "نشط ومسجل",
+    "fb_id": "61596071895923"
   }
 ]
