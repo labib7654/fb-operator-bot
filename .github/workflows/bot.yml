@@ -1,42 +1,84 @@
-name: FB Operator 24/7 Cloud Bot
+name: FB Operator 24/7 Cloud Bot (Real Desktop Environment)
 
 on:
   push:
     branches: [ main ]
+    paths-ignore:
+      - 'fb_operator_vault.json'
   workflow_dispatch:
   schedule:
-    # يتجدد التشغيل تلقائياً في سحابة مايكروسوفت كل 5 ساعات ليعمل 24 ساعة دون توقف
+    # يتجدد التشغيل تلقائياً كل 5 ساعات ليبقى شغالاً في السحاب 24/7 دون توقف
     - cron: '0 */5 * * *'
+
+concurrency:
+  group: fb-operator-24-7-bot
+  cancel-in-progress: true
+
+permissions:
+  contents: write
 
 jobs:
   run-fb-operator:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 315
     steps:
       - name: 📥 جلب الكود
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: true
 
       - name: 🐍 إعداد بايثون 3.12
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: 📦 تثبيت متطلبات النظام والخطوط العربية
+      - name: 🖥️ تثبيت بيئة سطح المكتب الحقيقية ومتصفح جوجل كروم (Xvfb & Real Google Chrome)
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y --no-install-recommends fonts-noto-core fonts-noto-cjk fonts-noto-extra fonts-noto-ui-core fonts-noto-color-emoji
+          sudo apt-get install -y --no-install-recommends \
+            xvfb \
+            x11-utils \
+            libxss1 \
+            libasound2 \
+            libnss3 \
+            fonts-noto-core \
+            fonts-noto-color-emoji \
+            fonts-noto-cjk \
+            fonts-noto-extra \
+            wget \
+            curl \
+            ca-certificates
+
+          # تثبيت متصفح Google Chrome الرسمي الحقيقي
+          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | sudo gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
+          sudo apt-get update -y
+          sudo apt-get install -y google-chrome-stable || true
+
+          # تثبيت متطلبات بايثون مع مكتبات Playwright والاعتماديات
           if [ -d "HUGGINGFACE_UPLOAD" ]; then
             pip install -r HUGGINGFACE_UPLOAD/requirements.txt
-            playwright install chromium
+            playwright install --with-deps chromium
           else
             pip install -r requirements.txt
-            playwright install chromium
+            playwright install --with-deps chromium
           fi
 
-      - name: 🚀 إطلاق بوت فيسبوك في السحاب
+      - name: 🚀 تشغيل البوت في بيئة ديسكتوب حقيقية 1920x1080 (Xvfb Real Display)
+        env:
+          _SECRET_BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          FB_VAULT_KEY: ${{ secrets.FB_VAULT_KEY }}
+          PYTHONUNBUFFERED: "1"
         run: |
+          if [ -n "$_SECRET_BOT_TOKEN" ]; then export BOT_TOKEN="$_SECRET_BOT_TOKEN"; fi
+          # حفظ تلقائي قبل انتهاء الدورة بـ 5 دقائق ومنع خطأ خروج timeout 124/143
+          rc=0
           if [ -d "HUGGINGFACE_UPLOAD" ]; then
-            python HUGGINGFACE_UPLOAD/fb_operator/telegram_bot.py
+            timeout -k 30s --signal=SIGTERM 295m xvfb-run -a -s "-screen 0 1920x1080x24 -ac +extension GLX +render -noreset" python HUGGINGFACE_UPLOAD/fb_operator/telegram_bot.py || rc=$?
           else
-            python fb_operator/telegram_bot.py
+            timeout -k 30s --signal=SIGTERM 295m xvfb-run -a -s "-screen 0 1920x1080x24 -ac +extension GLX +render -noreset" python fb_operator/telegram_bot.py || rc=$?
+          fi
+          if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && [ "$rc" -ne 143 ]; then
+            exit "$rc"
           fi
