@@ -17,6 +17,7 @@ from typing import Any, Callable
 from telebot import types
 
 from fb_operator.webapp_ui import get_miniapp_html
+from fb_operator.state_events import get_seq, publish_event, wait_for_relevant_events
 
 _url_lock = threading.Lock()
 _public_webapp_url: str | None = None
@@ -366,6 +367,7 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                         "status": status,
                         "message": msg,
                         "is_super_admin": False,
+                        "event_seq": get_seq(),
                         "user": {"id": uid, "name": user_rec.get("name", ""), "username": user_rec.get("username", "")},
                     })
                     return
@@ -433,12 +435,47 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                     "authorized": True,
                     "status": "approved",
                     "is_super_admin": is_dev,
+                    "event_seq": get_seq(),
                     "user": {"id": uid, "name": user_rec.get("name", ""), "username": user_rec.get("username", "")},
                     "permissions": perms,
                     "enabled_labels": enabled_labels,
                     "usable_accounts": usable_safe,
                     "manageable_accounts": manageable_safe,
                     "mission_state": mission_state,
+                })
+                return
+
+            if path == "/api/sync/wait":
+                auth = self._authenticate(touch_login=False)
+                if not auth:
+                    return
+                uid, _tg_user, user_rec = auth
+                is_dev = hooks["is_super_admin"](uid)
+                perms = {k: True for k in hooks["PERMISSION_LABELS"]} if is_dev else hooks["get_user_permissions"](uid)
+                can_see_shared = is_dev or (user_rec.get("status") == "approved" and bool(perms.get("can_use_accounts")))
+
+                qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                try:
+                    since = max(0, int((qs.get("since") or ["0"])[0]))
+                except ValueError:
+                    since = 0
+                try:
+                    req_timeout = float((qs.get("timeout") or ["22"])[0])
+                except ValueError:
+                    req_timeout = 22.0
+                timeout = max(1.0, min(22.0, req_timeout))
+
+                changed, new_seq, scopes = wait_for_relevant_events(
+                    since_seq=since,
+                    viewer_uid=uid,
+                    is_dev=is_dev,
+                    can_see_shared_accounts=can_see_shared,
+                    timeout=timeout,
+                )
+                self._send_json(200, {
+                    "changed": changed,
+                    "seq": new_seq,
+                    "scopes": scopes,
                 })
                 return
 
@@ -657,6 +694,7 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
 
                 hooks["record_user_operation"](uid, "تشغيل مهمة ميدانية (Mini App)")
                 hooks["record_audit_log"](uid, user_label, "LAUNCH_MISSION_WEBAPP", f"الهدف: {target_url[:80]}")
+                publish_event("mission", uid, "launch")
                 threading.Thread(target=hooks["execute_mission_worker"], args=(uid, uid), daemon=True).start()
                 self._send_json(200, {"ok": True, "message": "تم بدء تنفيذ المهمة في الخلفية! راقب التقدم هنا أو في الدردشة."})
                 return

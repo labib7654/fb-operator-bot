@@ -13,6 +13,7 @@ import threading
 import subprocess
 from pathlib import Path
 from fb_operator.config import ACCOUNTS_FILE, PROFILES_DIR
+from fb_operator.state_events import publish_event
 
 BASE_OPERATOR_DIR = Path(__file__).resolve().parent
 _accounts_lock = threading.RLock()
@@ -143,32 +144,41 @@ def add_account(name: str, email: str, password: str, owner_id: int = 0, owner_n
         }
         accounts.append(new_acc)
         save_accounts(accounts, sync_git=False)
-        return dict(new_acc)
+
+    publish_event("accounts", int(owner_id) if owner_id else 0, "account_add")
+    return dict(new_acc)
 
 
 def update_account(account_id: str, updates: dict, sync_git: bool = True) -> bool:
     """تحديث بيانات أو حالة حساب معين بأمان تام"""
+    updated = False
+    owner_id = 0
     with _accounts_lock:
         accounts = load_accounts()
-        updated = False
         for acc in accounts:
             if acc.get("id") == account_id:
                 acc.update(updates)
+                owner_id = int(acc.get("owner_id") or 0)
                 updated = True
                 break
         if updated:
             save_accounts(accounts, sync_git=sync_git)
-        return updated
+    if updated:
+        publish_event("accounts", owner_id, "account_update")
+    return updated
 
 
 def delete_account(account_id: str) -> bool:
     """حذف حساب من السجل وحذف مجلد جلسة البروفايل بالكامل"""
+    deleted = False
+    owner_id = 0
     with _accounts_lock:
         accounts = load_accounts()
         target_acc = next((a for a in accounts if a.get("id") == account_id), None)
         if not target_acc:
             return False
 
+        owner_id = int(target_acc.get("owner_id") or 0)
         p_dir = target_acc.get("profile_dir")
         if p_dir:
             acc_folder = Path(p_dir).name
@@ -181,7 +191,11 @@ def delete_account(account_id: str) -> bool:
 
         updated = [acc for acc in accounts if acc.get("id") != account_id]
         save_accounts(updated, sync_git=True)
-        return True
+        deleted = True
+
+    if deleted:
+        publish_event("accounts", owner_id, "account_delete")
+    return True
 
 
 def get_accounts_by_owner(owner_id: int) -> list[dict]:
@@ -225,7 +239,9 @@ def delete_accounts_by_owner(owner_id: int) -> int:
                 remaining.append(a)
         if deleted_count > 0:
             save_accounts(remaining, sync_git=True)
-        return deleted_count
+    if deleted_count > 0:
+        publish_event("accounts", uid_int, "delete_accounts_by_owner")
+    return deleted_count
 
 
 def purge_broken_accounts(owner_id: int | None = None) -> tuple[int, list[str]]:
@@ -233,9 +249,9 @@ def purge_broken_accounts(owner_id: int | None = None) -> tuple[int, list[str]]:
     تنظيف وحذف كافة الحسابات التالفة أو التي تتطلب تسجيل دخول.
     إذا تم تمرير owner_id يتم تنظيف حسابات هذا المستخدم فقط لضمان عدم المساس بحسابات المطور أو الآخرين.
     """
+    purged_names: list[str] = []
     with _accounts_lock:
         accounts = load_accounts()
-        purged_names = []
         remaining = []
 
         for acc in accounts:
@@ -258,7 +274,9 @@ def purge_broken_accounts(owner_id: int | None = None) -> tuple[int, list[str]]:
         if purged_names:
             save_accounts(remaining, sync_git=True)
 
-        return len(purged_names), purged_names
+    if purged_names:
+        publish_event("accounts", int(owner_id) if owner_id else 0, "purge_broken")
+    return len(purged_names), purged_names
 
 
 def get_account_by_id(account_id: str) -> dict | None:

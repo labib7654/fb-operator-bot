@@ -58,6 +58,7 @@ from fb_operator.actions import (
 from fb_operator.webapp_server import (
     start_webapp_and_tunnel, get_public_webapp_url, update_menu_button_for_user
 )
+from fb_operator.state_events import publish_event, register_listener
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8798272294:AAEY_LIYnVRIY2T-WUP63duCn5V7VFgGsCE")
 
@@ -72,6 +73,36 @@ SHOTS_TEMP_DIR.mkdir(parents=True, exist_ok=True)
 def esc(val) -> str:
     """تنظيف وتشفير كافة المدخلات لمنع حقن HTML أو تعطل رسائل تلغرام"""
     return html.escape(str(val or ""), quote=True)
+
+
+def _prompt_back_markup(back_to: str = "back_to_main") -> types.InlineKeyboardMarkup:
+    """لوحة رجوع فورية تُرفق مع كل طلب إدخال نصي لمنع احتجاز المستخدم داخل أي عملية"""
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    if back_to != "back_to_main":
+        markup.row(
+            types.InlineKeyboardButton("🔙 رجوع", callback_data=f"cancel_to:{back_to}"),
+            types.InlineKeyboardButton("🏠 الرئيسية", callback_data="cancel_to:back_to_main")
+        )
+    else:
+        markup.row(
+            types.InlineKeyboardButton("🔙 إلغاء والرجوع للرئيسية", callback_data="cancel_to:back_to_main")
+        )
+    return markup
+
+
+def _back_home_markup(back_to: str = "back_to_main") -> types.InlineKeyboardMarkup:
+    """لوحة عودة سريعة بعد انتهاء العمليات"""
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    if back_to != "back_to_main":
+        markup.row(
+            types.InlineKeyboardButton("🔙 رجوع", callback_data=back_to),
+            types.InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="back_to_main")
+        )
+    else:
+        markup.row(
+            types.InlineKeyboardButton("🔙 العودة للقائمة الرئيسية", callback_data="back_to_main")
+        )
+    return markup
 
 
 def safe_answer(call_id: str, text: str | None = None, show_alert: bool = False) -> None:
@@ -106,11 +137,32 @@ def safe_edit_reply_markup(chat_id: int, message_id: int, reply_markup) -> None:
         pass
 
 
-def safe_send(chat_id: int, text: str, reply_markup=None) -> None:
+def safe_send(chat_id: int, text: str, reply_markup=None):
     try:
-        bot.send_message(chat_id, text, reply_markup=reply_markup)
+        return bot.send_message(chat_id, text, reply_markup=reply_markup)
     except Exception:
-        pass
+        return None
+
+
+# متتبع الرسائل التفاعلية النشطة لتحديث لوحات تلغرام تلقائياً فور وقوع أي حدث (بدون Polling)
+_active_views: dict[int, dict] = {}
+_active_views_lock = threading.Lock()
+_live_sync_cond = threading.Condition()
+_live_sync_pending_uids: set[int] = set()
+_live_sync_started = False
+
+
+def _track_view(user_id: int, chat_id: int, msg_id: int | None, view: str, target_id: int = 0) -> None:
+    if not msg_id:
+        return
+    with _active_views_lock:
+        _active_views[int(user_id)] = {
+            "chat_id": int(chat_id),
+            "msg_id": int(msg_id),
+            "view": view,
+            "target_id": int(target_id),
+            "last_push": 0.0,
+        }
 
 
 # أقفال عزل بروفايلات المتصفح ومنع تشغيل نفس البروفايل في خيطين متزامنين
@@ -703,6 +755,158 @@ def render_user_dossier(t_id: int):
     return txt, markup
 
 
+def _render_audit_logs_view() -> tuple[str, types.InlineKeyboardMarkup]:
+    logs = load_audit_logs(limit=22)
+    lines = [
+        "📜 <b>سجل الرقابة والأحداث الكامل (Audit Log):</b>",
+        "━━━━━━━━━━━━━━━━━━━━"
+    ]
+    if not logs:
+        lines.append("<i>لا توجد أحداث مسجلة حتى الآن.</i>")
+    else:
+        for lg in reversed(logs):
+            ev = esc(lg.get("event"))
+            ts = esc(lg.get("timestamp", ""))[5:]
+            uname = esc(lg.get("user_name") or lg.get("user_id"))
+            uid = esc(lg.get("user_id"))
+            det = esc(lg.get("details", ""))
+            lines.append(f"• <code>{ts}</code> | <b>[{ev}]</b>\n  👤 {uname} (<code>{uid}</code>)\n  📝 {det}")
+
+    txt = "\n".join(lines)
+    if len(txt) > 3950:
+        txt = txt[:3920] + "\n..."
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.row(
+        types.InlineKeyboardButton("🔄 تحديث السجل", callback_data="menu_audit_logs"),
+        types.InlineKeyboardButton("🛰️ رادار المستخدمين", callback_data="menu_surveillance_radar")
+    )
+    markup.row(types.InlineKeyboardButton("🔙 اللوحة الرئيسية", callback_data="back_to_main"))
+    return txt, markup
+
+
+def _render_manage_accs_view(user_id: int) -> tuple[str, types.InlineKeyboardMarkup]:
+    is_dev = is_super_admin(user_id)
+    accs = get_manageable_accounts_for_user(user_id)
+    can_del = is_dev or has_permission(user_id, "can_delete_accounts")
+    can_add = is_dev or has_permission(user_id, "can_add_accounts")
+
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    for a in accs[-20:]:
+        st_icon = "🟢" if "نشط" in a.get("status", "") else "🔴"
+        if can_del:
+            markup.row(
+                types.InlineKeyboardButton(f"{st_icon} {a['name']}", callback_data="noop"),
+                types.InlineKeyboardButton("🗑️ حذف", callback_data=f"del_acc_{a['id']}")
+            )
+        else:
+            markup.row(types.InlineKeyboardButton(f"{st_icon} {a['name']}", callback_data="noop"))
+
+    if can_add:
+        markup.row(types.InlineKeyboardButton("➕ إضافة حساب جديد للبوت", callback_data="act_add_acc"))
+    if can_del:
+        markup.row(types.InlineKeyboardButton("🧹 تنظيف وحذف الحسابات التالفة", callback_data="act_purge_broken"))
+    markup.row(
+        types.InlineKeyboardButton("🔄 فحص الجلسات", callback_data="act_check_sessions"),
+        types.InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main")
+    )
+
+    title = "👥 <b>إدارة كافة حسابات النظام:</b>\n\n" if is_dev else "📋 <b>حساباتك التي قمت بإضافتها للبوت:</b>\n\n"
+    txt = title
+    for i, a in enumerate(accs, 1):
+        st_text = "🟢 نشط ومسجل" if "نشط" in a.get("status", "") else f"🔴 غير نشط ({esc(a.get('diagnostic_reason') or 'يتطلب تسجيل دخول')})"
+        owner_lbl = a.get("owner_name") or a.get("owner_id") or "المطور الرئيسي"
+        owner_badge = f" | المضيف: {esc(owner_lbl)}" if is_dev else ""
+        txt += f"{i}. <b>{esc(a['name'])}</b> (<code>{esc(a['id'])}</code>){owner_badge}\n   📧 <code>{esc(a['email'])}</code> | {st_text}\n"
+    if not accs:
+        txt += "<i>لا توجد حسابات مسجلة في هذا السجل حتى الآن.</i>"
+    if len(txt) > 3950:
+        txt = txt[:3920] + "\n..."
+    return txt, markup
+
+
+def _refresh_tracked_inline_view(uid: int) -> None:
+    if not hasattr(bot, "edit_message_text"):
+        return
+    with _active_views_lock:
+        entry = dict(_active_views.get(uid) or {})
+    if not entry:
+        return
+
+    now = time.monotonic()
+    elapsed = now - entry.get("last_push", 0.0)
+    if elapsed < 1.2:
+        # انتظر باقي مهلة منع التشبع بدلاً من إسقاط آخر تحديث حي (Trailing-Edge Coalescing)
+        time.sleep(1.2 - elapsed)
+        now = time.monotonic()
+    with _active_views_lock:
+        latest = _active_views.get(uid)
+        if not latest:
+            return
+        latest["last_push"] = now
+        entry = dict(latest)
+
+    view = entry["view"]
+    chat_id = entry["chat_id"]
+    msg_id = entry["msg_id"]
+    target_id = entry.get("target_id", 0)
+
+    if view == "main":
+        txt = get_dashboard_text(uid)
+        markup = get_main_dashboard_markup(uid)
+    elif view == "radar" and is_super_admin(uid):
+        txt, markup = render_surveillance_radar_text_and_markup()
+    elif view == "dossier" and is_super_admin(uid) and target_id:
+        txt, markup = render_user_dossier(target_id)
+        if not txt:
+            txt, markup = render_surveillance_radar_text_and_markup()
+    elif view == "audit" and is_super_admin(uid):
+        txt, markup = _render_audit_logs_view()
+    elif view == "manage_accs":
+        txt, markup = _render_manage_accs_view(uid)
+    else:
+        return
+
+    try:
+        bot.edit_message_text(txt, chat_id, msg_id, reply_markup=markup)
+    except Exception:
+        pass
+
+
+def _live_inline_sync_worker() -> None:
+    while True:
+        with _live_sync_cond:
+            while not _live_sync_pending_uids:
+                _live_sync_cond.wait(timeout=30.0)
+            uids = list(_live_sync_pending_uids)
+            _live_sync_pending_uids.clear()
+        time.sleep(0.35)  # دمج التحديثات المتتالية السريعة في ضغطة واحدة
+        for uid in uids:
+            try:
+                _refresh_tracked_inline_view(uid)
+            except Exception:
+                pass
+
+
+def _on_state_event(scope: str, target_uid: int, reason: str) -> None:
+    """مستمع فوري لتحديث الرسائل النشطة في تلغرام فور حدوث أي عملية أو تسجيل جديد"""
+    with _active_views_lock:
+        tracked_uids = list(_active_views.keys())
+    if not tracked_uids:
+        return
+
+    to_wake: list[int] = []
+    for uid in tracked_uids:
+        if is_super_admin(uid):
+            to_wake.append(uid)
+        elif target_uid == uid or (scope == "accounts" and has_permission(uid, "can_use_accounts")):
+            to_wake.append(uid)
+
+    if to_wake:
+        with _live_sync_cond:
+            _live_sync_pending_uids.update(to_wake)
+            _live_sync_cond.notify_all()
+
+
 # ----------------- معالجات الأوامر والقوائم -----------------
 
 @bot.message_handler(commands=['start', 'menu', 'cancel'])
@@ -715,11 +919,13 @@ def cmd_start(message: types.Message):
     st = get_user_state(message.from_user.id)
     st["input_mode"] = None
     st["temp_acc_data"] = {}
-    safe_send(
+    sent = safe_send(
         message.chat.id,
         get_dashboard_text(message.from_user.id),
         reply_markup=get_main_dashboard_markup(message.from_user.id)
     )
+    if sent and hasattr(sent, "message_id"):
+        _track_view(message.from_user.id, message.chat.id, sent.message_id, "main")
 
 
 @bot.callback_query_handler(func=lambda call: True)
@@ -729,6 +935,19 @@ def handle_callbacks(call: types.CallbackQuery):
 
     if data == "noop":
         safe_answer(call.id)
+        return
+
+    if data.startswith("cancel_to:"):
+        dest = data.split(":", 1)[1].strip()
+        allowed_dests = {"back_to_main", "menu_wizard_react", "menu_wizard_comment", "menu_cmt_interact", "menu_manage_accs"}
+        if dest not in allowed_dests:
+            dest = "back_to_main"
+        st = get_user_state(user_id)
+        st["input_mode"] = None
+        st["temp_acc_data"] = {}
+        safe_answer(call.id, "تم الإلغاء والرجوع")
+        call.data = dest
+        handle_callbacks(call)
         return
 
     # 1. بوابة موافقة / حظر المطور الأكبر (حصرياً لـ SUPER_ADMIN_ID)
@@ -781,7 +1000,8 @@ def handle_callbacks(call: types.CallbackQuery):
         safe_answer(call.id, "🚫 تم حظر المستخدم نهائياً وتصفير صلاحياته!", show_alert=True)
         safe_edit_message(
             f"🚫 <b>تم حظر المستخدم (<code>{target_uid}</code>) ومنعه نهائياً.</b>",
-            call.message.chat.id, call.message.message_id
+            call.message.chat.id, call.message.message_id,
+            reply_markup=_back_home_markup("menu_surveillance_radar")
         )
         return
 
@@ -799,6 +1019,7 @@ def handle_callbacks(call: types.CallbackQuery):
             safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
             return
         txt, markup = render_surveillance_radar_text_and_markup()
+        _track_view(user_id, call.message.chat.id, call.message.message_id, "radar")
         safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
         return
 
@@ -807,31 +1028,8 @@ def handle_callbacks(call: types.CallbackQuery):
             record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", "محاولة فتح سجل الرقابة")
             safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
             return
-        logs = load_audit_logs(limit=22)
-        lines = [
-            "📜 <b>سجل الرقابة والأحداث الكامل (Audit Log):</b>",
-            "━━━━━━━━━━━━━━━━━━━━"
-        ]
-        if not logs:
-            lines.append("<i>لا توجد أحداث مسجلة حتى الآن.</i>")
-        else:
-            for lg in reversed(logs):
-                ev = esc(lg.get("event"))
-                ts = esc(lg.get("timestamp", ""))[5:]
-                uname = esc(lg.get("user_name") or lg.get("user_id"))
-                uid = esc(lg.get("user_id"))
-                det = esc(lg.get("details", ""))
-                lines.append(f"• <code>{ts}</code> | <b>[{ev}]</b>\n  👤 {uname} (<code>{uid}</code>)\n  📝 {det}")
-
-        txt = "\n".join(lines)
-        if len(txt) > 3950:
-            txt = txt[:3920] + "\n..."
-        markup = types.InlineKeyboardMarkup(row_width=2)
-        markup.row(
-            types.InlineKeyboardButton("🔄 تحديث السجل", callback_data="menu_audit_logs"),
-            types.InlineKeyboardButton("🛰️ رادار المستخدمين", callback_data="menu_surveillance_radar")
-        )
-        markup.row(types.InlineKeyboardButton("🔙 اللوحة الرئيسية", callback_data="back_to_main"))
+        txt, markup = _render_audit_logs_view()
+        _track_view(user_id, call.message.chat.id, call.message.message_id, "audit")
         safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
         return
 
@@ -848,6 +1046,7 @@ def handle_callbacks(call: types.CallbackQuery):
         if not txt:
             safe_answer(call.id, "المستخدم غير موجود أو هو المطور الرئيسي.", show_alert=True)
             return
+        _track_view(user_id, call.message.chat.id, call.message.message_id, "dossier", target_id=t_id)
         safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
         return
 
@@ -1008,10 +1207,18 @@ def handle_callbacks(call: types.CallbackQuery):
         val = data.replace("set_react_post_", "")
         if val == "custom":
             st["input_mode"] = "waiting_react_post_num"
-            safe_send(call.message.chat.id, "🔢 <b>أرسل الآن رقم المنشور المستهدف للتفاعل (أو أرسل إلغاء):</b>")
+            safe_send(
+                call.message.chat.id,
+                "🔢 <b>أرسل الآن رقم المنشور المستهدف للتفاعل:</b>",
+                reply_markup=_prompt_back_markup("menu_wizard_react")
+            )
         elif val == "url":
             st["input_mode"] = "waiting_react_post_url"
-            safe_send(call.message.chat.id, "🔗 <b>أرسل رابط المنشور المباشر للتفاعل عليه (أو أرسل إلغاء):</b>")
+            safe_send(
+                call.message.chat.id,
+                "🔗 <b>أرسل رابط المنشور المباشر للتفاعل عليه:</b>",
+                reply_markup=_prompt_back_markup("menu_wizard_react")
+            )
         else:
             try:
                 st["react_post_index"] = int(val)
@@ -1083,7 +1290,11 @@ def handle_callbacks(call: types.CallbackQuery):
         if not require_perm_or_deny(call, "can_comment", "⛔ صلاحية التعليقات غير مفعلة لحسابك."):
             return
         st["input_mode"] = "waiting_comment_text"
-        safe_send(call.message.chat.id, "💬 <b>أرسل الآن نص التعليق الجديد الذي ترغب بنشره (أو أرسل إلغاء):</b>")
+        safe_send(
+            call.message.chat.id,
+            "💬 <b>أرسل الآن نص التعليق الجديد الذي ترغب بنشره:</b>",
+            reply_markup=_prompt_back_markup("menu_wizard_comment")
+        )
 
     elif data.startswith("set_cmt_post_"):
         if not require_perm_or_deny(call, "can_comment", "⛔ صلاحية التعليقات غير مفعلة لحسابك."):
@@ -1091,10 +1302,18 @@ def handle_callbacks(call: types.CallbackQuery):
         val = data.replace("set_cmt_post_", "")
         if val == "custom":
             st["input_mode"] = "waiting_cmt_post_num"
-            safe_send(call.message.chat.id, "🔢 <b>أرسل الآن رقم المنشور المطلوب التعليق عليه (أو أرسل إلغاء):</b>")
+            safe_send(
+                call.message.chat.id,
+                "🔢 <b>أرسل الآن رقم المنشور المطلوب التعليق عليه:</b>",
+                reply_markup=_prompt_back_markup("menu_wizard_comment")
+            )
         elif val == "url":
             st["input_mode"] = "waiting_cmt_post_url"
-            safe_send(call.message.chat.id, "🔗 <b>أرسل رابط المنشور المباشر للتعليق عليه (أو أرسل إلغاء):</b>")
+            safe_send(
+                call.message.chat.id,
+                "🔗 <b>أرسل رابط المنشور المباشر للتعليق عليه:</b>",
+                reply_markup=_prompt_back_markup("menu_wizard_comment")
+            )
         else:
             try:
                 st["comment_post_index"] = int(val)
@@ -1177,7 +1396,8 @@ def handle_callbacks(call: types.CallbackQuery):
         safe_send(
             call.message.chat.id,
             f"✉️ <b>النص الحالي للرسالة الخاصة:</b>\n<i>'{esc(st['message_text'])}'</i>\n\n"
-            "أرسل الآن النص الجديد للرسالة الخاصة (أو أرسل إلغاء):"
+            "أرسل الآن النص الجديد للرسالة الخاصة:",
+            reply_markup=_prompt_back_markup("back_to_main")
         )
 
     # E) البلاغات والحظر (can_report)
@@ -1306,13 +1526,21 @@ def handle_callbacks(call: types.CallbackQuery):
         if not require_perm_or_deny(call, "can_interact_comments", "⛔ صلاحية التفاعل مع التعليقات غير مفعلة."):
             return
         st["input_mode"] = "waiting_cmt_val"
-        safe_send(call.message.chat.id, "✏️ <b>أرسل الآن اسم كاتب التعليق أو الكلمة المفتاحية أو الترتيب (أو أرسل إلغاء):</b>")
+        safe_send(
+            call.message.chat.id,
+            "✏️ <b>أرسل الآن اسم كاتب التعليق أو الكلمة المفتاحية أو الترتيب:</b>",
+            reply_markup=_prompt_back_markup("menu_cmt_interact")
+        )
 
     elif data == "edit_cmt_reply_text":
         if not require_perm_or_deny(call, "can_interact_comments", "⛔ صلاحية التفاعل مع التعليقات غير مفعلة."):
             return
         st["input_mode"] = "waiting_cmt_reply"
-        safe_send(call.message.chat.id, "✏️ <b>أرسل الآن نص الرد على التعليق (أو أرسل إلغاء):</b>")
+        safe_send(
+            call.message.chat.id,
+            "✏️ <b>أرسل الآن نص الرد على التعليق:</b>",
+            reply_markup=_prompt_back_markup("menu_cmt_interact")
+        )
 
     # G) الرابط المستهدف واختيار الحساب المنفذ
     elif data == "menu_set_url":
@@ -1322,7 +1550,8 @@ def handle_callbacks(call: types.CallbackQuery):
         st["input_mode"] = "waiting_url"
         safe_send(
             call.message.chat.id,
-            "🔗 <b>أرسل الآن الرابط المستهدف الجديد (منشور أو حساب فيسبوك) أو أرسل إلغاء:</b>"
+            "🔗 <b>أرسل الآن الرابط المستهدف الجديد (منشور أو حساب فيسبوك):</b>",
+            reply_markup=_prompt_back_markup("back_to_main")
         )
 
     elif data == "menu_select_acc":
@@ -1366,43 +1595,9 @@ def handle_callbacks(call: types.CallbackQuery):
             safe_answer(call.id, "⛔ ليس لديك صلاحية إدارة أو إضافة الحسابات.", show_alert=True)
             return
 
-        accs = get_manageable_accounts_for_user(user_id)
-        can_del = is_dev or has_permission(user_id, "can_delete_accounts")
-        can_add = is_dev or has_permission(user_id, "can_add_accounts")
-
-        markup = types.InlineKeyboardMarkup(row_width=2)
-        for a in accs[-20:]:
-            st_icon = "🟢" if "نشط" in a.get("status", "") else "🔴"
-            if can_del:
-                markup.row(
-                    types.InlineKeyboardButton(f"{st_icon} {a['name']}", callback_data="noop"),
-                    types.InlineKeyboardButton("🗑️ حذف", callback_data=f"del_acc_{a['id']}")
-                )
-            else:
-                markup.row(types.InlineKeyboardButton(f"{st_icon} {a['name']}", callback_data="noop"))
-
-        if can_add:
-            markup.row(types.InlineKeyboardButton("➕ إضافة حساب جديد للبوت", callback_data="act_add_acc"))
-        if can_del:
-            markup.row(types.InlineKeyboardButton("🧹 تنظيف وحذف الحسابات التالفة", callback_data="act_purge_broken"))
-        markup.row(
-            types.InlineKeyboardButton("🔄 فحص الجلسات", callback_data="act_check_sessions"),
-            types.InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main")
-        )
-
-        title = "👥 <b>إدارة كافة حسابات النظام:</b>\n\n" if is_dev else "📋 <b>حساباتك التي قمت بإضافتها للبوت:</b>\n\n"
-        txt = title
-        for i, a in enumerate(accs, 1):
-            st_text = "🟢 نشط ومسجل" if "نشط" in a.get("status", "") else f"🔴 غير نشط ({esc(a.get('diagnostic_reason') or 'يتطلب تسجيل دخول')})"
-            owner_lbl = a.get("owner_name") or a.get("owner_id") or "المطور الرئيسي"
-            owner_badge = f" | المضيف: {esc(owner_lbl)}" if is_dev else ""
-            txt += f"{i}. <b>{esc(a['name'])}</b> (<code>{esc(a['id'])}</code>){owner_badge}\n   📧 <code>{esc(a['email'])}</code> | {st_text}\n"
-        if not accs:
-            txt += "<i>لا توجد حسابات مسجلة في هذا السجل حتى الآن.</i>"
-        if len(txt) > 3950:
-            txt = txt[:3920] + "\n..."
-
+        txt, markup = _render_manage_accs_view(user_id)
         safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+        _track_view(user_id, call.message.chat.id, call.message.message_id, "manage_accs")
 
     elif data.startswith("del_acc_"):
         if not (is_super_admin(user_id) or has_permission(user_id, "can_delete_accounts")):
@@ -1446,7 +1641,11 @@ def handle_callbacks(call: types.CallbackQuery):
             return
         st["input_mode"] = "add_acc_name"
         st["temp_acc_data"] = {}
-        safe_send(call.message.chat.id, "➕ <b>أرسل اسم الحساب أو لقبه أولاً (مثال: حساب فيسبوك 1) — أو أرسل 'إلغاء':</b>")
+        safe_send(
+            call.message.chat.id,
+            "➕ <b>أرسل اسم الحساب أو لقبه أولاً (مثال: حساب فيسبوك 1):</b>",
+            reply_markup=_prompt_back_markup("menu_manage_accs")
+        )
 
     elif data == "act_check_sessions":
         if not (is_super_admin(user_id) or has_permission(user_id, "can_add_accounts") or has_permission(user_id, "can_use_accounts")):
@@ -1456,11 +1655,14 @@ def handle_callbacks(call: types.CallbackQuery):
         threading.Thread(target=check_all_sessions_worker, args=(call.message.chat.id, user_id), daemon=True).start()
 
     elif data == "back_to_main":
+        st["input_mode"] = None
+        st["temp_acc_data"] = {}
         safe_edit_message(
             get_dashboard_text(user_id),
             call.message.chat.id, call.message.message_id,
             reply_markup=get_main_dashboard_markup(user_id)
         )
+        _track_view(user_id, call.message.chat.id, call.message.message_id, "main")
 
     # I) الإطلاق الميداني (can_execute)
     elif data == "action_launch":
@@ -1502,7 +1704,11 @@ def check_all_sessions_worker(chat_id: int, requester_id: int):
     active_cnt = 0
     total = len(accs)
     if total == 0:
-        safe_edit_message("<i>لا توجد حسابات في نطاقك لفحصها حالياً.</i>", chat_id, status_msg_id)
+        safe_edit_message(
+            "<i>لا توجد حسابات في نطاقك لفحصها حالياً.</i>",
+            chat_id, status_msg_id,
+            reply_markup=_back_home_markup("menu_manage_accs")
+        )
         return
 
     for idx, a in enumerate(accs, 1):
@@ -1547,7 +1753,8 @@ def check_all_sessions_worker(chat_id: int, requester_id: int):
         f"🟢 <b>الحسابات النشطة:</b> {active_cnt}\n"
         f"🔴 <b>غير نشط / يتطلب دخول:</b> {total - active_cnt}\n"
         f"━━━━━━━━━━━━━━━━━━━━",
-        chat_id, status_msg_id
+        chat_id, status_msg_id,
+        reply_markup=_back_home_markup("menu_manage_accs")
     )
 
 
@@ -1608,9 +1815,13 @@ def handle_text_inputs(message: types.Message):
             st["comment_post_url"] = ""
             st["input_mode"] = None
             bot.reply_to(message, f"✅ تم تحديد التعليق على المنشور رقم: <b>{text}</b>")
+            cmd_start(message)
         else:
-            bot.reply_to(message, "❌ يرجى إرسال رقم صحيح أكبر من الصفر (مثال: 4).")
-        cmd_start(message)
+            bot.reply_to(
+                message,
+                "❌ يرجى إرسال رقم صحيح أكبر من الصفر (مثال: 4).",
+                reply_markup=_prompt_back_markup("menu_wizard_comment")
+            )
 
     elif mode == "waiting_cmt_post_url":
         if not (is_super_admin(user_id) or has_permission(user_id, "can_comment")):
@@ -1630,9 +1841,13 @@ def handle_text_inputs(message: types.Message):
             st["react_post_url"] = ""
             st["input_mode"] = None
             bot.reply_to(message, f"✅ تم تحديد التفاعل مع المنشور رقم: <b>{text}</b>")
+            cmd_start(message)
         else:
-            bot.reply_to(message, "❌ يرجى إرسال رقم صحيح أكبر من الصفر (مثال: 4).")
-        cmd_start(message)
+            bot.reply_to(
+                message,
+                "❌ يرجى إرسال رقم صحيح أكبر من الصفر (مثال: 4).",
+                reply_markup=_prompt_back_markup("menu_wizard_react")
+            )
 
     elif mode == "waiting_react_post_url":
         if not (is_super_admin(user_id) or has_permission(user_id, "can_react")):
@@ -1668,7 +1883,11 @@ def handle_text_inputs(message: types.Message):
             return
         st["temp_acc_data"]["name"] = text
         st["input_mode"] = "add_acc_email"
-        bot.reply_to(message, "📧 <b>الآن أرسل البريد الإلكتروني أو رقم الهاتف للحساب (أو أرسل إلغاء):</b>")
+        bot.reply_to(
+            message,
+            "📧 <b>الآن أرسل البريد الإلكتروني أو رقم الهاتف للحساب:</b>",
+            reply_markup=_prompt_back_markup("menu_manage_accs")
+        )
 
     elif mode == "add_acc_email":
         if not (is_super_admin(user_id) or has_permission(user_id, "can_add_accounts")):
@@ -1676,7 +1895,11 @@ def handle_text_inputs(message: types.Message):
             return
         st["temp_acc_data"]["email"] = text
         st["input_mode"] = "add_acc_pass"
-        bot.reply_to(message, "🔑 <b>الآن أرسل كلمة المرور الخاصة بالحساب (أو أرسل إلغاء):</b>")
+        bot.reply_to(
+            message,
+            "🔑 <b>الآن أرسل كلمة المرور الخاصة بالحساب:</b>",
+            reply_markup=_prompt_back_markup("menu_manage_accs")
+        )
 
     elif mode == "add_acc_pass":
         if not (is_super_admin(user_id) or has_permission(user_id, "can_add_accounts")):
@@ -1832,7 +2055,8 @@ def async_login_account_worker(
                 f"👤 <b>الاسم:</b> {esc(acc['name'])}\n"
                 f"📧 <b>البريد:</b> <code>{esc(acc['email'])}</code>\n"
                 f"🛡️ <b>الحالة:</b> 🟢 نشط ومسجل بالكوكيز الدائمة",
-                chat_id, msg_id
+                chat_id, msg_id,
+                reply_markup=_back_home_markup("menu_manage_accs")
             )
             if has_shot:
                 try:
@@ -1853,7 +2077,8 @@ def async_login_account_worker(
             safe_edit_message(
                 f"⚠️ <b>تم حفظ بيانات الحساب '<code>{esc(acc['email'])}</code>' ولكن لم تكتمل الجلسة تلقائياً.</b>\n"
                 f"🔍 <b>السبب المشخص:</b> {esc(diag_reason)}",
-                chat_id, msg_id
+                chat_id, msg_id,
+                reply_markup=_back_home_markup("menu_manage_accs")
             )
             if has_shot:
                 try:
@@ -1881,7 +2106,11 @@ def async_login_account_worker(
         })
         record_account_result_for_user(owner_id, is_active=False)
         record_audit_log(owner_id, owner_name, "ACCOUNT_INACTIVE", f"فشل تشغيلي للحساب {acc['email']}: {err_str[:150]}")
-        safe_edit_message(f"❌ حدث خطأ أثناء تسجيل الحساب:\n<code>{esc(err_str[:250])}</code>", chat_id, msg_id)
+        safe_edit_message(
+            f"❌ حدث خطأ أثناء تسجيل الحساب:\n<code>{esc(err_str[:250])}</code>",
+            chat_id, msg_id,
+            reply_markup=_back_home_markup("menu_manage_accs")
+        )
         _notify_developer_account_result(
             owner_id=owner_id,
             owner_name=owner_name,
@@ -1906,13 +2135,14 @@ def execute_mission_worker(chat_id: int, user_id: int):
     st["is_running"] = True
     status_msg = None
 
-    def update_live_status(text: str):
+    def update_live_status(text: str, reply_markup=None):
         clean_plain = html.unescape(re.sub(r"<[^>]+>", "", text)).strip()
         st["live_status_text"] = clean_plain
+        publish_event("mission", user_id, "live_status")
         if status_msg is not None:
-            safe_edit_message(text, chat_id, status_msg.message_id)
+            safe_edit_message(text, chat_id, status_msg.message_id, reply_markup=reply_markup)
         else:
-            safe_send(chat_id, text)
+            safe_send(chat_id, text, reply_markup=reply_markup)
 
     try:
         try:
@@ -1920,8 +2150,9 @@ def execute_mission_worker(chat_id: int, user_id: int):
         except Exception:
             status_msg = None
         st["live_status_text"] = "بدء تهيئة محرك العمليات والتحقق من الصلاحيات..."
+        publish_event("mission", user_id, "started")
         if not (is_super_admin(user_id) or (is_authorized_user(user_id) and has_permission(user_id, "can_execute"))):
-            update_live_status("⛔ <b>تم إيقاف المهمة:</b> ليس لديك صلاحية التنفيذ.")
+            update_live_status("⛔ <b>تم إيقاف المهمة:</b> ليس لديك صلاحية التنفيذ.", reply_markup=_back_home_markup())
             return
 
         usable = get_usable_accounts_for_user(user_id)
@@ -1934,7 +2165,7 @@ def execute_mission_worker(chat_id: int, user_id: int):
             target_accounts = [a for a in usable if a["id"] == st["selected_acc"]]
 
         if not target_accounts:
-            update_live_status("❌ <b>خطأ:</b> لم يتم العثور على أي حساب مصرح لك باستخدامه.")
+            update_live_status("❌ <b>خطأ:</b> لم يتم العثور على أي حساب مصرح لك باستخدامه.", reply_markup=_back_home_markup())
             return
 
         # تطبيق حدود عدد الحسابات إذا حددها المستخدم في معالجات التفاعل أو التعليق
@@ -1951,8 +2182,11 @@ def execute_mission_worker(chat_id: int, user_id: int):
         for idx, acc in enumerate(target_accounts, 1):
             # التحقق الفوري أثناء التشغيل تحسباً لحظْر أو سحب الصلاحيات في المنتصف
             if not (is_super_admin(user_id) or (is_authorized_user(user_id) and has_permission(user_id, "can_execute"))):
-                update_live_status("⛔ <b>تم إيقاف التشغيل فوراً لأن المطور قام بسحب صلاحية التنفيذ أو حظر الحساب.</b>")
-                break
+                update_live_status(
+                    "⛔ <b>تم إيقاف التشغيل فوراً لأن المطور قام بسحب صلاحية التنفيذ أو حظر الحساب.</b>",
+                    reply_markup=_back_home_markup()
+                )
+                return
 
             label_acc = acc["name"] if is_super_admin(user_id) else f"{acc['name']}"
             update_live_status(
@@ -2093,13 +2327,15 @@ def execute_mission_worker(chat_id: int, user_id: int):
             "━━━━━━━━━━━━━━━━━━━━\n"
             f"✅ <b>إجمالي الإجراءات المنفذة:</b> {actions_done}\n"
             f"👥 <b>الحسابات المشاركة:</b> {total_accounts}\n"
-            "━━━━━━━━━━━━━━━━━━━━"
+            "━━━━━━━━━━━━━━━━━━━━",
+            reply_markup=_back_home_markup()
         )
 
     except Exception as e:
-        update_live_status(f"❌ حدث خطأ أثناء التنفيذ: <code>{esc(e)}</code>")
+        update_live_status(f"❌ حدث خطأ أثناء التنفيذ: <code>{esc(e)}</code>", reply_markup=_back_home_markup())
     finally:
         st["is_running"] = False
+        publish_event("mission", user_id, "done")
 
 
 # ----------------- خادم لوحة التحكم المصغرة داخل تلغرام (Telegram Mini App Server) -----------------
@@ -2142,6 +2378,7 @@ def _build_webapp_hooks() -> dict:
 
 
 def run_telegram_bot():
+    global _live_sync_started
     print("=" * 60)
     print("🚀 بدء تشغيل بوت تلغرام FB Operator في السحاب 24/7...")
     try:
@@ -2150,6 +2387,11 @@ def run_telegram_bot():
         pass
     print(f"👑 معرف المطور الرئيسي الحصين: {SUPER_ADMIN_ID}")
     print("=" * 60)
+
+    if not _live_sync_started:
+        register_listener(_on_state_event)
+        threading.Thread(target=_live_inline_sync_worker, daemon=True).start()
+        _live_sync_started = True
 
     start_webapp_and_tunnel(BOT_TOKEN, _build_webapp_hooks())
 

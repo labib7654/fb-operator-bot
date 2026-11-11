@@ -438,6 +438,9 @@ def get_miniapp_html() -> str:
 
         <!-- تبويب إدارة وإضافة الحسابات -->
         <div id="tab-accounts" class="tab-view hidden">
+            <div style="margin-bottom:10px;" id="accBackBar">
+                <button type="button" class="btn btn-muted btn-sm" onclick="goHomeTab()">رجوع للقائمة الرئيسية</button>
+            </div>
             <div class="panel" id="secAddAccount">
                 <div class="panel-title">إضافة حساب فيسبوك جديد للبوت</div>
                 <div class="field"><label>اسم / لقب الحساب</label><input type="text" id="addAccName" placeholder="مثال: حساب فيسبوك 1"></div>
@@ -463,7 +466,10 @@ def get_miniapp_html() -> str:
             <div class="panel">
                 <div class="panel-title">
                     <span>رادار المستخدمين والصلاحيات</span>
-                    <button type="button" class="btn btn-muted btn-sm" onclick="loadAdminRadar()">تحديث الرادار</button>
+                    <div style="display:flex;gap:6px;">
+                        <button type="button" class="btn btn-muted btn-sm" onclick="loadAdminRadar()">تحديث</button>
+                        <button type="button" class="btn btn-muted btn-sm" onclick="goHomeTab()">رجوع</button>
+                    </div>
                 </div>
                 <div id="radarUsersContainer"></div>
             </div>
@@ -475,7 +481,10 @@ def get_miniapp_html() -> str:
             <div class="panel">
                 <div class="panel-title">
                     <span>سجل الرقابة والأحداث الكامل</span>
-                    <button type="button" class="btn btn-muted btn-sm" onclick="loadAuditLogs()">تحديث السجل</button>
+                    <div style="display:flex;gap:6px;">
+                        <button type="button" class="btn btn-muted btn-sm" onclick="loadAuditLogs()">تحديث</button>
+                        <button type="button" class="btn btn-muted btn-sm" onclick="goHomeTab()">رجوع</button>
+                    </div>
                 </div>
                 <div id="auditLogsContainer"></div>
             </div>
@@ -494,7 +503,15 @@ if (tg) {
 
 let appState = null;
 let selectedRadarUid = null;
-let pollTimer = null;
+let currentTabs = [];
+let lastEventSeq = 0;
+let syncRunning = false;
+let syncAbortCtrl = null;
+let lastRadarData = null;
+
+if (tg && tg.BackButton) {
+    tg.BackButton.onClick(() => handleNativeBack());
+}
 
 function escHtml(v) {
     return String(v == null ? "" : v)
@@ -512,7 +529,7 @@ function showToast(msg) {
     setTimeout(() => { t.style.display = "none"; }, 3200);
 }
 
-async function apiCall(path, method = "GET", bodyObj = null) {
+async function apiCall(path, method = "GET", bodyObj = null, signal = null) {
     const initData = tg ? tg.initData : "";
     const opts = {
         method,
@@ -521,64 +538,184 @@ async function apiCall(path, method = "GET", bodyObj = null) {
             "X-Telegram-Init-Data": initData || ""
         }
     };
+    if (signal) {
+        opts.signal = signal;
+    }
     if (bodyObj !== null) {
         opts.body = JSON.stringify(bodyObj);
     }
     const res = await fetch(path, opts);
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
-        throw new Error(data.error || ("HTTP " + res.status));
+        const err = new Error(data.error || ("HTTP " + res.status));
+        err.status = res.status;
+        throw err;
     }
     return data;
 }
+
+function closeRadarDossier() {
+    selectedRadarUid = null;
+    const panel = document.getElementById("selectedUserDossier");
+    if (panel) {
+        panel.classList.add("hidden");
+        panel.innerHTML = "";
+    }
+    updateTelegramBackButton();
+}
+
+function goHomeTab() {
+    if (selectedRadarUid !== null) {
+        closeRadarDossier();
+    }
+    if (currentTabs.length > 0) {
+        switchTab(currentTabs[0].id);
+    }
+}
+
+function handleNativeBack() {
+    const activeTab = document.getElementById("tabsBar")?.dataset.activeTab || "";
+    if (activeTab === "radar" && selectedRadarUid !== null) {
+        closeRadarDossier();
+        return;
+    }
+    if (currentTabs.length > 1 && activeTab !== currentTabs[0].id) {
+        switchTab(currentTabs[0].id);
+    }
+}
+
+function updateTelegramBackButton() {
+    if (!tg || !tg.BackButton) return;
+    const activeTab = document.getElementById("tabsBar")?.dataset.activeTab || "";
+    const inSubView = (activeTab === "radar" && selectedRadarUid !== null) ||
+        (currentTabs.length > 1 && activeTab && activeTab !== currentTabs[0].id);
+    try {
+        if (inSubView) tg.BackButton.show();
+        else tg.BackButton.hide();
+    } catch (_) {}
+}
+
+function refreshUsableSelect() {
+    const sel = document.getElementById("inpSelectedAcc");
+    if (!sel || !appState) return;
+    const prevVal = sel.value || (appState.mission_state && appState.mission_state.selected_acc) || "all";
+    sel.innerHTML = "";
+    const optAll = document.createElement("option");
+    optAll.value = "all";
+    optAll.textContent = "جميع الحسابات المتاحة النشطة";
+    sel.appendChild(optAll);
+    for (const a of (appState.usable_accounts || [])) {
+        const opt = document.createElement("option");
+        opt.value = a.id;
+        opt.textContent = (a.is_active ? "[نشط] " : "[غير نشط] ") + a.name;
+        sel.appendChild(opt);
+    }
+    const exists = Array.from(sel.options).some(o => o.value === prevVal);
+    sel.value = exists ? prevVal : "all";
+}
+
+async function applyLiveSyncUpdate(scopes) {
+    const fresh = await apiCall("/api/bootstrap");
+    if (fresh.event_seq) lastEventSeq = fresh.event_seq;
+
+    if (!fresh.authorized) {
+        document.getElementById("appShell").classList.add("hidden");
+        const lb = document.getElementById("lockedBox");
+        lb.classList.remove("hidden");
+        document.getElementById("lockedTitle").textContent = fresh.status === "banned" ? "حسابك محظور" : "بانتظار موافقة المطور";
+        document.getElementById("lockedMsg").textContent = fresh.message || "يرجى انتظار اعتماد المطور وتخصيص الصلاحيات لك.";
+        updateTelegramBackButton();
+        return;
+    }
+
+    const wasLocked = !appState || !appState.authorized;
+    const prevPerms = JSON.stringify(appState && appState.permissions ? appState.permissions : {});
+    const nextPerms = JSON.stringify(fresh.permissions || {});
+    appState = fresh;
+    document.getElementById("appShell").classList.remove("hidden");
+
+    if (wasLocked || prevPerms !== nextPerms) {
+        renderApp();
+    } else {
+        renderMissionBanner();
+        refreshUsableSelect();
+        renderAccountsList();
+    }
+
+    if (fresh.is_super_admin) {
+        const scList = scopes || [];
+        const activeTab = document.getElementById("tabsBar")?.dataset.activeTab || "";
+        if ((scList.includes("users") || scList.includes("accounts")) && activeTab === "radar") {
+            await loadAdminRadar();
+        }
+        if ((scList.includes("audit") || scList.includes("users") || scList.includes("accounts")) && activeTab === "audit") {
+            await loadAuditLogs();
+        }
+    }
+}
+
+async function startEventSyncLoop() {
+    if (syncRunning) return;
+    syncRunning = true;
+    let backoffMs = 1500;
+
+    while (syncRunning) {
+        if (document.visibilityState === "hidden") {
+            await new Promise(r => setTimeout(r, 800));
+            continue;
+        }
+        try {
+            syncAbortCtrl = new AbortController();
+            const ev = await apiCall("/api/sync/wait?since=" + lastEventSeq + "&timeout=22", "GET", null, syncAbortCtrl.signal);
+            backoffMs = 1500;
+            if (ev && typeof ev.seq === "number" && ev.seq > lastEventSeq) {
+                lastEventSeq = ev.seq;
+            }
+            if (ev && ev.changed) {
+                await applyLiveSyncUpdate(ev.scopes || []);
+            }
+        } catch (err) {
+            if (err && err.name === "AbortError") {
+                continue;
+            }
+            if (err && (err.status === 401 || err.status === 403)) {
+                syncRunning = false;
+                break;
+            }
+            await new Promise(r => setTimeout(r, backoffMs));
+            backoffMs = Math.min(8000, backoffMs * 2);
+        }
+    }
+}
+
+document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden" && syncAbortCtrl) {
+        try { syncAbortCtrl.abort(); } catch (_) {}
+    } else if (document.visibilityState === "visible" && syncRunning) {
+        applyLiveSyncUpdate(["users", "accounts", "audit", "mission"]).catch(() => {});
+    }
+});
 
 async function bootstrap() {
     try {
         const data = await apiCall("/api/bootstrap");
         document.getElementById("loadingBox").classList.add("hidden");
+        if (data.event_seq) lastEventSeq = data.event_seq;
 
         if (!data.authorized) {
+            appState = data;
             const lb = document.getElementById("lockedBox");
             lb.classList.remove("hidden");
             document.getElementById("lockedTitle").textContent = data.status === "banned" ? "حسابك محظور" : "بانتظار موافقة المطور";
             document.getElementById("lockedMsg").textContent = data.message || "يرجى انتظار اعتماد المطور وتخصيص الصلاحيات لك.";
+            startEventSyncLoop();
             return;
         }
 
         appState = data;
         document.getElementById("appShell").classList.remove("hidden");
         renderApp();
-
-        if (!pollTimer) {
-            pollTimer = setInterval(async () => {
-                try {
-                    const fresh = await apiCall("/api/bootstrap");
-                    if (fresh && !fresh.authorized) {
-                        document.getElementById("appShell").classList.add("hidden");
-                        const lb = document.getElementById("lockedBox");
-                        lb.classList.remove("hidden");
-                        document.getElementById("lockedTitle").textContent = fresh.status === "banned" ? "حسابك محظور" : "تم سحب الصلاحية";
-                        document.getElementById("lockedMsg").textContent = fresh.message || "تم تعليق وصولك للنظام.";
-                        clearInterval(pollTimer);
-                        pollTimer = null;
-                        return;
-                    }
-                    if (fresh && fresh.authorized) {
-                        const prevPerms = JSON.stringify(appState && appState.permissions ? appState.permissions : {});
-                        const nextPerms = JSON.stringify(fresh.permissions || {});
-                        appState = fresh;
-                        if (prevPerms !== nextPerms) {
-                            renderApp();
-                        } else {
-                            renderMissionBanner();
-                            if (document.getElementById("tab-accounts") && !document.getElementById("tab-accounts").classList.contains("hidden")) {
-                                renderAccountsList();
-                            }
-                        }
-                    }
-                } catch (_) {}
-            }, 4000);
-        }
+        startEventSyncLoop();
     } catch (err) {
         document.getElementById("loadingBox").classList.add("hidden");
         const lb = document.getElementById("lockedBox");
@@ -599,7 +736,7 @@ function renderApp() {
 
     const enabledLabels = appState.enabled_labels || [];
     document.getElementById("userPermsSummary").textContent = isDev
-        ? "صلاحيات سيادية كاملة (10/10)"
+        ? "صلاحيات سيادية كاملة | مزامنة فورية بالأحداث"
         : (enabledLabels.length ? "المفعل: " + enabledLabels.join("، ") : "بانتظار تفعيل الميزات من المطور");
 
     // بناء التبويبات حسب الصلاحيات بدقة
@@ -613,6 +750,12 @@ function renderApp() {
         tabs.push({ id: "radar", label: "الرادار والصلاحيات" });
         tabs.push({ id: "audit", label: "سجل الرقابة" });
     }
+    currentTabs = tabs;
+
+    const accBackBar = document.getElementById("accBackBar");
+    if (accBackBar) {
+        accBackBar.classList.toggle("hidden", tabs.length <= 1 || tabs[0].id === "accounts");
+    }
 
     const tabsBar = document.getElementById("tabsBar");
     tabsBar.innerHTML = "";
@@ -623,6 +766,7 @@ function renderApp() {
         lb.classList.remove("hidden");
         document.getElementById("lockedTitle").textContent = "حسابك معتمد بنجاح";
         document.getElementById("lockedMsg").textContent = "لم يفعّل المطور أي أداة أو صلاحية لحسابك بعد.";
+        updateTelegramBackButton();
         return;
     }
 
@@ -650,7 +794,6 @@ function switchTab(tabId, reloadData = true) {
         btn.classList.remove("active");
     });
     const btns = Array.from(document.getElementById("tabsBar").children);
-    const mapIdx = ["mission", "accounts", "radar", "audit"].filter(id => document.getElementById("tab-" + id));
     btns.forEach(b => {
         if ((b.textContent === "العمليات" && tabId === "mission") ||
             ((b.textContent === "الحسابات" || b.textContent === "إضافة الحسابات") && tabId === "accounts") ||
@@ -663,6 +806,8 @@ function switchTab(tabId, reloadData = true) {
     document.querySelectorAll(".tab-view").forEach(v => v.classList.add("hidden"));
     const target = document.getElementById("tab-" + tabId);
     if (target) target.classList.remove("hidden");
+
+    updateTelegramBackButton();
 
     if (reloadData) {
         if (tabId === "radar") loadAdminRadar();
@@ -982,15 +1127,24 @@ function selectRadarUser(uid, radarData) {
     const u = (radarData.users || []).find(x => x.id === uid);
     const panel = document.getElementById("selectedUserDossier");
     if (!u) {
-        panel.classList.add("hidden");
+        closeRadarDossier();
         return;
     }
     panel.classList.remove("hidden");
     panel.innerHTML = "";
+    updateTelegramBackButton();
 
     const title = document.createElement("div");
     title.className = "panel-title";
-    title.textContent = "بطاقة المستخدم: " + u.name + " (" + u.id + ")";
+    const tSpan = document.createElement("span");
+    tSpan.textContent = "بطاقة المستخدم: " + u.name + " (" + u.id + ")";
+    const backBtn = document.createElement("button");
+    backBtn.type = "button";
+    backBtn.className = "btn btn-muted btn-sm";
+    backBtn.textContent = "رجوع للقائمة";
+    backBtn.onclick = () => closeRadarDossier();
+    title.appendChild(tSpan);
+    title.appendChild(backBtn);
     panel.appendChild(title);
 
     const meta = document.createElement("div");

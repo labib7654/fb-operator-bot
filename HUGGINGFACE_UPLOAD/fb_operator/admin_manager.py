@@ -12,6 +12,7 @@ import threading
 from pathlib import Path
 from datetime import datetime
 from fb_operator.account_manager import git_sync_save
+from fb_operator.state_events import publish_event
 
 USERS_FILE = Path(__file__).resolve().parent / "users.json"
 AUDIT_LOG_FILE = Path(__file__).resolve().parent / "audit_logs.json"
@@ -155,10 +156,12 @@ def register_or_update_user(user_id: int, name: str, username: str = "", touch_l
     تسجيل أو تحديث بيانات المستخدم في الرادار الشامل.
     يعود بـ (بيانات المستخدم، هل هو مستخدم جديد؟)
     """
+    is_new = False
+    should_publish = False
+    res_user: dict = {}
     with _users_lock:
         users = load_users()
         uid = str(int(user_id))
-        is_new = False
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         clean_name = name.strip() if name else ""
         clean_user = username.strip() if username else ""
@@ -178,9 +181,9 @@ def register_or_update_user(user_id: int, name: str, username: str = "", touch_l
                 changed = True
             if changed:
                 save_users(users, sync_git=False)
-            return dict(u), False
-
-        if uid not in users:
+                should_publish = True
+            res_user = dict(u)
+        elif uid not in users:
             is_new = True
             users[uid] = {
                 "id": int(user_id),
@@ -198,6 +201,8 @@ def register_or_update_user(user_id: int, name: str, username: str = "", touch_l
             }
             save_users(users, sync_git=True)
             record_audit_log(int(user_id), users[uid]["name"], "JOIN_REQUEST", "دخول مستخدم جديد وطلب موافقة المطور")
+            should_publish = True
+            res_user = dict(users[uid])
         else:
             u = users[uid]
             changed = u.get("role") != "user"
@@ -214,8 +219,12 @@ def register_or_update_user(user_id: int, name: str, username: str = "", touch_l
                 changed = True
             if changed:
                 save_users(users, sync_git=False)
+                should_publish = True
+            res_user = dict(users[uid])
 
-        return dict(users[uid]), is_new
+    if should_publish:
+        publish_event("users", int(user_id), "register_or_update")
+    return res_user, is_new
 
 
 def get_user_permissions(user_id: int) -> dict:
@@ -261,24 +270,27 @@ def approve_user(user_id: int) -> bool:
     """اعتماد المستخدم في حالة 'موافق عليه' مع إبقاء كافة الصلاحيات مغلقة افتراضياً"""
     if is_super_admin(user_id):
         return True
+    ok = False
     with _users_lock:
         users = load_users()
         uid = str(int(user_id))
         if uid in users:
             users[uid]["status"] = "approved"
             users[uid]["role"] = "user"
-            # ضمان بقاء الصلاحيات كما يختارها المطور (لا يُفتح شيء تلقائياً)
             perms = users[uid].get("permissions", {})
             users[uid]["permissions"] = {pk: bool(perms.get(pk, False)) for pk in DEFAULT_PERMISSIONS}
             save_users(users, sync_git=True)
             record_audit_log(int(user_id), users[uid].get("name", ""), "USER_APPROVED", "تم قبول واعتماد المستخدم (كافة الأدوات مغلقة بانتظار التخصيص)")
-            return True
-    return False
+            ok = True
+    if ok:
+        publish_event("users", int(user_id), "approve")
+    return ok
 
 
 def ban_user(user_id: int) -> bool:
     if is_super_admin(user_id):
         return False  # ممنوع حظر المطور الأكبر مطلقاً
+    ok = False
     with _users_lock:
         users = load_users()
         uid = str(int(user_id))
@@ -288,24 +300,29 @@ def ban_user(user_id: int) -> bool:
             users[uid]["permissions"] = dict(DEFAULT_PERMISSIONS)
             save_users(users, sync_git=True)
             record_audit_log(int(user_id), users[uid].get("name", ""), "USER_BANNED", "تم حظر المستخدم وتجريده من كافة الصلاحيات")
-            return True
-    return False
+            ok = True
+    if ok:
+        publish_event("users", int(user_id), "ban")
+    return ok
 
 
 def unban_user(user_id: int) -> bool:
     if is_super_admin(user_id):
         return True
+    ok = False
     with _users_lock:
         users = load_users()
         uid = str(int(user_id))
         if uid in users:
             users[uid]["status"] = "approved"
             users[uid]["role"] = "user"
-            users[uid]["permissions"] = dict(DEFAULT_PERMISSIONS)  # إعادة فك الحظر مع صلاحيات مغلقة للأمان
+            users[uid]["permissions"] = dict(DEFAULT_PERMISSIONS)
             save_users(users, sync_git=True)
             record_audit_log(int(user_id), users[uid].get("name", ""), "USER_UNBANNED", "تم فك الحظر عن المستخدم مع إبقاء الصلاحيات مقفلة للأمان")
-            return True
-    return False
+            ok = True
+    if ok:
+        publish_event("users", int(user_id), "unban")
+    return ok
 
 
 def toggle_user_permission(user_id: int, permission: str) -> bool:
@@ -313,24 +330,30 @@ def toggle_user_permission(user_id: int, permission: str) -> bool:
         return True  # صلاحيات المطور الأكبر مطلقة ولا تتغير
     if permission not in DEFAULT_PERMISSIONS:
         return False
+    new_val = False
+    changed = False
     with _users_lock:
         users = load_users()
         uid = str(int(user_id))
         if uid in users:
             perms = users[uid].setdefault("permissions", dict(DEFAULT_PERMISSIONS))
             perms[permission] = not perms.get(permission, False)
+            new_val = perms[permission]
+            changed = True
             save_users(users, sync_git=True)
-            state_str = "تفعيل" if perms[permission] else "تعطيل"
+            state_str = "تفعيل" if new_val else "تعطيل"
             perm_ar = PERMISSION_LABELS.get(permission, permission)
             record_audit_log(int(user_id), users[uid].get("name", ""), "PERM_CHANGE", f"{state_str} صلاحية ({perm_ar})")
-            return perms[permission]
-    return False
+    if changed:
+        publish_event("users", int(user_id), "perm_toggle")
+    return new_val
 
 
 def revoke_all_permissions(user_id: int) -> bool:
     """إقفال وسحب كافة الصلاحيات الممنوحة لمستخدم بضغطة واحدة"""
     if is_super_admin(user_id):
         return False
+    ok = False
     with _users_lock:
         users = load_users()
         uid = str(int(user_id))
@@ -338,11 +361,14 @@ def revoke_all_permissions(user_id: int) -> bool:
             users[uid]["permissions"] = dict(DEFAULT_PERMISSIONS)
             save_users(users, sync_git=True)
             record_audit_log(int(user_id), users[uid].get("name", ""), "PERM_RESET", "تصفير وإقفال كافة الصلاحيات الممنوحة للمستخدم")
-            return True
-    return False
+            ok = True
+    if ok:
+        publish_event("users", int(user_id), "revoke_all")
+    return ok
 
 
 def record_user_operation(user_id: int, op_desc: str = "تشغيل مهمة ميدانية") -> None:
+    updated = False
     with _users_lock:
         users = load_users()
         uid = str(int(user_id))
@@ -351,10 +377,14 @@ def record_user_operation(user_id: int, op_desc: str = "تشغيل مهمة مي
             users[uid]["last_seen"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             save_users(users, sync_git=False)
             record_audit_log(int(user_id), users[uid].get("name", ""), "OPERATION", op_desc)
+            updated = True
+    if updated:
+        publish_event("users", int(user_id), "operation")
 
 
 def record_account_result_for_user(user_id: int, is_active: bool) -> None:
     """تسجيل إحصائية الحساب المضاف للمستخدم (هل نشط أم فشل/غير نشط)"""
+    updated = False
     with _users_lock:
         users = load_users()
         uid = str(int(user_id))
@@ -364,11 +394,15 @@ def record_account_result_for_user(user_id: int, is_active: bool) -> None:
             else:
                 users[uid]["inactive_accounts_added"] = users[uid].get("inactive_accounts_added", 0) + 1
             save_users(users, sync_git=True)
+            updated = True
+    if updated:
+        publish_event("users", int(user_id), "account_result")
 
 
 def delete_user_and_data(user_id: int) -> bool:
     if is_super_admin(user_id):
         return False  # ممنوع مسح المطور الأكبر
+    ok = False
     with _users_lock:
         users = load_users()
         uid = str(int(user_id))
@@ -377,14 +411,17 @@ def delete_user_and_data(user_id: int) -> bool:
             del users[uid]
             save_users(users, sync_git=True)
             record_audit_log(int(user_id), name, "USER_DELETED", "تم مسح المستخدم بالكامل من النظام")
-            return True
-    return False
+            ok = True
+    if ok:
+        publish_event("users", int(user_id), "user_delete")
+    return ok
 
 
 # ----------------- سجل الرقابة والأحداث الكامل (Audit Logs) -----------------
 
 def record_audit_log(user_id: int, user_name: str, event_type: str, details: str) -> None:
     """حفظ سجل رقابي كامل لكل حدث في النظام للمطور الأكبر بأمان تعدد الخيوط"""
+    written = False
     with _audit_lock:
         try:
             logs = load_audit_logs(limit=0)
@@ -398,8 +435,11 @@ def record_audit_log(user_id: int, user_name: str, event_type: str, details: str
             if len(logs) > 300:
                 logs = logs[-300:]
             _atomic_write_json(AUDIT_LOG_FILE, logs)
+            written = True
         except Exception:
             pass
+    if written:
+        publish_event("audit", int(user_id), str(event_type))
 
 
 def load_audit_logs(limit: int = 100) -> list[dict]:
