@@ -260,6 +260,13 @@ def get_miniapp_html() -> str:
     <div id="lockedBox" class="locked-box hidden">
         <div id="lockedTitle" style="font-size:16px;font-weight:700;margin-bottom:8px;">الوصول مقفل</div>
         <div id="lockedMsg" style="font-size:13px;color:var(--muted);"></div>
+        <div id="inviteRedeemBox" class="hidden" style="margin-top:16px;text-align:right;max-width:380px;margin-left:auto;margin-right:auto;">
+            <div class="field">
+                <label>هل لديك كود إحالة أو تفعيل؟</label>
+                <input type="text" id="inpRedeemCode" placeholder="أدخل الكود مثال: FB-XXXX-XXXX">
+            </div>
+            <button type="button" class="btn btn-primary" onclick="redeemInviteCode()">تفعيل حساب إضافة الحسابات بالكود</button>
+        </div>
     </div>
 
     <div id="appShell" class="hidden">
@@ -268,7 +275,10 @@ def get_miniapp_html() -> str:
                 <div class="topbar-title" id="userNameLbl">FB Operator</div>
                 <div class="topbar-sub" id="userPermsSummary">متصل بالسحابة</div>
             </div>
-            <div class="role-pill" id="rolePill">مستخدم</div>
+            <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;justify-content:flex-end;">
+                <div class="role-pill" id="walletPill" style="background:rgba(46,160,67,0.16);color:#3fb950;border-color:rgba(46,160,67,0.35);">0 نقطة</div>
+                <div class="role-pill" id="rolePill">مستخدم</div>
+            </div>
         </div>
 
         <div class="tabs" id="tabsBar"></div>
@@ -431,6 +441,7 @@ def get_miniapp_html() -> str:
             </div>
 
             <div class="panel" id="secExecute">
+                <div id="missionCostBadge" class="mono" style="margin-bottom:8px;"></div>
                 <button type="button" class="btn btn-ok" id="btnLaunchMission" onclick="launchMission()">بدء تنفيذ المهمة في الخلفية الآن</button>
                 <div id="missionLiveBanner" class="status-banner hidden"></div>
             </div>
@@ -487,6 +498,42 @@ def get_miniapp_html() -> str:
                     </div>
                 </div>
                 <div id="auditLogsContainer"></div>
+            </div>
+        </div>
+
+        <!-- تبويب المحفظة والنقاط والإحالات -->
+        <div id="tab-wallet" class="tab-view hidden">
+            <div style="margin-bottom:10px;" id="walletBackBar">
+                <button type="button" class="btn btn-muted btn-sm" onclick="goHomeTab()">رجوع للقائمة الرئيسية</button>
+            </div>
+            <div class="panel" id="walletSummaryCard"></div>
+            <div class="panel hidden" id="referralPanel"></div>
+            <div class="panel">
+                <div class="panel-title">سجل حركات المحفظة والنقاط</div>
+                <div id="ledgerContainer"></div>
+            </div>
+        </div>
+
+        <!-- تبويب الدعم والموافقة على بيع الحسابات والمحاسبة -->
+        <div id="tab-support" class="tab-view hidden">
+            <div style="margin-bottom:10px;" id="supportBackBar">
+                <button type="button" class="btn btn-muted btn-sm" onclick="goHomeTab()">رجوع للقائمة الرئيسية</button>
+            </div>
+            <div class="panel" id="supportComposerPanel"></div>
+            <div class="panel">
+                <div class="panel-title">سجل المحادثات وطلبات المحاسبة</div>
+                <div id="supportTicketsContainer"></div>
+            </div>
+        </div>
+
+        <!-- تبويب تسعيرة النقاط والوضع العام (للمطور الرئيسي فقط) -->
+        <div id="tab-economy" class="tab-view hidden">
+            <div class="panel">
+                <div class="panel-title">
+                    <span>إعدادات النقاط والتسعيرة والوضع العام</span>
+                    <button type="button" class="btn btn-muted btn-sm" onclick="goHomeTab()">رجوع</button>
+                </div>
+                <div id="economySettingsContainer"></div>
             </div>
         </div>
     </div>
@@ -624,6 +671,8 @@ async function applyLiveSyncUpdate(scopes) {
         lb.classList.remove("hidden");
         document.getElementById("lockedTitle").textContent = fresh.status === "banned" ? "حسابك محظور" : "بانتظار موافقة المطور";
         document.getElementById("lockedMsg").textContent = fresh.message || "يرجى انتظار اعتماد المطور وتخصيص الصلاحيات لك.";
+        const irb = document.getElementById("inviteRedeemBox");
+        if (irb) irb.classList.toggle("hidden", !fresh.can_redeem_invite);
         updateTelegramBackButton();
         return;
     }
@@ -637,19 +686,26 @@ async function applyLiveSyncUpdate(scopes) {
     if (wasLocked || prevPerms !== nextPerms) {
         renderApp();
     } else {
+        updateWalletTopbar();
         renderMissionBanner();
+        renderMissionCostBadge();
         refreshUsableSelect();
         renderAccountsList();
+        renderWalletTab();
+        renderSupportTickets();
     }
 
     if (fresh.is_super_admin) {
         const scList = scopes || [];
         const activeTab = document.getElementById("tabsBar")?.dataset.activeTab || "";
-        if ((scList.includes("users") || scList.includes("accounts")) && activeTab === "radar") {
+        if ((scList.includes("users") || scList.includes("accounts") || scList.includes("economy") || scList.includes("support")) && activeTab === "radar") {
             await loadAdminRadar();
         }
         if ((scList.includes("audit") || scList.includes("users") || scList.includes("accounts")) && activeTab === "audit") {
             await loadAuditLogs();
+        }
+        if (scList.includes("economy") && activeTab === "economy") {
+            renderEconomyTab();
         }
     }
 }
@@ -692,9 +748,24 @@ document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "hidden" && syncAbortCtrl) {
         try { syncAbortCtrl.abort(); } catch (_) {}
     } else if (document.visibilityState === "visible" && syncRunning) {
-        applyLiveSyncUpdate(["users", "accounts", "audit", "mission"]).catch(() => {});
+        applyLiveSyncUpdate(["users", "accounts", "audit", "mission", "economy", "support"]).catch(() => {});
     }
 });
+
+async function redeemInviteCode() {
+    const code = (document.getElementById("inpRedeemCode")?.value || "").trim();
+    if (!code) {
+        showToast("أدخل كود الدعوة أولاً");
+        return;
+    }
+    try {
+        const res = await apiCall("/api/referral/redeem", "POST", { code });
+        showToast(res.message || "تم التفعيل بنجاح!");
+        await bootstrap();
+    } catch (e) {
+        showToast(e.message);
+    }
+}
 
 async function bootstrap() {
     try {
@@ -708,6 +779,8 @@ async function bootstrap() {
             lb.classList.remove("hidden");
             document.getElementById("lockedTitle").textContent = data.status === "banned" ? "حسابك محظور" : "بانتظار موافقة المطور";
             document.getElementById("lockedMsg").textContent = data.message || "يرجى انتظار اعتماد المطور وتخصيص الصلاحيات لك.";
+            const irb = document.getElementById("inviteRedeemBox");
+            if (irb) irb.classList.toggle("hidden", !data.can_redeem_invite);
             startEventSyncLoop();
             return;
         }
@@ -725,6 +798,14 @@ async function bootstrap() {
     }
 }
 
+function updateWalletTopbar() {
+    if (!appState) return;
+    const wp = document.getElementById("walletPill");
+    if (!wp) return;
+    const w = appState.wallet || { points: 0, yer_value: 0 };
+    wp.textContent = (w.points || 0) + " نقطة (" + Number(w.yer_value || 0).toLocaleString("en-US") + " ريال)";
+}
+
 function renderApp() {
     document.getElementById("lockedBox").classList.add("hidden");
     const u = appState.user;
@@ -733,6 +814,7 @@ function renderApp() {
 
     document.getElementById("userNameLbl").textContent = u.name || "FB Operator";
     document.getElementById("rolePill").textContent = isDev ? "المطور الرئيسي" : "عضو معتمد";
+    updateWalletTopbar();
 
     const enabledLabels = appState.enabled_labels || [];
     document.getElementById("userPermsSummary").textContent = isDev
@@ -742,12 +824,18 @@ function renderApp() {
     // بناء التبويبات حسب الصلاحيات بدقة
     const hasActions = isDev || p.can_react || p.can_comment || p.can_interact_comments || p.can_friend_follow || p.can_message || p.can_report;
     const hasAccTab = isDev || p.can_add_accounts || p.can_delete_accounts;
+    const hasAnyPerm = isDev || Object.values(p || {}).some(Boolean) || ((appState.wallet && appState.wallet.points) > 0);
 
     const tabs = [];
     if (hasActions) tabs.push({ id: "mission", label: "العمليات" });
     if (hasAccTab) tabs.push({ id: "accounts", label: p.can_add_accounts && !hasActions && !isDev ? "إضافة الحسابات" : "الحسابات" });
+    if (hasAnyPerm) {
+        tabs.push({ id: "wallet", label: "المحفظة والإحالة" });
+        tabs.push({ id: "support", label: isDev ? "صندوق الدعم والبيع" : "الدعم وبيع الحسابات" });
+    }
     if (isDev) {
         tabs.push({ id: "radar", label: "الرادار والصلاحيات" });
+        tabs.push({ id: "economy", label: "تسعيرة النقاط والوضع العام" });
         tabs.push({ id: "audit", label: "سجل الرقابة" });
     }
     currentTabs = tabs;
@@ -766,6 +854,8 @@ function renderApp() {
         lb.classList.remove("hidden");
         document.getElementById("lockedTitle").textContent = "حسابك معتمد بنجاح";
         document.getElementById("lockedMsg").textContent = "لم يفعّل المطور أي أداة أو صلاحية لحسابك بعد.";
+        const irb = document.getElementById("inviteRedeemBox");
+        if (irb) irb.classList.add("hidden");
         updateTelegramBackButton();
         return;
     }
@@ -777,6 +867,7 @@ function renderApp() {
     for (const t of tabs) {
         const b = document.createElement("button");
         b.type = "button";
+        b.dataset.tabId = t.id;
         b.className = "tab-btn" + (t.id === activeTabId ? " active" : "");
         b.textContent = t.label;
         b.onclick = () => switchTab(t.id);
@@ -786,21 +877,16 @@ function renderApp() {
     switchTab(activeTabId, false);
     populateMissionForm();
     renderAccountsList();
+    renderWalletTab();
+    renderSupportComposer();
+    renderSupportTickets();
+    if (isDev) renderEconomyTab();
 }
 
 function switchTab(tabId, reloadData = true) {
     document.getElementById("tabsBar").dataset.activeTab = tabId;
     document.querySelectorAll(".tab-btn").forEach(btn => {
-        btn.classList.remove("active");
-    });
-    const btns = Array.from(document.getElementById("tabsBar").children);
-    btns.forEach(b => {
-        if ((b.textContent === "العمليات" && tabId === "mission") ||
-            ((b.textContent === "الحسابات" || b.textContent === "إضافة الحسابات") && tabId === "accounts") ||
-            (b.textContent === "الرادار والصلاحيات" && tabId === "radar") ||
-            (b.textContent === "سجل الرقابة" && tabId === "audit")) {
-            b.classList.add("active");
-        }
+        btn.classList.toggle("active", btn.dataset.tabId === tabId);
     });
 
     document.querySelectorAll(".tab-view").forEach(v => v.classList.add("hidden"));
@@ -812,6 +898,9 @@ function switchTab(tabId, reloadData = true) {
     if (reloadData) {
         if (tabId === "radar") loadAdminRadar();
         if (tabId === "audit") loadAuditLogs();
+        if (tabId === "economy") renderEconomyTab();
+        if (tabId === "wallet") renderWalletTab();
+        if (tabId === "support") { renderSupportComposer(); renderSupportTickets(); }
     }
 }
 
@@ -895,6 +984,38 @@ function populateMissionForm() {
     setToggleBtn("btnTogBlock", !!ms.block);
 
     renderMissionBanner();
+    renderMissionCostBadge();
+}
+
+function renderMissionCostBadge() {
+    const el = document.getElementById("missionCostBadge");
+    if (!el || !appState || !appState.mission_state) return;
+    if (appState.is_super_admin) {
+        el.textContent = "المطور الرئيسي: تنفيذ مجاني غير محدود بدون خصم نقاط";
+        return;
+    }
+    const cfg = appState.economy_settings || {};
+    const costs = cfg.operation_costs || {};
+    const ms = appState.mission_state;
+    let perAcc = 0;
+    for (const k of Object.keys(costs)) {
+        if (ms[k]) perAcc += Number(costs[k] || 0);
+    }
+    const selAcc = document.getElementById("inpSelectedAcc")?.value || ms.selected_acc || "all";
+    const usable = appState.usable_accounts || [];
+    const activePool = usable.filter(a => a.is_active);
+    const poolLen = activePool.length || usable.length || 1;
+    const lim = parseInt(document.getElementById("inpAccLimit")?.value || ms.acc_count_limit || "0", 10) || 0;
+    const estAccs = selAcc !== "all" ? 1 : (lim > 0 ? Math.min(poolLen, lim) : poolLen);
+    const totalCost = perAcc * estAccs;
+    const bal = (appState.wallet && appState.wallet.points) || 0;
+    if (appState.points_enforced) {
+        el.textContent = "تكلفة هذه المهمة: " + totalCost + " نقطة | رصيدك المتاح: " + bal + " نقطة";
+        el.className = bal >= totalCost ? "badge-ok" : "badge-bad";
+    } else {
+        el.textContent = "نظام الخصم الفوري للنقاط معطل حالياً من المطور | رصيدك: " + bal + " نقطة";
+        el.className = "mono";
+    }
 }
 
 function renderMissionBanner() {
@@ -943,8 +1064,15 @@ async function launchMission() {
         const res = await apiCall("/api/mission/launch", "POST", payload);
         showToast(res.message || "تم بدء التنفيذ!");
         appState.mission_state.is_running = true;
+        if (typeof res.remaining_points === "number" && appState.wallet) {
+            appState.wallet.points = res.remaining_points;
+            const rate = (appState.economy_settings && appState.economy_settings.yer_per_point) || 10;
+            appState.wallet.yer_value = res.remaining_points * rate;
+            updateWalletTopbar();
+        }
         appState.mission_state.live_status_text = "جاري تشغيل المهمة في الخلفية وإرسال الإثباتات في المحادثة...";
         renderMissionBanner();
+        renderMissionCostBadge();
     } catch (e) {
         showToast(e.message);
     }
@@ -1106,9 +1234,14 @@ async function loadAdminRadar() {
             head.appendChild(st);
             row.appendChild(head);
 
+            const totalPerms = Object.keys(data.perm_labels || {}).length || 11;
             const meta = document.createElement("div");
             meta.className = "mono";
-            meta.textContent = "نشط: " + u.active_count + " | غير نشط: " + u.inactive_count + " | صلاحيات: " + u.enabled_perms + "/10";
+            meta.textContent =
+                "نشط: " + u.active_count +
+                " | غير نشط: " + u.inactive_count +
+                " | نقاط: " + (u.points || 0) + " (" + Number(u.yer_value || 0).toLocaleString("en-US") + " ريال)" +
+                " | صلاحيات: " + u.enabled_perms + "/" + totalPerms;
             row.appendChild(meta);
 
             container.appendChild(row);
@@ -1154,8 +1287,65 @@ function selectRadarUser(uid, radarData) {
         "المعرف: @" + (u.username || "-") +
         " | الدخول: " + u.total_logins +
         " | العمليات: " + u.operations_count +
-        " | سجل دائم: " + u.active_accounts_added + " نشط / " + u.inactive_accounts_added + " فاشل";
+        " | سجل دائم: " + u.active_accounts_added + " نشط / " + u.inactive_accounts_added + " فاشل" +
+        " | إحالاته: " + (u.referred_count || 0);
     panel.appendChild(meta);
+
+    // لوحة التحكم الكاملة بنقاط المستخدم للمطور الرئيسي
+    const ptsBox = document.createElement("div");
+    ptsBox.className = "item-row";
+    ptsBox.style.marginBottom = "12px";
+
+    const ptsHead = document.createElement("div");
+    ptsHead.className = "item-head";
+    const ptsTitle = document.createElement("span");
+    ptsTitle.className = "item-name";
+    ptsTitle.textContent = "محفظة النقاط والمستحقات المالية";
+    const ptsBadge = document.createElement("span");
+    ptsBadge.className = "badge-ok";
+    ptsBadge.textContent = (u.points || 0) + " نقطة = " + Number(u.yer_value || 0).toLocaleString("en-US") + " ريال يمني";
+    ptsHead.appendChild(ptsTitle);
+    ptsHead.appendChild(ptsBadge);
+    ptsBox.appendChild(ptsHead);
+
+    const ptsSub = document.createElement("div");
+    ptsSub.className = "mono";
+    ptsSub.style.marginBottom = "8px";
+    ptsSub.textContent = "المكتسب: " + (u.total_points_earned || 0) + " | المصروف: " + (u.total_points_spent || 0) + " | إجمالي التسوية: " + Number(u.total_yer_settled || 0).toLocaleString("en-US") + " ريال";
+    ptsBox.appendChild(ptsSub);
+
+    const ptsGrid = document.createElement("div");
+    ptsGrid.className = "row-2";
+    ptsGrid.innerHTML =
+        '<div class="field"><label>عدد النقاط</label><input type="number" id="inpAdminPtsAmt" min="1" value="5"></div>' +
+        '<div class="field"><label>السبب / ملاحظة المحاسبة</label><input type="text" id="inpAdminPtsReason" placeholder="مكافأة / سحب / حوالة"></div>';
+    ptsBox.appendChild(ptsGrid);
+
+    const ptsBtns = document.createElement("div");
+    ptsBtns.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;";
+    const bAddP = document.createElement("button");
+    bAddP.type = "button";
+    bAddP.className = "btn btn-ok btn-sm";
+    bAddP.textContent = "+ إضافة نقاط";
+    bAddP.onclick = () => adminPointsAction(u.id, "add");
+
+    const bDedP = document.createElement("button");
+    bDedP.type = "button";
+    bDedP.className = "btn btn-danger btn-sm";
+    bDedP.textContent = "- خصم / سحب";
+    bDedP.onclick = () => adminPointsAction(u.id, "deduct");
+
+    const bSettleP = document.createElement("button");
+    bSettleP.type = "button";
+    bSettleP.className = "btn btn-primary btn-sm";
+    bSettleP.textContent = "اعتماد وصرف كل الرصيد (" + (u.points || 0) + " نقطة)";
+    bSettleP.onclick = () => adminPointsAction(u.id, "settle", "all");
+
+    ptsBtns.appendChild(bAddP);
+    ptsBtns.appendChild(bDedP);
+    if ((u.points || 0) > 0) ptsBtns.appendChild(bSettleP);
+    ptsBox.appendChild(ptsBtns);
+    panel.appendChild(ptsBox);
 
     // أزرار الموافقة والحظر والحذف
     const actionRow = document.createElement("div");
@@ -1313,6 +1503,517 @@ async function loadAuditLogs() {
         showToast(e.message);
     }
 }
+
+async function copyTextValue(val) {
+    try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            await navigator.clipboard.writeText(val);
+            showToast("تم النسخ بنجاح!");
+            return;
+        }
+    } catch (_) {}
+    showToast(val);
+}
+
+function renderWalletTab() {
+    if (!appState) return;
+    const w = appState.wallet || { points: 0, yer_value: 0, yer_per_point: 10, total_points_earned: 0, total_points_spent: 0, total_yer_settled: 0, referred_count: 0 };
+    const snap = appState.settlement_snapshot || {};
+    const cfg = appState.economy_settings || {};
+    const card = document.getElementById("walletSummaryCard");
+    if (card) {
+        card.innerHTML = "";
+        const title = document.createElement("div");
+        title.className = "panel-title";
+        const s1 = document.createElement("span");
+        s1.textContent = "محفظة النقاط والأرباح";
+        const s2 = document.createElement("span");
+        s2.className = "badge-ok";
+        s2.textContent = (w.points || 0) + " نقطة = " + Number(w.yer_value || 0).toLocaleString("en-US") + " ريال يمني";
+        title.appendChild(s1);
+        title.appendChild(s2);
+        card.appendChild(title);
+
+        const stats = [
+            "سعر الصرف الرسمي: كل 1 نقطة = " + (w.yer_per_point || 10) + " ريال يمني",
+            "مكافأة كل حساب نشط تضيفه: +" + (cfg.active_account_reward || 1) + " نقطة | مكافأة الإحالة: +" + (cfg.referral_reward || 4) + " نقاط",
+            "حساباتك المضافة: " + (snap.total_added || 0) + " (نشط: " + (snap.active_added || 0) + " | غير نشط: " + (snap.inactive_added || 0) + ")",
+            "إجمالي الإحالات: " + (w.referred_count || 0) + " | تم صرفه سابقاً: " + Number(w.total_yer_settled || 0).toLocaleString("en-US") + " ريال"
+        ];
+        for (const line of stats) {
+            const d = document.createElement("div");
+            d.className = "mono";
+            d.style.marginBottom = "4px";
+            d.textContent = line;
+            card.appendChild(d);
+        }
+    }
+
+    const refPanel = document.getElementById("referralPanel");
+    if (refPanel) {
+        refPanel.classList.toggle("hidden", !appState.can_invite);
+        if (appState.can_invite) {
+            const inf = appState.invite_info || {};
+            refPanel.innerHTML = "";
+            const rt = document.createElement("div");
+            rt.className = "panel-title";
+            rt.textContent = "روابط وأكواد الإحالة (+ " + (cfg.referral_reward || 4) + " نقاط للمدعو)";
+            refPanel.appendChild(rt);
+
+            const refLink = inf.bot_username && inf.ref_code
+                ? "https://t.me/" + inf.bot_username + "?start=ref_" + inf.ref_code
+                : ("ref_" + (inf.ref_code || ""));
+
+            const linkRow = document.createElement("div");
+            linkRow.className = "item-row";
+            const lkLbl = document.createElement("div");
+            lkLbl.className = "mono";
+            lkLbl.style.marginBottom = "6px";
+            lkLbl.textContent = "رابطك الدائم (يفتح لصديقك إضافة الحسابات فقط): " + refLink;
+            linkRow.appendChild(lkLbl);
+            const btnRow = document.createElement("div");
+            btnRow.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;";
+            const bCopy = document.createElement("button");
+            bCopy.type = "button";
+            bCopy.className = "btn btn-muted btn-sm";
+            bCopy.textContent = "نسخ رابط الإحالة";
+            bCopy.onclick = () => copyTextValue(refLink);
+
+            const bGen = document.createElement("button");
+            bGen.type = "button";
+            bGen.className = "btn btn-primary btn-sm";
+            bGen.textContent = "+ توليد كود تفعيل لمرة واحدة";
+            bGen.onclick = () => createInviteCode();
+
+            btnRow.appendChild(bCopy);
+            btnRow.appendChild(bGen);
+            linkRow.appendChild(btnRow);
+            refPanel.appendChild(linkRow);
+
+            const codes = inf.codes || [];
+            for (const c of codes) {
+                const cr = document.createElement("div");
+                cr.className = "item-row";
+                const ch = document.createElement("div");
+                ch.className = "item-head";
+                const cn = document.createElement("span");
+                cn.className = "item-name";
+                cn.textContent = c.code;
+                const cs = document.createElement("span");
+                cs.className = c.status === "active" ? "badge-ok" : "badge-bad";
+                cs.textContent = c.status === "active" ? "متاح للاستخدام" : (c.status === "used" ? "تم استخدامه" : "ملغي");
+                ch.appendChild(cn);
+                ch.appendChild(cs);
+                cr.appendChild(ch);
+
+                if (c.status === "active") {
+                    const actRow = document.createElement("div");
+                    actRow.style.cssText = "display:flex;gap:6px;margin-top:6px;";
+                    const bc = document.createElement("button");
+                    bc.type = "button";
+                    bc.className = "btn btn-muted btn-sm";
+                    bc.textContent = "نسخ الكود";
+                    bc.onclick = () => copyTextValue(c.code);
+                    const br = document.createElement("button");
+                    br.type = "button";
+                    br.className = "btn btn-danger btn-sm";
+                    br.textContent = "إلغاء";
+                    br.onclick = () => revokeInviteCode(c.code);
+                    actRow.appendChild(bc);
+                    actRow.appendChild(br);
+                    cr.appendChild(actRow);
+                }
+                refPanel.appendChild(cr);
+            }
+        }
+    }
+
+    const ledgerBox = document.getElementById("ledgerContainer");
+    if (ledgerBox) {
+        ledgerBox.innerHTML = "";
+        const ledger = appState.ledger || [];
+        if (!ledger.length) {
+            const em = document.createElement("div");
+            em.className = "mono";
+            em.textContent = "لا توجد حركات نقاط مسجلة حتى الآن.";
+            ledgerBox.appendChild(em);
+            return;
+        }
+        for (const tx of ledger) {
+            const row = document.createElement("div");
+            row.className = "item-row";
+            const h = document.createElement("div");
+            h.className = "item-head";
+            const dSpan = document.createElement("span");
+            dSpan.className = tx.delta >= 0 ? "badge-ok" : "badge-bad";
+            dSpan.textContent = (tx.delta >= 0 ? "+" : "") + tx.delta + " نقطة (" + Math.abs(tx.yer_amount || 0) + " ريال)";
+            const tSpan = document.createElement("span");
+            tSpan.className = "mono";
+            tSpan.textContent = tx.timestamp;
+            h.appendChild(dSpan);
+            h.appendChild(tSpan);
+            row.appendChild(h);
+
+            const rLine = document.createElement("div");
+            rLine.className = "mono";
+            rLine.textContent = tx.reason + " | الرصيد بعد الحركة: " + tx.balance_after;
+            row.appendChild(rLine);
+            ledgerBox.appendChild(row);
+        }
+    }
+}
+
+async function createInviteCode() {
+    try {
+        const res = await apiCall("/api/referral/create_code", "POST", {});
+        showToast("تم إنشاء الكود: " + (res.invite && res.invite.code));
+        await applyLiveSyncUpdate(["economy"]);
+    } catch (e) {
+        showToast(e.message);
+    }
+}
+
+async function revokeInviteCode(code) {
+    try {
+        const res = await apiCall("/api/referral/revoke_code", "POST", { code });
+        showToast(res.message || "تم إلغاء الكود");
+        await applyLiveSyncUpdate(["economy"]);
+    } catch (e) {
+        showToast(e.message);
+    }
+}
+
+function renderSupportComposer() {
+    const box = document.getElementById("supportComposerPanel");
+    if (!box || !appState) return;
+    if (appState.is_super_admin) {
+        box.innerHTML = "";
+        const tt = document.createElement("div");
+        tt.className = "panel-title";
+        tt.textContent = "صندوق الدعم وطلبات بيع الحسابات الواردة";
+        const info = document.createElement("div");
+        info.className = "mono";
+        info.textContent = "تصل هنا كل رسائل المستخدمين مع عدد حساباتهم النشطة وغير النشطة ورصيدهم بالريال اليمني، ويمكنك الرد أو اعتماد التسوية فوراً.";
+        box.appendChild(tt);
+        box.appendChild(info);
+        return;
+    }
+
+    // لا نعيد بناء مربع الكتابة إذا كان موجوداً حتى لا تضيع رسالة المستخدم أثناء التحديث الحي
+    if (document.getElementById("inpSupportMsg")) {
+        const st = document.getElementById("supportSnapText");
+        const snap = appState.settlement_snapshot || {};
+        if (st) {
+            st.textContent = "حساباتك المضافة: " + (snap.total_added || 0) + " (نشط: " + (snap.active_added || 0) + ") | رصيدك المستحق: " + (snap.points || 0) + " نقطة (" + Number(snap.yer_value || 0).toLocaleString("en-US") + " ريال يمني)";
+        }
+        return;
+    }
+
+    const snap = appState.settlement_snapshot || {};
+    box.innerHTML = "";
+    const tt = document.createElement("div");
+    tt.className = "panel-title";
+    tt.textContent = "الدعم والتواصل مع المطور والموافقة على بيع الحسابات";
+    box.appendChild(tt);
+
+    const stLine = document.createElement("div");
+    stLine.id = "supportSnapText";
+    stLine.className = "badge-ok";
+    stLine.style.marginBottom = "10px";
+    stLine.textContent = "حساباتك المضافة: " + (snap.total_added || 0) + " (نشط: " + (snap.active_added || 0) + ") | رصيدك المستحق: " + (snap.points || 0) + " نقطة (" + Number(snap.yer_value || 0).toLocaleString("en-US") + " ريال يمني)";
+    box.appendChild(stLine);
+
+    const fKind = document.createElement("div");
+    fKind.className = "field";
+    fKind.innerHTML =
+        '<label>نوع الرسالة</label>' +
+        '<select id="inpSupportKind">' +
+        '<option value="sell_accounts">موافقة على بيع الحسابات المضافة وطلب المحاسبة</option>' +
+        '<option value="support">رسالة دعم واستفسار عامة للمطور</option>' +
+        '</select>';
+    box.appendChild(fKind);
+
+    const fTxt = document.createElement("div");
+    fTxt.className = "field";
+    const lblT = document.createElement("label");
+    lblT.textContent = "نص الرسالة (اكتب رقم المحفظة / الحساب البنكي أو استفسارك)";
+    const ta = document.createElement("textarea");
+    ta.id = "inpSupportMsg";
+    ta.placeholder = "مثال: أوافق على بيع الحسابات المفعلة، أرجو المحاسبة على رقمي...";
+    fTxt.appendChild(lblT);
+    fTxt.appendChild(ta);
+    box.appendChild(fTxt);
+
+    const bSend = document.createElement("button");
+    bSend.type = "button";
+    bSend.className = "btn btn-ok";
+    bSend.textContent = "إرسال إلى المطور مع كامل التفاصيل";
+    bSend.onclick = () => submitSupportTicket();
+    box.appendChild(bSend);
+}
+
+async function submitSupportTicket() {
+    const kind = document.getElementById("inpSupportKind")?.value || "support";
+    const msg = (document.getElementById("inpSupportMsg")?.value || "").trim();
+    if (!msg) {
+        showToast("اكتب رسالتك أولاً");
+        return;
+    }
+    try {
+        const res = await apiCall("/api/support/create", "POST", { kind, message: msg });
+        showToast(res.message || "تم الإرسال!");
+        document.getElementById("inpSupportMsg").value = "";
+        await applyLiveSyncUpdate(["support"]);
+    } catch (e) {
+        showToast(e.message);
+    }
+}
+
+function renderSupportTickets() {
+    const box = document.getElementById("supportTicketsContainer");
+    if (!box || !appState) return;
+    // حفظ أي مسودة رد مفتوحة قبل إعادة الرسم
+    const savedDrafts = {};
+    box.querySelectorAll("input[data-draft-tkt]").forEach(inp => {
+        if (inp.value) savedDrafts[inp.dataset.draftTkt] = inp.value;
+    });
+
+    box.innerHTML = "";
+    const tickets = appState.support_tickets || [];
+    if (!tickets.length) {
+        const em = document.createElement("div");
+        em.className = "mono";
+        em.textContent = "لا توجد تذاكر أو رسائل دعم مسجلة بعد.";
+        box.appendChild(em);
+        return;
+    }
+    const isDev = appState.is_super_admin;
+
+    for (const t of tickets) {
+        const snap = t.live_snapshot || t.snapshot || {};
+        const row = document.createElement("div");
+        row.className = "item-row";
+
+        const head = document.createElement("div");
+        head.className = "item-head";
+        const nm = document.createElement("span");
+        nm.className = "item-name";
+        nm.textContent = (t.kind === "sell_accounts" ? "بيع حسابات ومحاسبة" : "رسالة دعم") + " • " + t.id;
+        const st = document.createElement("span");
+        st.className = t.status === "settled" ? "badge-ok" : (t.status === "replied_by_dev" ? "badge-ok" : "badge-warn");
+        st.textContent = t.status === "settled" ? "تمت المحاسبة" : (t.status === "replied_by_dev" ? "رد المطور" : "مفتوحة");
+        head.appendChild(nm);
+        head.appendChild(st);
+        row.appendChild(head);
+
+        if (isDev) {
+            const devMeta = document.createElement("div");
+            devMeta.className = "mono";
+            devMeta.style.marginBottom = "6px";
+            devMeta.textContent =
+                "المستخدم: " + (snap.name || t.user_name) + " (" + t.user_id + ")" +
+                " | حسابات: " + (snap.total_added || 0) + " (نشط: " + (snap.active_added || 0) + ")" +
+                " | رصيده: " + (snap.points || 0) + " نقطة (" + Number(snap.yer_value || 0).toLocaleString("en-US") + " ريال)";
+            row.appendChild(devMeta);
+        }
+
+        for (const m of (t.messages || [])) {
+            const mb = document.createElement("div");
+            mb.className = "status-banner";
+            mb.style.marginTop = "6px";
+            mb.style.borderColor = m.sender === "developer" ? "rgba(46,160,67,0.45)" : "var(--border)";
+            mb.textContent = (m.sender === "developer" ? "المطور/الدعم: " : (m.sender_name || "المستخدم") + ": ") + m.text + "\n(" + m.timestamp + ")";
+            row.appendChild(mb);
+        }
+
+        const rWrap = document.createElement("div");
+        rWrap.style.cssText = "display:flex;gap:6px;margin-top:8px;flex-wrap:wrap;";
+        const rInp = document.createElement("input");
+        rInp.type = "text";
+        rInp.dataset.draftTkt = t.id;
+        rInp.placeholder = isDev ? "اكتب ردك للمستخدم (مثال: أرسل رقمك أودع لك)..." : "اكتب ردك للمطور...";
+        rInp.value = savedDrafts[t.id] || "";
+        rInp.style.flex = "1";
+
+        const rBtn = document.createElement("button");
+        rBtn.type = "button";
+        rBtn.className = "btn btn-primary btn-sm";
+        rBtn.textContent = "إرسال الرد";
+        rBtn.onclick = () => replySupportTicket(t.id, rInp.value);
+
+        rWrap.appendChild(rInp);
+        rWrap.appendChild(rBtn);
+        if (isDev && (snap.points || 0) > 0) {
+            const sBtn = document.createElement("button");
+            sBtn.type = "button";
+            sBtn.className = "btn btn-ok btn-sm";
+            sBtn.textContent = "صرف وتصفية (" + snap.points + " نقطة = " + Number(snap.yer_value || 0).toLocaleString("en-US") + " ريال)";
+            sBtn.onclick = () => adminPointsAction(t.user_id, "settle", "all", t.id);
+            rWrap.appendChild(sBtn);
+        }
+        row.appendChild(rWrap);
+        box.appendChild(row);
+    }
+}
+
+async function replySupportTicket(ticketId, msg) {
+    const clean = String(msg || "").trim();
+    if (!clean) {
+        showToast("اكتب الرد أولاً");
+        return;
+    }
+    try {
+        const res = await apiCall("/api/support/reply", "POST", { ticket_id: ticketId, message: clean });
+        showToast(res.message || "تم إرسال الرد");
+        const box = document.getElementById("supportTicketsContainer");
+        if (box) {
+            box.querySelectorAll("input[data-draft-tkt]").forEach(el => {
+                if (el.dataset.draftTkt === ticketId) el.value = "";
+            });
+        }
+        await applyLiveSyncUpdate(["support"]);
+    } catch (e) {
+        showToast(e.message);
+    }
+}
+
+async function adminPointsAction(uid, action, amtOverride = null, ticketId = "") {
+    const amtInput = document.getElementById("inpAdminPtsAmt");
+    const reasonInput = document.getElementById("inpAdminPtsReason");
+    const amount = amtOverride !== null ? amtOverride : (parseInt(amtInput ? amtInput.value : "0", 10) || 0);
+    const reason = (reasonInput && reasonInput.value.trim()) || (action === "settle" ? "اعتماد تسوية وصرف أرباح بالريال اليمني" : "تعديل إداري من المطور");
+    try {
+        const res = await apiCall("/api/admin/points", "POST", {
+            target_id: uid,
+            action,
+            amount,
+            reason,
+            ticket_id: ticketId
+        });
+        showToast(res.message || "تم تحديث النقاط");
+        await applyLiveSyncUpdate(["economy", "support", "users"]);
+        if (document.getElementById("tabsBar")?.dataset.activeTab === "radar") {
+            await loadAdminRadar();
+        }
+    } catch (e) {
+        showToast(e.message);
+    }
+}
+
+function renderEconomyTab() {
+    const box = document.getElementById("economySettingsContainer");
+    if (!box || !appState || !appState.is_super_admin) return;
+    const cfg = appState.economy_settings || {};
+    const opLabels = appState.op_cost_labels || {};
+    const opCosts = cfg.operation_costs || {};
+    box.innerHTML = "";
+
+    const toggles = [
+        { key: "public_mode", label: "فتح البوت للعامة (Public Mode)", desc: "يسمح لأي مستخدم جديد بالعمل داخل البوت شرط أن يدفع تكلفة كل عملية بالنقاط" },
+        { key: "enforce_points_on_actions", label: "إلزام خصم النقاط مقابل تنفيذ العمليات", desc: "يتفعل تلقائياً في الوضع العام، ويمكن تفعيله بالوضع الخاص أيضاً" },
+        { key: "suppliers_can_invite", label: "تمكين موردي الحسابات من إنشاء روابط وأكواد إحالة", desc: "من يمتلك صلاحية إضافة حسابات يستطيع دعوة غيره وكسب مكافأة الإحالة" },
+        { key: "public_allow_report", label: "تضمين ميزة البلاغات داخل الوضع العام", desc: "مغلق افتراضياً للأمان" }
+    ];
+
+    for (const tgItem of toggles) {
+        const row = document.createElement("div");
+        row.className = "toggle-item";
+        const left = document.createElement("div");
+        const l1 = document.createElement("div");
+        l1.className = "toggle-label";
+        l1.textContent = tgItem.label;
+        const l2 = document.createElement("div");
+        l2.className = "toggle-desc";
+        l2.textContent = tgItem.desc;
+        left.appendChild(l1);
+        left.appendChild(l2);
+
+        const btn = document.createElement("button");
+        btn.type = "button";
+        const isOn = !!cfg[tgItem.key];
+        btn.className = "switch-btn " + (isOn ? "switch-on" : "switch-off");
+        btn.textContent = isOn ? "مفعل" : "مغلق";
+        btn.onclick = async () => {
+            try {
+                const res = await apiCall("/api/admin/economy", "POST", { [tgItem.key]: !isOn });
+                appState.economy_settings = res.economy_settings;
+                showToast("تم تحديث الإعداد");
+                renderEconomyTab();
+            } catch (e) { showToast(e.message); }
+        };
+        row.appendChild(left);
+        row.appendChild(btn);
+        box.appendChild(row);
+    }
+
+    const form = document.createElement("div");
+    form.style.marginTop = "12px";
+    form.innerHTML =
+        '<div class="row-2">' +
+        '<div class="field"><label>قيمة النقطة بالريال اليمني</label><input type="number" id="ecoYerRate" min="1" value="' + (cfg.yer_per_point || 10) + '"></div>' +
+        '<div class="field"><label>مكافأة كل حساب نشط</label><input type="number" id="ecoAccRew" min="0" value="' + (cfg.active_account_reward || 1) + '"></div>' +
+        '<div class="field"><label>مكافأة الإحالة</label><input type="number" id="ecoRefRew" min="0" value="' + (cfg.referral_reward || 4) + '"></div>' +
+        '<div class="field"><label>شرط صرف مكافأة الإحالة</label><select id="ecoRefTrig">' +
+        '<option value="first_active"' + (cfg.referral_trigger !== "instant" ? " selected" : "") + '>عند تفعيل أول حساب نشط (آمن)</option>' +
+        '<option value="instant"' + (cfg.referral_trigger === "instant" ? " selected" : "") + '>فوراً عند الدخول بالرابط/الكود</option>' +
+        '</select></div></div>';
+
+    const costTitle = document.createElement("div");
+    costTitle.className = "panel-title";
+    costTitle.textContent = "تسعيرة كل عملية (بالنقاط لكل حساب منفذ)";
+    form.appendChild(costTitle);
+
+    const costGrid = document.createElement("div");
+    costGrid.className = "row-2";
+    for (const [opK, opLbl] of Object.entries(opLabels)) {
+        const f = document.createElement("div");
+        f.className = "field";
+        const l = document.createElement("label");
+        l.textContent = opLbl;
+        const inp = document.createElement("input");
+        inp.type = "number";
+        inp.min = "0";
+        inp.dataset.opCost = opK;
+        inp.value = opCosts[opK] != null ? opCosts[opK] : 1;
+        f.appendChild(l);
+        f.appendChild(inp);
+        costGrid.appendChild(f);
+    }
+    form.appendChild(costGrid);
+
+    const bSave = document.createElement("button");
+    bSave.type = "button";
+    bSave.className = "btn btn-ok";
+    bSave.textContent = "حفظ إعدادات النقاط والتسعيرة";
+    bSave.onclick = () => saveEconomySettings();
+    form.appendChild(bSave);
+    box.appendChild(form);
+}
+
+async function saveEconomySettings() {
+    const operation_costs = {};
+    document.querySelectorAll("input[data-op-cost]").forEach(inp => {
+        operation_costs[inp.dataset.opCost] = parseInt(inp.value || "0", 10) || 0;
+    });
+    const payload = {
+        yer_per_point: parseInt(document.getElementById("ecoYerRate")?.value || "10", 10) || 10,
+        active_account_reward: parseInt(document.getElementById("ecoAccRew")?.value || "1", 10) || 0,
+        referral_reward: parseInt(document.getElementById("ecoRefRew")?.value || "4", 10) || 0,
+        referral_trigger: document.getElementById("ecoRefTrig")?.value || "first_active",
+        operation_costs
+    };
+    try {
+        const res = await apiCall("/api/admin/economy", "POST", payload);
+        appState.economy_settings = res.economy_settings;
+        showToast(res.message || "تم الحفظ");
+        renderEconomyTab();
+    } catch (e) {
+        showToast(e.message);
+    }
+}
+
+document.getElementById("inpSelectedAcc")?.addEventListener("change", renderMissionCostBadge);
+document.getElementById("inpAccLimit")?.addEventListener("input", renderMissionCostBadge);
 
 bootstrap();
 </script>

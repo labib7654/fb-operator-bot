@@ -50,7 +50,19 @@ def _run_git_sync() -> None:
             subprocess.run(["git", "config", "user.name", "github-actions[bot]"], cwd=cwd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             subprocess.run(["git", "config", "user.email", "github-actions[bot]@users.noreply.github.com"], cwd=cwd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-            targets = [name for name in ("accounts.json", "users.json", "audit_logs.json", "profiles") if (BASE_OPERATOR_DIR / name).exists()]
+            targets = [
+                name for name in (
+                    "accounts.json",
+                    "users.json",
+                    "audit_logs.json",
+                    "economy_settings.json",
+                    "points_ledger.json",
+                    "invite_codes.json",
+                    "support_tickets.json",
+                    "profiles",
+                )
+                if (BASE_OPERATOR_DIR / name).exists()
+            ]
             if not targets:
                 return
 

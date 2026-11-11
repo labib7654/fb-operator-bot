@@ -51,8 +51,8 @@ def _match_event(scope: str, t_uid: int, viewer_uid: int, is_dev: bool, can_see_
         return True
     if scope == "accounts":
         return t_uid in (0, viewer_uid) or can_see_shared_accounts
-    if scope in ("users", "mission"):
-        return t_uid == viewer_uid
+    if scope in ("users", "mission", "economy", "support"):
+        return t_uid == 0 or t_uid == viewer_uid
     return False
 
 

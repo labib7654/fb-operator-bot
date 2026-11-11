@@ -34,7 +34,8 @@ DEFAULT_PERMISSIONS = {
     "can_message": False,             # إرسال رسائل الماسنجر الخاصة
     "can_report": False,              # تقديم البلاغات الرسمية وحظر الحسابات
     "can_delete_accounts": False,     # حذف أو تنظيف الحسابات الخاصة
-    "can_execute": False              # تشغيل زر الإطلاق الميداني
+    "can_execute": False,             # تشغيل زر الإطلاق الميداني
+    "can_invite": False               # إنشاء روابط وأكواد إحالة (+4 نقاط)
 }
 
 PERMISSION_LABELS = {
@@ -47,7 +48,8 @@ PERMISSION_LABELS = {
     "can_message": "الرسائل الخاصة",
     "can_report": "البلاغات والحظر",
     "can_delete_accounts": "حذف الحسابات المضافة",
-    "can_execute": "التنفيذ الميداني (الإطلاق)"
+    "can_execute": "التنفيذ الميداني (الإطلاق)",
+    "can_invite": "روابط وأكواد الإحالة"
 }
 
 ALL_TRUE_PERMISSIONS = {k: True for k in DEFAULT_PERMISSIONS}
@@ -76,10 +78,29 @@ def is_super_admin(user_id: int | str) -> bool:
         return False
 
 
+def _safe_nonneg_int(val, default: int = 0) -> int:
+    try:
+        return max(0, int(val))
+    except Exception:
+        return default
+
+
+def _ensure_wallet_fields(u: dict) -> None:
+    u["points"] = _safe_nonneg_int(u.get("points", 0))
+    u["total_points_earned"] = _safe_nonneg_int(u.get("total_points_earned", 0))
+    u["total_points_spent"] = _safe_nonneg_int(u.get("total_points_spent", 0))
+    u["total_yer_settled"] = _safe_nonneg_int(u.get("total_yer_settled", 0))
+    u["referred_by"] = _safe_nonneg_int(u.get("referred_by", 0))
+    u["referral_code_used"] = str(u.get("referral_code_used") or "")[:40]
+    u["referral_rewarded"] = bool(u.get("referral_rewarded", False))
+    u["referred_count"] = _safe_nonneg_int(u.get("referred_count", 0))
+    u["ref_code"] = str(u.get("ref_code") or "")[:32]
+
+
 def _build_super_profile(existing: dict | None = None) -> dict:
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     existing = existing or {}
-    return {
+    prof = {
         "id": SUPER_ADMIN_ID,
         "name": existing.get("name", "👑 المطور الرئيسي (Super Admin)"),
         "username": existing.get("username", "Dev"),
@@ -91,8 +112,18 @@ def _build_super_profile(existing: dict | None = None) -> dict:
         "operations_count": existing.get("operations_count", 0),
         "active_accounts_added": existing.get("active_accounts_added", 0),
         "inactive_accounts_added": existing.get("inactive_accounts_added", 0),
+        "points": _safe_nonneg_int(existing.get("points", 0)),
+        "total_points_earned": _safe_nonneg_int(existing.get("total_points_earned", 0)),
+        "total_points_spent": _safe_nonneg_int(existing.get("total_points_spent", 0)),
+        "total_yer_settled": _safe_nonneg_int(existing.get("total_yer_settled", 0)),
+        "referred_by": 0,
+        "referral_code_used": "",
+        "referral_rewarded": False,
+        "referred_count": _safe_nonneg_int(existing.get("referred_count", 0)),
+        "ref_code": str(existing.get("ref_code") or "")[:32],
         "permissions": dict(ALL_TRUE_PERMISSIONS)
     }
+    return prof
 
 
 def load_users() -> dict:
@@ -126,6 +157,7 @@ def load_users() -> dict:
                         raw_perms = {}
                     # حصر المفاتيح فقط في المفاتيح الرسمية وفرض False افتراضياً
                     v["permissions"] = {pk: bool(raw_perms.get(pk, False)) for pk in DEFAULT_PERMISSIONS}
+                    _ensure_wallet_fields(v)
             return data
         except Exception:
             try:
@@ -197,6 +229,15 @@ def register_or_update_user(user_id: int, name: str, username: str = "", touch_l
                 "operations_count": 0,
                 "active_accounts_added": 0,
                 "inactive_accounts_added": 0,
+                "points": 0,
+                "total_points_earned": 0,
+                "total_points_spent": 0,
+                "total_yer_settled": 0,
+                "referred_by": 0,
+                "referral_code_used": "",
+                "referral_rewarded": False,
+                "referred_count": 0,
+                "ref_code": "",
                 "permissions": dict(DEFAULT_PERMISSIONS)
             }
             save_users(users, sync_git=True)

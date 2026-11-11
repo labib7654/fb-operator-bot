@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import html
 import json
 import os
 import platform
@@ -18,6 +19,7 @@ from telebot import types
 
 from fb_operator.webapp_ui import get_miniapp_html
 from fb_operator.state_events import get_seq, publish_event, wait_for_relevant_events
+import fb_operator.economy_manager as eco
 
 _url_lock = threading.Lock()
 _public_webapp_url: str | None = None
@@ -303,7 +305,12 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
             username = str(tg_user.get("username") or "")[:64]
 
             user_rec, is_new = hooks["register_or_update_user"](uid, first_name, username, touch_login=touch_login)
-            if is_new and not hooks["is_super_admin"](uid):
+            if not hooks["is_super_admin"](uid) and user_rec.get("status") == "pending":
+                if eco.ensure_public_access_if_enabled(uid):
+                    fresh_users = hooks["load_users"]()
+                    user_rec = fresh_users.get(str(uid), user_rec)
+                    update_menu_button_for_user(hooks.get("bot"), uid, is_allowed=True)
+            if is_new and not hooks["is_super_admin"](uid) and user_rec.get("status") == "pending":
                 notifier = hooks.get("notify_new_pending_user")
                 if notifier:
                     try:
@@ -360,11 +367,12 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                     msg = (
                         "حسابك محظور نهائياً من استخدام النظام."
                         if status == "banned"
-                        else f"تم تسجيل طلبك تلقائياً لدى المطور، يرجى الانتظار حتى الموافقة.\nمعرفك: {uid}"
+                        else f"تم تسجيل طلبك تلقائياً لدى المطور، يرجى الانتظار حتى الموافقة.\nمعرفك: {uid}\nأو أدخل كود الدعوة لتفعيل إضافة الحسابات فوراً."
                     )
                     self._send_json(200, {
                         "authorized": False,
                         "status": status,
+                        "can_redeem_invite": status == "pending",
                         "message": msg,
                         "is_super_admin": False,
                         "event_seq": get_seq(),
@@ -431,6 +439,9 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                     "live_status_text": st.get("live_status_text", ""),
                 }
 
+                bot_uname = str((hooks.get("get_bot_username") and hooks["get_bot_username"]()) or hooks.get("bot_username") or "")
+                can_inv = eco.can_user_invite(uid)
+                eco_cfg = eco.load_economy_settings()
                 self._send_json(200, {
                     "authorized": True,
                     "status": "approved",
@@ -442,6 +453,19 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                     "usable_accounts": usable_safe,
                     "manageable_accounts": manageable_safe,
                     "mission_state": mission_state,
+                    "wallet": eco.get_user_wallet(uid),
+                    "settlement_snapshot": eco.build_user_settlement_snapshot(uid),
+                    "economy_settings": eco_cfg,
+                    "points_enforced": eco.is_points_enforced_for_user(uid),
+                    "op_cost_labels": eco.OP_COST_LABELS_AR,
+                    "can_invite": can_inv,
+                    "invite_info": {
+                        "ref_code": eco.get_or_create_personal_ref_code(uid) if can_inv else "",
+                        "bot_username": bot_uname,
+                        "codes": list(reversed(eco.list_invite_codes_by_owner(uid)))[-15:] if can_inv else [],
+                    },
+                    "ledger": list(reversed(eco.load_points_ledger(uid, limit=25))),
+                    "support_tickets": eco.list_support_tickets(uid, is_dev=is_dev, limit=30),
                 })
                 return
 
@@ -520,7 +544,10 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                             "fb_id": full.get("fb_id", ""),
                         })
 
+                    eco_cfg = eco.load_economy_settings()
+                    rate_yer = eco_cfg["yer_per_point"]
                     u_perms = u_dict.get("permissions", {})
+                    u_pts = int(u_dict.get("points", 0))
                     radar_users.append({
                         "id": t_uid,
                         "name": u_dict.get("name", ""),
@@ -530,6 +557,14 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                         "operations_count": u_dict.get("operations_count", 0),
                         "active_accounts_added": u_dict.get("active_accounts_added", 0),
                         "inactive_accounts_added": u_dict.get("inactive_accounts_added", 0),
+                        "points": u_pts,
+                        "yer_value": u_pts * rate_yer,
+                        "total_points_earned": int(u_dict.get("total_points_earned", 0)),
+                        "total_points_spent": int(u_dict.get("total_points_spent", 0)),
+                        "total_yer_settled": int(u_dict.get("total_yer_settled", 0)),
+                        "referred_by": int(u_dict.get("referred_by") or 0),
+                        "referred_count": int(u_dict.get("referred_count", 0)),
+                        "referral_rewarded": bool(u_dict.get("referral_rewarded", False)),
                         "enabled_perms": sum(1 for v in u_perms.values() if v),
                         "permissions": u_perms,
                         "active_count": active_c,
@@ -539,6 +574,8 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
 
                 self._send_json(200, {
                     "perm_labels": hooks["PERMISSION_LABELS"],
+                    "economy_settings": eco.load_economy_settings(),
+                    "op_cost_labels": eco.OP_COST_LABELS_AR,
                     "users": radar_users,
                 })
                 return
@@ -564,6 +601,36 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
             if not auth:
                 return
             uid, tg_user, user_rec = auth
+            user_label = str(tg_user.get("first_name") or user_rec.get("name") or uid)
+            username = str(tg_user.get("username") or user_rec.get("username") or "")
+
+            if path == "/api/referral/redeem":
+                if user_rec.get("status") == "banned":
+                    self._send_json(403, {"error": "حسابك محظور نهائياً ولا يمكن تفعيله بكود."})
+                    return
+                body, err = self._read_json_body()
+                if err or body is None:
+                    self._send_json(400, {"error": err or "طلب غير صالح"})
+                    return
+                code = str(body.get("code") or "").strip()
+                res = eco.redeem_invite_code(uid, code, user_name=user_label, username=username)
+                if not res.get("ok"):
+                    self._send_json(400, {"error": res.get("error", "تعذر استخدام كود الدعوة.")})
+                    return
+                update_menu_button_for_user(hooks.get("bot"), uid, is_allowed=True)
+                inv_id = res["inviter_id"]
+                bonus_msg = f" وحصلت على +{res['instant_bonus']} نقاط!" if res.get("instant_bonus") else " (تضاف لك +4 نقاط فور تفعيل أول حساب نشط)"
+                hooks["safe_send"](
+                    inv_id,
+                    f"🎟️ <b>انضم مستخدم جديد عبر إحالتك:</b> {html.escape(user_label, quote=True)} (<code>{uid}</code>){bonus_msg}"
+                )
+                self._send_json(200, {
+                    "ok": True,
+                    "message": "✅ تم تفعيل حسابك كمورّد حسابات فيسبوك بنجاح!",
+                    "inviter_name": res.get("inviter_name", ""),
+                })
+                return
+
             if not self._require_approved(uid, tg_user, user_rec):
                 return
 
@@ -574,8 +641,6 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
 
             is_dev = hooks["is_super_admin"](uid)
             perms = {k: True for k in hooks["PERMISSION_LABELS"]} if is_dev else hooks["get_user_permissions"](uid)
-            user_label = str(tg_user.get("first_name") or user_rec.get("name") or uid)
-            username = str(tg_user.get("username") or user_rec.get("username") or "")
 
             if path == "/api/mission/launch":
                 if not (is_dev or perms.get("can_execute")):
@@ -633,6 +698,8 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                         self._send_json(409, {"error": "توجد مهمة قيد التشغيل لحسابك حالياً، انتظر اكتمالها."})
                         return
 
+                    st["is_running"] = False
+
                     def safe_int(val: Any, default: int, min_v: int, max_v: int) -> int:
                         try:
                             n = int(val)
@@ -640,24 +707,54 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                         except Exception:
                             return default
 
+                    acc_limit_val = safe_int(body.get("acc_count_limit", 0), 0, 0, 500)
+                    ff_ok = is_dev or perms.get("can_friend_follow")
+                    rep_ok = is_dev or perms.get("can_report")
+                    flags_for_billing = {
+                        "like": bool(body.get("like")) and (is_dev or perms.get("can_react")),
+                        "comment": bool(body.get("comment")) and (is_dev or perms.get("can_comment")),
+                        "interact_cmt": bool(body.get("interact_cmt")) and (is_dev or perms.get("can_interact_comments")),
+                        "friend": bool(body.get("friend")) and ff_ok,
+                        "cancel_friend": bool(body.get("cancel_friend")) and ff_ok and not bool(body.get("friend")),
+                        "follow": bool(body.get("follow")) and ff_ok,
+                        "unfollow": bool(body.get("unfollow")) and ff_ok and not bool(body.get("follow")),
+                        "message": bool(body.get("message")) and (is_dev or perms.get("can_message")),
+                        "report_post": bool(body.get("report_post")) and rep_ok,
+                        "report_profile": bool(body.get("report_profile")) and rep_ok and not bool(body.get("report_post")),
+                        "block": bool(body.get("block")) and rep_ok,
+                    }
+                    acc_est = eco.estimate_mission_account_count(
+                        usable, {"selected_acc": selected_acc, "acc_count_limit": acc_limit_val}
+                    )
+                    debit_res = eco.debit_points_for_mission(uid, flags_for_billing, acc_est, target_url)
+                    if not debit_res.get("ok"):
+                        req_pts = debit_res.get("required", 0)
+                        bal_pts = debit_res.get("balance", 0)
+                        self._send_json(402, {
+                            "error": f"رصيد نقاطك ({bal_pts} نقطة) لا يكفي لتنفيذ هذه العملية ({req_pts} نقطة). أضف حسابات نشطة (+1) أو ادعُ أصدقاء (+4) أو اشحن من المطور.",
+                            "required_points": req_pts,
+                            "balance": bal_pts,
+                        })
+                        return
+
                     st["target_url"] = target_url[:1000]
                     st["selected_acc"] = selected_acc
-                    st["acc_count_limit"] = safe_int(body.get("acc_count_limit", 0), 0, 0, 500)
+                    st["acc_count_limit"] = acc_limit_val
 
-                    st["like"] = bool(body.get("like")) and (is_dev or perms.get("can_react"))
+                    st["like"] = flags_for_billing["like"]
                     rtype = str(body.get("reaction_type") or "like")
                     st["reaction_type"] = rtype if rtype in VALID_REACTIONS else "like"
                     st["react_post_index"] = safe_int(body.get("react_post_index", 1), 1, 1, 50)
                     rurl = str(body.get("react_post_url") or "").strip()
                     st["react_post_url"] = rurl[:1000] if rurl.startswith(("http://", "https://")) else ""
 
-                    st["comment"] = bool(body.get("comment")) and (is_dev or perms.get("can_comment"))
+                    st["comment"] = flags_for_billing["comment"]
                     st["comment_text"] = str(body.get("comment_text") or "").strip()[:2000]
                     st["comment_post_index"] = safe_int(body.get("comment_post_index", 1), 1, 1, 50)
                     curl = str(body.get("comment_post_url") or "").strip()
                     st["comment_post_url"] = curl[:1000] if curl.startswith(("http://", "https://")) else ""
 
-                    st["interact_cmt"] = bool(body.get("interact_cmt")) and (is_dev or perms.get("can_interact_comments"))
+                    st["interact_cmt"] = flags_for_billing["interact_cmt"]
                     cmode = str(body.get("cmt_target_mode") or "first")
                     st["cmt_target_mode"] = cmode if cmode in VALID_CMT_MODES else "first"
                     st["cmt_target_val"] = str(body.get("cmt_target_val") or "").strip()[:300]
@@ -665,25 +762,17 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                     st["cmt_reaction"] = creact if creact in VALID_CMT_REACTIONS else "like"
                     st["cmt_reply"] = str(body.get("cmt_reply") or "").strip()[:2000]
 
-                    ff_ok = is_dev or perms.get("can_friend_follow")
-                    st["friend"] = bool(body.get("friend")) and ff_ok
-                    st["cancel_friend"] = bool(body.get("cancel_friend")) and ff_ok
-                    st["follow"] = bool(body.get("follow")) and ff_ok
-                    st["unfollow"] = bool(body.get("unfollow")) and ff_ok
-                    if st["friend"] and st["cancel_friend"]:
-                        st["cancel_friend"] = False
-                    if st["follow"] and st["unfollow"]:
-                        st["unfollow"] = False
+                    st["friend"] = flags_for_billing["friend"]
+                    st["cancel_friend"] = flags_for_billing["cancel_friend"]
+                    st["follow"] = flags_for_billing["follow"]
+                    st["unfollow"] = flags_for_billing["unfollow"]
 
-                    st["message"] = bool(body.get("message")) and (is_dev or perms.get("can_message"))
+                    st["message"] = flags_for_billing["message"]
                     st["message_text"] = str(body.get("message_text") or "").strip()[:2000]
 
-                    rep_ok = is_dev or perms.get("can_report")
-                    st["report_post"] = bool(body.get("report_post")) and rep_ok
-                    st["report_profile"] = bool(body.get("report_profile")) and rep_ok
-                    st["block"] = bool(body.get("block")) and rep_ok
-                    if st["report_post"] and st["report_profile"]:
-                        st["report_profile"] = False
+                    st["report_post"] = flags_for_billing["report_post"]
+                    st["report_profile"] = flags_for_billing["report_profile"]
+                    st["block"] = flags_for_billing["block"]
                     r_reason = str(body.get("rep_reason") or "harassment")
                     st["rep_reason"] = r_reason if r_reason in VALID_REP_REASONS else "harassment"
                     r_victim = str(body.get("rep_victim") or "me")
@@ -693,10 +782,15 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                     st["live_status_text"] = "تم إطلاق المهمة من لوحة التحكم الداخلية..."
 
                 hooks["record_user_operation"](uid, "تشغيل مهمة ميدانية (Mini App)")
-                hooks["record_audit_log"](uid, user_label, "LAUNCH_MISSION_WEBAPP", f"الهدف: {target_url[:80]}")
+                hooks["record_audit_log"](uid, user_label, "LAUNCH_MISSION_WEBAPP", f"الهدف: {target_url[:80]} | تكلفة: {debit_res.get('cost', 0)} نقطة")
                 publish_event("mission", uid, "launch")
                 threading.Thread(target=hooks["execute_mission_worker"], args=(uid, uid), daemon=True).start()
-                self._send_json(200, {"ok": True, "message": "تم بدء تنفيذ المهمة في الخلفية! راقب التقدم هنا أو في الدردشة."})
+                self._send_json(200, {
+                    "ok": True,
+                    "cost": debit_res.get("cost", 0),
+                    "remaining_points": debit_res.get("balance", 0),
+                    "message": "تم بدء تنفيذ المهمة في الخلفية! راقب التقدم هنا أو في الدردشة.",
+                })
                 return
 
             if path == "/api/accounts/add":
@@ -867,6 +961,183 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                     return
 
                 self._send_json(400, {"error": "إجراء غير معروف."})
+                return
+
+            if path == "/api/referral/create_code":
+                if not eco.can_user_invite(uid):
+                    self._deny_perm(uid, tg_user, "محاولة توليد كود إحالة بدون صلاحية")
+                    return
+                label = str(body.get("label") or "").strip()[:60]
+                res = eco.create_invite_code(uid, max_uses=1, label=label)
+                if not res.get("ok"):
+                    self._send_json(400, {"error": res.get("error", "تعذر إنشاء كود الدعوة.")})
+                    return
+                bot_uname = str((hooks.get("get_bot_username") and hooks["get_bot_username"]()) or hooks.get("bot_username") or "")
+                inv = res["invite"]
+                link = f"https://t.me/{bot_uname}?start=ref_{inv['code']}" if bot_uname else ""
+                self._send_json(200, {"ok": True, "invite": inv, "invite_link": link})
+                return
+
+            if path == "/api/referral/revoke_code":
+                code = str(body.get("code") or "").strip()
+                if not code:
+                    self._send_json(400, {"error": "كود الإحالة مطلوب."})
+                    return
+                if not eco.revoke_invite_code(uid, code, is_dev=is_dev):
+                    self._send_json(403, {"error": "الكود غير موجود أو لا يخصك."})
+                    return
+                self._send_json(200, {"ok": True, "message": "تم إلغاء كود الدعوة بنجاح."})
+                return
+
+            if path == "/api/support/create":
+                kind = str(body.get("kind") or "support").strip()
+                msg_txt = str(body.get("message") or "").strip()
+                res = eco.create_support_ticket(uid, kind, msg_txt)
+                if not res.get("ok"):
+                    self._send_json(400, {"error": res.get("error", "تعذر إرسال التذكرة.")})
+                    return
+                tkt = res["ticket"]
+                snap = tkt["snapshot"]
+                super_id = int(hooks["SUPER_ADMIN_ID"])
+                u_tag = f"@{html.escape(username, quote=True)}" if username else "بدون معرف"
+                title = "💵 طلب موافقة على بيع الحسابات والمحاسبة" if tkt["kind"] == "sell_accounts" else "💬 رسالة جديدة للدعم والمطور"
+                mk = types.InlineKeyboardMarkup(row_width=1)
+                mk.add(types.InlineKeyboardButton("↩️ الرد على المستخدم", callback_data=f"tkt_reply_{tkt['id']}"))
+                if snap["points"] > 0:
+                    mk.add(types.InlineKeyboardButton(
+                        f"💸 تسوية كامل الرصيد ({snap['points']} نقطة = {snap['yer_value']:,} ريال)",
+                        callback_data=f"tkt_settle_{tkt['id']}"
+                    ))
+                mk.add(types.InlineKeyboardButton("🛰️ فتح بطاقة المستخدم بالرادار", callback_data=f"surv_user_{uid}"))
+                hooks["safe_send"](
+                    super_id,
+                    f"📬 <b>{title}</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🎫 <b>رقم التذكرة:</b> <code>{tkt['id']}</code>\n"
+                    f"👤 <b>المستخدم:</b> {html.escape(snap['name'], quote=True)} ({u_tag})\n"
+                    f"🆔 <b>الآيدي:</b> <code>{uid}</code>\n"
+                    f"📊 <b>الحسابات المضافة:</b> {snap['total_added']} (🟢 {snap['active_added']} نشط | 🔴 {snap['inactive_added']} غير نشط)\n"
+                    f"💰 <b>رصيد النقاط:</b> {snap['points']} نقطة = <b>{snap['yer_value']:,} ريال يمني</b>\n"
+                    f"🧾 <b>تمت محاسبته سابقاً:</b> {snap['total_yer_settled']:,} ريال يمني\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📝 <b>رسالته:</b>\n{html.escape(msg_txt, quote=True)}",
+                    reply_markup=mk,
+                )
+                self._send_json(200, {"ok": True, "ticket": tkt, "message": "✅ تم إرسال رسالتك إلى المطور مع كامل تفاصيل حساباتك ونقاطك!"})
+                return
+
+            if path == "/api/support/reply":
+                ticket_id = str(body.get("ticket_id") or "").strip()
+                msg_txt = str(body.get("message") or "").strip()
+                if not ticket_id:
+                    self._send_json(400, {"error": "رقم التذكرة مطلوب."})
+                    return
+                res = eco.reply_support_ticket(ticket_id, uid, msg_txt, is_dev=is_dev)
+                if not res.get("ok"):
+                    code_http = 403 if res.get("error") == "forbidden" else 400
+                    self._send_json(code_http, {"error": "لا يمكنك الرد على هذه التذكرة." if code_http == 403 else res.get("error", "خطأ.")})
+                    return
+                tkt = res["ticket"]
+                snap = tkt.get("snapshot", {})
+                if is_dev:
+                    mk_u = types.InlineKeyboardMarkup(row_width=1)
+                    mk_u.add(types.InlineKeyboardButton("↩️ الرد على المطور / الدعم", callback_data=f"user_reply_tkt_{tkt['id']}"))
+                    hooks["safe_send"](
+                        tkt["user_id"],
+                        f"📩 <b>رد جديد من المطور / الدعم</b> (<code>{tkt['id']}</code>)\n"
+                        "━━━━━━━━━━━━━━━━━━━━\n"
+                        f"💬 {html.escape(msg_txt, quote=True)}\n"
+                        "━━━━━━━━━━━━━━━━━━━━\n"
+                        f"💰 <b>رصيدك الحالي:</b> {snap.get('points', 0)} نقطة ({snap.get('yer_value', 0):,} ريال)",
+                        reply_markup=mk_u,
+                    )
+                else:
+                    super_id = int(hooks["SUPER_ADMIN_ID"])
+                    mk_d = types.InlineKeyboardMarkup(row_width=1)
+                    mk_d.add(types.InlineKeyboardButton("↩️ الرد على المستخدم", callback_data=f"tkt_reply_{tkt['id']}"))
+                    if snap.get("points", 0) > 0:
+                        mk_d.add(types.InlineKeyboardButton(
+                            f"💸 تسوية الرصيد ({snap['points']} نقطة = {snap['yer_value']:,} ريال)",
+                            callback_data=f"tkt_settle_{tkt['id']}"
+                        ))
+                    hooks["safe_send"](
+                        super_id,
+                        f"💬 <b>رد جديد من المستخدم</b> {html.escape(user_label, quote=True)} (<code>{uid}</code>)\n"
+                        f"🎫 <b>تذكرة:</b> <code>{tkt['id']}</code> | 💰 <b>الرصيد:</b> {snap.get('points', 0)} نقطة ({snap.get('yer_value', 0):,} ريال)\n"
+                        f"📝 {html.escape(msg_txt, quote=True)}",
+                        reply_markup=mk_d,
+                    )
+                self._send_json(200, {"ok": True, "ticket": tkt, "message": "✅ تم إرسال الرد بنجاح."})
+                return
+
+            if path == "/api/admin/points":
+                if not is_dev:
+                    self._deny_perm(uid, tg_user, "محاولة التلاعب بالنقاط من غير المطور الرئيسي")
+                    return
+                try:
+                    target_id = int(body.get("target_id"))
+                except Exception:
+                    self._send_json(400, {"error": "معرف المستخدم غير صالح."})
+                    return
+
+                act = str(body.get("action") or "").strip()
+                reason = str(body.get("reason") or "تعديل يدوي من المطور").strip()[:240]
+                ticket_id = str(body.get("ticket_id") or "").strip() or None
+
+                if act == "settle":
+                    raw_amt = body.get("amount")
+                    amt = None if (raw_amt is None or str(raw_amt).lower() == "all") else None
+                    if raw_amt not in (None, "", "all"):
+                        try:
+                            amt = int(raw_amt)
+                        except Exception:
+                            self._send_json(400, {"error": "قيمة النقاط للتصفية غير صالحة."})
+                            return
+                    s_res = eco.settle_payout(target_id, amt, actor_uid=uid, ticket_id=ticket_id, note=reason)
+                    if not s_res.get("ok"):
+                        self._send_json(400, {"error": s_res.get("error", "تعذرت التسوية.")})
+                        return
+                    hooks["safe_send"](
+                        target_id,
+                        f"🧾 <b>إشعار محاسبة وصرف أرباح</b>\n"
+                        f"✅ تم اعتماد تسوية <b>{s_res['points_settled']} نقطة</b> بمبلغ <b>{s_res['yer_paid']:,} ريال يمني</b>.\n"
+                        f"💰 <b>الرصيد المتبقي:</b> {s_res['remaining_points']} نقطة ({s_res['remaining_yer']:,} ريال)"
+                    )
+                    self._send_json(200, {"ok": True, "message": f"✅ تمت تسوية {s_res['points_settled']} نقطة ({s_res['yer_paid']:,} ريال يمني).", **s_res})
+                    return
+
+                try:
+                    amount = int(body.get("amount"))
+                except Exception:
+                    self._send_json(400, {"error": "أدخل عدداً صحيحاً من النقاط."})
+                    return
+                if amount <= 0:
+                    self._send_json(400, {"error": "عدد النقاط يجب أن يكون أكبر من الصفر."})
+                    return
+
+                if act == "add":
+                    adj = eco.adjust_user_points(target_id, amount, "ADMIN_GRANT", reason, actor_uid=uid)
+                    msg_u = f"➕ <b>تمت إضافة +{amount} نقطة إلى محفظتك من المطور!</b>\n💰 رصيدك الجديد: {adj.get('balance', 0)} نقطة ({adj.get('yer_value', 0):,} ريال يمني)"
+                elif act == "deduct":
+                    adj = eco.adjust_user_points(target_id, -amount, "ADMIN_DEDUCT", reason, actor_uid=uid, allow_partial_zero=True)
+                    msg_u = f"➖ <b>تم خصم {abs(adj.get('delta', amount))} نقطة من محفظتك.</b>\n📝 السبب: {html.escape(reason, quote=True)}\n💰 رصيدك الحالي: {adj.get('balance', 0)} نقطة"
+                else:
+                    self._send_json(400, {"error": "إجراء نقاط غير معروف."})
+                    return
+
+                if not adj.get("ok"):
+                    self._send_json(400, {"error": adj.get("error", "تعذر تعديل النقاط.")})
+                    return
+                hooks["safe_send"](target_id, msg_u)
+                self._send_json(200, {"ok": True, "balance": adj["balance"], "yer_value": adj["yer_value"], "message": "✅ تم تحديث محفظة النقاط بنجاح."})
+                return
+
+            if path == "/api/admin/economy":
+                if not is_dev:
+                    self._deny_perm(uid, tg_user, "محاولة تعديل تسعيرة النقاط والوضع العام من غير المطور")
+                    return
+                updated = eco.update_economy_settings(body, actor_uid=uid)
+                self._send_json(200, {"ok": True, "economy_settings": updated, "message": "✅ تم حفظ إعدادات النقاط والتسعيرة والوضع العام بنجاح."})
                 return
 
             self._send_json(404, {"error": "المسار غير موجود"})
