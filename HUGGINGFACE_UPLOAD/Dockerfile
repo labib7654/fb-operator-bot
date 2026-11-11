@@ -36,6 +36,10 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 RUN playwright install --with-deps chromium
 
+# تثبيت cloudflared لتشغيل نفق HTTPS الآمن للوحة التحكم المصغرة داخل تلغرام عند الحاجة
+RUN wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O /usr/local/bin/cloudflared && \
+    chmod +x /usr/local/bin/cloudflared || true
+
 # تخصيص الصلاحيات لمستخدم Docker
 RUN mkdir -p /app/fb_operator/profiles /app/scratch && \
     chown -R 1000:1000 /app

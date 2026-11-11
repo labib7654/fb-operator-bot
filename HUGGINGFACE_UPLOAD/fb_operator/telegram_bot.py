@@ -24,6 +24,7 @@ if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
         pass
 
 import os
+import re
 import html
 import time
 import tempfile
@@ -39,9 +40,10 @@ from fb_operator.account_manager import (
     delete_accounts_by_owner, get_account_by_id, git_sync_save
 )
 from fb_operator.admin_manager import (
-    is_super_admin, is_authorized_user, has_permission, register_or_update_user,
-    approve_user, ban_user, unban_user, toggle_user_permission, revoke_all_permissions,
-    delete_user_and_data, load_users, record_user_operation, record_account_result_for_user,
+    is_super_admin, is_authorized_user, has_permission, get_user_permissions,
+    register_or_update_user, approve_user, ban_user, unban_user,
+    toggle_user_permission, revoke_all_permissions, delete_user_and_data,
+    load_users, record_user_operation, record_account_result_for_user,
     record_audit_log, load_audit_logs, SUPER_ADMIN_ID, PERMISSION_LABELS
 )
 from fb_operator.browser_manager import (
@@ -52,6 +54,9 @@ from fb_operator.actions import (
     send_friend_request, cancel_friend_request, follow_profile, unfollow_profile,
     send_direct_message, block_profile, report_profile, report_post,
     interact_with_specific_comment
+)
+from fb_operator.webapp_server import (
+    start_webapp_and_tunnel, get_public_webapp_url, update_menu_button_for_user
 )
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8798272294:AAEY_LIYnVRIY2T-WUP63duCn5V7VFgGsCE")
@@ -79,7 +84,10 @@ def safe_answer(call_id: str, text: str | None = None, show_alert: bool = False)
         pass
 
 
-def safe_edit_message(text: str, chat_id: int, message_id: int, reply_markup=None) -> None:
+def safe_edit_message(text: str, chat_id: int, message_id: int | None, reply_markup=None) -> None:
+    if message_id is None:
+        safe_send(chat_id, text, reply_markup=reply_markup)
+        return
     try:
         bot.edit_message_text(text, chat_id, message_id, reply_markup=reply_markup)
     except Exception as e:
@@ -157,7 +165,8 @@ def default_user_state() -> dict:
         "block": False,
         "input_mode": None,
         "temp_acc_data": {},
-        "is_running": False
+        "is_running": False,
+        "live_status_text": ""
     }
 
 
@@ -213,6 +222,32 @@ def require_perm_or_deny(call: types.CallbackQuery, perm_key: str, error_msg: st
 
 # ----------------- بوابة التحقق الصارمة من الوصول (Strict Access Gate) -----------------
 
+def notify_new_pending_user(user_id: int, full_name: str, username: str = "") -> None:
+    """إرسال تنبيه فوري للمطور الرئيسي عند دخول مستخدم جديد مع أزرار الموافقة أو الحظر"""
+    if is_super_admin(user_id):
+        return
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("✅ قبول (بدون صلاحيات)", callback_data=f"gate_app_{user_id}"),
+        types.InlineKeyboardButton("🚫 رفض وحظر نهائي", callback_data=f"gate_ban_{user_id}")
+    )
+    markup.add(
+        types.InlineKeyboardButton("🛰️ فتح بطاقة المستخدم بالرادار", callback_data=f"surv_user_{user_id}")
+    )
+    user_tag = f"@{esc(username)}" if username else "بدون معرف"
+    alert_text = (
+        "🚨 <b>رادار الأمان: مستخدم جديد دخل للبوت!</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 <b>الاسم:</b> {esc(full_name)}\n"
+        f"🆔 <b>الآيدي:</b> <code>{user_id}</code>\n"
+        f"🌐 <b>المعرف:</b> {user_tag}\n"
+        f"📅 <b>التوقيت:</b> {datetime.now().strftime('%Y-%m-%d %I:%M %p')}\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "⚠️ <b>الحالة الآن:</b> محجوب بالكامل. عند القبول تبقى كل الميزات مغلقة حتى تحددها بنفسك:"
+    )
+    safe_send(SUPER_ADMIN_ID, alert_text, reply_markup=markup)
+
+
 def check_user_access_gate(user, chat_id: int, notify_blocked: bool = True) -> bool:
     """
     بوابة الأمان والتحقق الصارمة:
@@ -230,26 +265,8 @@ def check_user_access_gate(user, chat_id: int, notify_blocked: bool = True) -> b
         return True
 
     if is_new:
-        markup = types.InlineKeyboardMarkup(row_width=2)
-        markup.add(
-            types.InlineKeyboardButton("✅ قبول (بدون صلاحيات)", callback_data=f"gate_app_{user_id}"),
-            types.InlineKeyboardButton("🚫 رفض وحظر نهائي", callback_data=f"gate_ban_{user_id}")
-        )
-        markup.add(
-            types.InlineKeyboardButton("🛰️ فتح بطاقة المستخدم بالرادار", callback_data=f"surv_user_{user_id}")
-        )
-        user_tag = f"@{esc(username)}" if username else "بدون معرف"
-        alert_text = (
-            "🚨 <b>رادار الأمان: مستخدم جديد دخل للبوت!</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            f"👤 <b>الاسم:</b> {esc(full_name)}\n"
-            f"🆔 <b>الآيدي:</b> <code>{user_id}</code>\n"
-            f"🌐 <b>المعرف:</b> {user_tag}\n"
-            f"📅 <b>التوقيت:</b> {datetime.now().strftime('%Y-%m-%d %I:%M %p')}\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "⚠️ <b>الحالة الآن:</b> محجوب بالكامل. عند القبول تبقى كل الميزات مغلقة حتى تحددها بنفسك:"
-        )
-        safe_send(SUPER_ADMIN_ID, alert_text, reply_markup=markup)
+        notify_new_pending_user(user_id, full_name, username)
+        update_menu_button_for_user(bot, user_id, is_allowed=False)
 
         if notify_blocked:
             safe_send(
@@ -437,17 +454,23 @@ def get_main_dashboard_markup(user_id: int) -> types.InlineKeyboardMarkup:
             types.InlineKeyboardButton(f"🛰️ رادار المستخدمين والصلاحيات ({user_count})", callback_data="menu_surveillance_radar")
         )
         markup.row(
-            types.InlineKeyboardButton("📜 سجل الرقابة والأحداث الكامل", callback_data="menu_audit_logs"),
-            types.InlineKeyboardButton("🌐 سجل السحابة (Actions)", url="https://github.com/labib7654/fb-operator-bot/actions")
+            types.InlineKeyboardButton("📜 سجل الرقابة والأحداث الكامل", callback_data="menu_audit_logs")
         )
 
-    # 10. زر الإطلاق الميداني (يظهر فقط إذا مُنح can_execute ولدى المستخدم أداة واحدة على الأقل)
+    # 10. فتح لوحة التحكم التفاعلية داخل تلغرام فقط (WebApp داخل التطبيق بدون متصفح خارجي)
+    webapp_url = get_public_webapp_url()
+    if webapp_url and any((is_dev, p_use, p_add, p_del, p_exec, has_any_action)):
+        markup.row(
+            types.InlineKeyboardButton("📱 فتح لوحة التحكم داخل تلغرام", web_app=types.WebAppInfo(url=webapp_url))
+        )
+
+    # 11. زر الإطلاق الميداني (يظهر فقط إذا مُنح can_execute ولدى المستخدم أداة واحدة على الأقل)
     if p_exec and has_any_action and (p_use or len(usable_accs) > 0):
         markup.row(
             types.InlineKeyboardButton("🚀 بدء تنفيذ المهام الآن", callback_data="action_launch")
         )
 
-    # 11. إذا كان المستخدم معتمداً لكن لم تُفتح له أي صلاحية بعد
+    # 12. إذا كان المستخدم معتمداً لكن لم تُفتح له أي صلاحية بعد
     if not any((is_dev, p_use, p_add, p_del, p_exec, has_any_action)):
         markup.row(types.InlineKeyboardButton("🔄 تحديث الصلاحيات والحالة", callback_data="back_to_main"))
 
@@ -685,8 +708,10 @@ def render_user_dossier(t_id: int):
 @bot.message_handler(commands=['start', 'menu', 'cancel'])
 def cmd_start(message: types.Message):
     if not check_user_access_gate(message.from_user, message.chat.id):
+        update_menu_button_for_user(bot, message.from_user.id, is_allowed=False)
         return
 
+    update_menu_button_for_user(bot, message.from_user.id, is_allowed=True)
     st = get_user_state(message.from_user.id)
     st["input_mode"] = None
     st["temp_acc_data"] = {}
@@ -720,6 +745,7 @@ def handle_callbacks(call: types.CallbackQuery):
             safe_answer(call.id, "👑 المطور الأكبر معتمد تلقائياً دوماً.")
             return
         approve_user(target_uid)
+        update_menu_button_for_user(bot, target_uid, is_allowed=True)
         safe_answer(call.id, "✅ تم قبول المستخدم! كافة الأدوات مغلقة حتى تفتحها له بنفسك.", show_alert=True)
         m = types.InlineKeyboardMarkup(row_width=1)
         m.add(
@@ -751,6 +777,7 @@ def handle_callbacks(call: types.CallbackQuery):
             safe_answer(call.id, "🛡️ محظور برمجياً: لا يمكن حظر المطور الأكبر أبداً!", show_alert=True)
             return
         ban_user(target_uid)
+        update_menu_button_for_user(bot, target_uid, is_allowed=False)
         safe_answer(call.id, "🚫 تم حظر المستخدم نهائياً وتصفير صلاحياته!", show_alert=True)
         safe_edit_message(
             f"🚫 <b>تم حظر المستخدم (<code>{target_uid}</code>) ومنعه نهائياً.</b>",
@@ -871,6 +898,7 @@ def handle_callbacks(call: types.CallbackQuery):
             safe_answer(call.id, "🛡️ محظور برمجياً: لا يمكن حظر المطور الأكبر!", show_alert=True)
             return
         ban_user(t_id)
+        update_menu_button_for_user(bot, t_id, is_allowed=False)
         safe_answer(call.id, "🚫 تم حظر المستخدم وتصفير صلاحياته!", show_alert=True)
         txt, markup = render_user_dossier(t_id)
         if txt:
@@ -885,6 +913,7 @@ def handle_callbacks(call: types.CallbackQuery):
         except ValueError:
             return
         unban_user(t_id)
+        update_menu_button_for_user(bot, t_id, is_allowed=True)
         safe_answer(call.id, "✅ تم فك الحظر (كافة الصلاحيات مغلقة للأمان)!", show_alert=True)
         txt, markup = render_user_dossier(t_id)
         if txt:
@@ -903,6 +932,7 @@ def handle_callbacks(call: types.CallbackQuery):
             return
         acc_deleted = delete_accounts_by_owner(t_id)
         delete_user_and_data(t_id)
+        update_menu_button_for_user(bot, t_id, is_allowed=False)
         safe_answer(call.id, f"🗑️ تم حذف المستخدم ومسح {acc_deleted} حساب تابعة له!", show_alert=True)
         txt, markup = render_surveillance_radar_text_and_markup()
         safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
@@ -1455,7 +1485,12 @@ def handle_callbacks(call: types.CallbackQuery):
 # ----------------- معالجة فحص الجلسات بالخلفية -----------------
 
 def check_all_sessions_worker(chat_id: int, requester_id: int):
-    status_msg = bot.send_message(chat_id, "⏳ <b>بدء فحص حالة الجلسات في المتصفح...</b>")
+    try:
+        status_msg = bot.send_message(chat_id, "⏳ <b>بدء فحص حالة الجلسات في المتصفح...</b>")
+        status_msg_id = status_msg.message_id if status_msg else None
+    except Exception:
+        status_msg_id = None
+
     is_dev = is_super_admin(requester_id)
     if is_dev:
         accs = load_accounts()
@@ -1467,12 +1502,12 @@ def check_all_sessions_worker(chat_id: int, requester_id: int):
     active_cnt = 0
     total = len(accs)
     if total == 0:
-        safe_edit_message("<i>لا توجد حسابات في نطاقك لفحصها حالياً.</i>", chat_id, status_msg.message_id)
+        safe_edit_message("<i>لا توجد حسابات في نطاقك لفحصها حالياً.</i>", chat_id, status_msg_id)
         return
 
     for idx, a in enumerate(accs, 1):
         try:
-            safe_edit_message(f"🔄 <b>جاري فحص الحساب ({idx}/{total}):</b> {esc(a['name'])}...", chat_id, status_msg.message_id)
+            safe_edit_message(f"🔄 <b>جاري فحص الحساب ({idx}/{total}):</b> {esc(a['name'])}...", chat_id, status_msg_id)
             lock = get_profile_lock(a["id"])
             with lock, _browser_semaphore:
                 with sync_playwright() as p:
@@ -1512,7 +1547,7 @@ def check_all_sessions_worker(chat_id: int, requester_id: int):
         f"🟢 <b>الحسابات النشطة:</b> {active_cnt}\n"
         f"🔴 <b>غير نشط / يتطلب دخول:</b> {total - active_cnt}\n"
         f"━━━━━━━━━━━━━━━━━━━━",
-        chat_id, status_msg.message_id
+        chat_id, status_msg_id
     )
 
 
@@ -1872,13 +1907,19 @@ def execute_mission_worker(chat_id: int, user_id: int):
     status_msg = None
 
     def update_live_status(text: str):
+        clean_plain = html.unescape(re.sub(r"<[^>]+>", "", text)).strip()
+        st["live_status_text"] = clean_plain
         if status_msg is not None:
             safe_edit_message(text, chat_id, status_msg.message_id)
         else:
             safe_send(chat_id, text)
 
     try:
-        status_msg = bot.send_message(chat_id, "⏳ <b>بدء تهيئة محرك العمليات والتحقق من الصلاحيات...</b>")
+        try:
+            status_msg = bot.send_message(chat_id, "⏳ <b>بدء تهيئة محرك العمليات والتحقق من الصلاحيات...</b>")
+        except Exception:
+            status_msg = None
+        st["live_status_text"] = "بدء تهيئة محرك العمليات والتحقق من الصلاحيات..."
         if not (is_super_admin(user_id) or (is_authorized_user(user_id) and has_permission(user_id, "can_execute"))):
             update_live_status("⛔ <b>تم إيقاف المهمة:</b> ليس لديك صلاحية التنفيذ.")
             return
@@ -2061,138 +2102,43 @@ def execute_mission_worker(chat_id: int, user_id: int):
         st["is_running"] = False
 
 
-# ----------------- صفحة الحالة السحابية الآمنة (Health Endpoint) -----------------
+# ----------------- خادم لوحة التحكم المصغرة داخل تلغرام (Telegram Mini App Server) -----------------
 
-WEB_DASHBOARD_HTML = """<!DOCTYPE html>
-<html lang="ar" dir="rtl">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>FB Operator Service Status</title>
-    <style>
-        :root {
-            --bg: #0d1117;
-            --panel: #161b22;
-            --border: #30363d;
-            --text: #e6edf3;
-            --muted: #8b949e;
-            --ok: #2ea043;
-            --accent: #2f81f7;
-        }
-        * { box-sizing: border-box; margin: 0; padding: 0; font-family: system-ui, -apple-system, 'Segoe UI', sans-serif; }
-        body {
-            background: var(--bg);
-            color: var(--text);
-            min-height: 100vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            padding: 24px;
-        }
-        .wrap { max-width: 760px; width: 100%; display: grid; gap: 16px; }
-        .header, .panel {
-            background: var(--panel);
-            border: 1px solid var(--border);
-            border-radius: 10px;
-            padding: 20px;
-        }
-        .header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; }
-        h1 { font-size: 20px; font-weight: 700; }
-        .status-tag {
-            background: rgba(46, 160, 67, 0.15);
-            color: #3fb950;
-            border: 1px solid rgba(46, 160, 67, 0.4);
-            padding: 4px 12px;
-            border-radius: 6px;
-            font-size: 13px;
-            font-weight: 600;
-        }
-        .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
-        .metric-label { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
-        .metric-val { font-size: 16px; font-weight: 600; }
-        .log-view {
-            background: #090c10;
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            padding: 16px;
-            font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
-            font-size: 13px;
-            line-height: 1.7;
-            color: #9ecbff;
-            direction: ltr;
-            text-align: left;
-        }
-        .cta {
-            display: inline-block;
-            text-align: center;
-            width: 100%;
-            padding: 13px 18px;
-            background: var(--accent);
-            color: #ffffff;
-            border-radius: 8px;
-            text-decoration: none;
-            font-weight: 600;
-            font-size: 15px;
-        }
-        .cta:hover { filter: brightness(1.08); }
-    </style>
-</head>
-<body>
-    <main class="wrap">
-        <section class="header">
-            <h1>FB Operator — بوابة التشغيل السحابية</h1>
-            <span class="status-tag">Xvfb 1080p Active</span>
-        </section>
-        <section class="metrics">
-            <div class="panel">
-                <div class="metric-label">محرك التصفح</div>
-                <div class="metric-val">Google Chrome Stable</div>
-            </div>
-            <div class="panel">
-                <div class="metric-label">دقة العرض الافتراضية</div>
-                <div class="metric-val">1920x1080 (24-bit)</div>
-            </div>
-            <div class="panel">
-                <div class="metric-label">عزل الصلاحيات</div>
-                <div class="metric-val">Granular RBAC + Audit</div>
-            </div>
-        </section>
-        <section class="log-view">
-[WORKER] Telegram service healthy and polling.<br>
-[DISPLAY] Xvfb virtual screen :99 ready.<br>
-[SECURITY] Granular RBAC active (default-deny all tools).<br>
-[ISOLATION] Per-profile thread locking enabled.
-        </section>
-        <a class="cta" href="https://t.me/Labib_Dev_Service_bot">فتح لوحة البوت في تلغرام</a>
-    </main>
-</body>
-</html>
-"""
-
-
-def start_health_server():
-    """خادم فحص الحالة السحابي برؤوس أمان HTTP قياسية وبدون تسريب بيانات المطور"""
-    from http.server import HTTPServer, BaseHTTPRequestHandler
-
-    class HealthHandler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/html; charset=utf-8')
-            self.send_header('X-Content-Type-Options', 'nosniff')
-            self.send_header('X-Frame-Options', 'DENY')
-            self.send_header('Cache-Control', 'no-store')
-            self.end_headers()
-            self.wfile.write(WEB_DASHBOARD_HTML.encode('utf-8'))
-
-        def log_message(self, format, *args):
-            pass
-
-    try:
-        port = int(os.environ.get("PORT", 7860))
-        server = HTTPServer(('0.0.0.0', port), HealthHandler)
-        server.serve_forever()
-    except Exception:
-        pass
+def _build_webapp_hooks() -> dict:
+    return {
+        "bot": bot,
+        "SUPER_ADMIN_ID": SUPER_ADMIN_ID,
+        "PERMISSION_LABELS": PERMISSION_LABELS,
+        "is_super_admin": is_super_admin,
+        "register_or_update_user": register_or_update_user,
+        "notify_new_pending_user": notify_new_pending_user,
+        "get_user_permissions": get_user_permissions,
+        "user_has_any_action_perm": user_has_any_action_perm,
+        "get_usable_accounts_for_user": get_usable_accounts_for_user,
+        "get_manageable_accounts_for_user": get_manageable_accounts_for_user,
+        "get_user_state": get_user_state,
+        "record_audit_log": record_audit_log,
+        "load_audit_logs": load_audit_logs,
+        "record_user_operation": record_user_operation,
+        "load_users": load_users,
+        "load_accounts": load_accounts,
+        "get_account_by_id": get_account_by_id,
+        "get_accounts_breakdown_by_owner": get_accounts_breakdown_by_owner,
+        "add_account": add_account,
+        "delete_account": delete_account,
+        "purge_broken_accounts": purge_broken_accounts,
+        "approve_user": approve_user,
+        "ban_user": ban_user,
+        "unban_user": unban_user,
+        "toggle_user_permission": toggle_user_permission,
+        "revoke_all_permissions": revoke_all_permissions,
+        "delete_accounts_by_owner": delete_accounts_by_owner,
+        "delete_user_and_data": delete_user_and_data,
+        "safe_send": safe_send,
+        "execute_mission_worker": execute_mission_worker,
+        "async_login_account_worker": async_login_account_worker,
+        "check_all_sessions_worker": check_all_sessions_worker,
+    }
 
 
 def run_telegram_bot():
@@ -2205,7 +2151,7 @@ def run_telegram_bot():
     print(f"👑 معرف المطور الرئيسي الحصين: {SUPER_ADMIN_ID}")
     print("=" * 60)
 
-    threading.Thread(target=start_health_server, daemon=True).start()
+    start_webapp_and_tunnel(BOT_TOKEN, _build_webapp_hooks())
 
     while True:
         try:

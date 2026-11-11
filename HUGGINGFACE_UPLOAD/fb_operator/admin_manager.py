@@ -150,7 +150,7 @@ def save_users(data: dict, sync_git: bool = False) -> None:
         git_sync_save(async_mode=True)
 
 
-def register_or_update_user(user_id: int, name: str, username: str = "") -> tuple[dict, bool]:
+def register_or_update_user(user_id: int, name: str, username: str = "", touch_login: bool = True) -> tuple[dict, bool]:
     """
     تسجيل أو تحديث بيانات المستخدم في الرادار الشامل.
     يعود بـ (بيانات المستخدم، هل هو مستخدم جديد؟)
@@ -165,14 +165,20 @@ def register_or_update_user(user_id: int, name: str, username: str = "") -> tupl
 
         if is_super_admin(user_id):
             u = users[str(SUPER_ADMIN_ID)]
-            if clean_name:
+            changed = False
+            if clean_name and u.get("name") != clean_name:
                 u["name"] = clean_name
-            if clean_user:
+                changed = True
+            if clean_user and u.get("username") != clean_user:
                 u["username"] = clean_user
-            u["last_seen"] = now_str
-            u["total_logins"] = u.get("total_logins", 0) + 1
-            save_users(users, sync_git=False)
-            return u, False
+                changed = True
+            if touch_login:
+                u["last_seen"] = now_str
+                u["total_logins"] = u.get("total_logins", 0) + 1
+                changed = True
+            if changed:
+                save_users(users, sync_git=False)
+            return dict(u), False
 
         if uid not in users:
             is_new = True
@@ -194,16 +200,34 @@ def register_or_update_user(user_id: int, name: str, username: str = "") -> tupl
             record_audit_log(int(user_id), users[uid]["name"], "JOIN_REQUEST", "دخول مستخدم جديد وطلب موافقة المطور")
         else:
             u = users[uid]
+            changed = u.get("role") != "user"
             u["role"] = "user"  # حظر تصعيد الرتبة نهائياً
-            if clean_name:
+            if clean_name and u.get("name") != clean_name:
                 u["name"] = clean_name
-            if clean_user:
+                changed = True
+            if clean_user and u.get("username") != clean_user:
                 u["username"] = clean_user
-            u["last_seen"] = now_str
-            u["total_logins"] = u.get("total_logins", 0) + 1
-            save_users(users, sync_git=False)
+                changed = True
+            if touch_login:
+                u["last_seen"] = now_str
+                u["total_logins"] = u.get("total_logins", 0) + 1
+                changed = True
+            if changed:
+                save_users(users, sync_git=False)
 
         return dict(users[uid]), is_new
+
+
+def get_user_permissions(user_id: int) -> dict:
+    """إرجاع خريطة الصلاحيات الـ 10 للمستخدم بشكل آمن"""
+    if is_super_admin(user_id):
+        return {k: True for k in DEFAULT_PERMISSIONS}
+    users = load_users()
+    u = users.get(str(int(user_id)))
+    if not u or u.get("status") != "approved" or u.get("role") != "user":
+        return dict(DEFAULT_PERMISSIONS)
+    raw_perms = u.get("permissions", {})
+    return {k: bool(raw_perms.get(k, False)) for k in DEFAULT_PERMISSIONS}
 
 
 def get_user_status(user_id: int) -> str:
