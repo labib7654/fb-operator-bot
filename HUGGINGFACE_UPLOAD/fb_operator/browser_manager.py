@@ -7,9 +7,77 @@
 import os
 import time
 import random
+import threading
 from pathlib import Path
 from playwright.sync_api import sync_playwright, BrowserContext, Page
 from fb_operator.config import DEFAULT_MIN_DELAY, DEFAULT_MAX_DELAY, PROFILES_DIR
+
+_LOGIN_ERROR_LOCK = threading.Lock()
+_LOGIN_ERRORS: dict[int, str] = {}
+
+
+def set_login_error(context, reason: str) -> None:
+    """تخزين سبب فشل تسجيل الدخول الأخير بشكل آمن لكل متصفح"""
+    with _LOGIN_ERROR_LOCK:
+        if reason:
+            _LOGIN_ERRORS[id(context)] = reason
+        else:
+            _LOGIN_ERRORS.pop(id(context), None)
+
+
+def get_login_error(context) -> str:
+    """استرجاع سبب فشل تسجيل الدخول الأخير"""
+    with _LOGIN_ERROR_LOCK:
+        return _LOGIN_ERRORS.get(id(context), "")
+
+
+def _cleanup_stale_profile_locks(profile_path: Path) -> None:
+    """تنظيف ملفات القفل العالقة بعد إعادة تشغيل الحاوية لمنع تعليق كروميوم"""
+    for lock_name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+        lp = profile_path / lock_name
+        try:
+            if lp.is_symlink() or lp.exists():
+                lp.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def check_facebook_page_access(page: Page) -> tuple[bool, str]:
+    """
+    فحص حالة الصفحة الحية في فيسبوك لاكتشاف الحجب أو انتهاء الجلسة أو عدم توفر المحتوى فوراً
+    بدلاً من إهدار الوقت في البحث عن أزرار غير موجودة.
+    """
+    curr_url = (getattr(page, "url", "") or "").lower()
+    if any(x in curr_url for x in ("checkpoint", "two_step_verification", "/recover/")):
+        return False, "الحساب يطلب تحقق أمان (Checkpoint / 2FA)"
+    if any(x in curr_url for x in ("suspended", "disabled", "/account_status")):
+        return False, "الحساب مقيد أو معطل من فيسبوك"
+    if any(x in curr_url for x in ("login.php", "/login/", "login/?next=")):
+        return False, "انتهت صلاحية الجلسة والحساب غير مسجل دخوله"
+
+    try:
+        has_email = page.locator('input[name="email"]').first.is_visible(timeout=350)
+        has_pass = page.locator('input[name="pass"]').first.is_visible(timeout=350)
+        if has_email and has_pass:
+            return False, "ظهرت صفحة تسجيل الدخول (الجلسة غير نشطة)"
+    except Exception:
+        pass
+
+    try:
+        snippet = page.evaluate("() => (document.body && document.body.innerText ? document.body.innerText.slice(0, 1500) : '')")
+        if isinstance(snippet, str) and snippet:
+            low = snippet.lower()
+            if any(k in low for k in (
+                "هذا المحتوى غير متوفر", "content isn't available",
+                "page isn't available", "الصفحة غير متوفرة", "broken link"
+            )):
+                return False, "الرابط أو المحتوى المستهدف غير متاح أو خاص أو محذوف"
+            if any(k in low for k in ("تم تعليق حسابك", "your account has been suspended", "تم تعطيل حسابك", "account has been disabled")):
+                return False, "الحساب معطل أو موقوف من إدارة فيسبوك"
+    except Exception:
+        pass
+
+    return True, ""
 
 def resolve_cross_platform_profile(profile_dir: str | Path) -> Path:
     """توحيد مسار مجلد البروفايل ليعمل على ويندوز ولينكس السحابي بسلاسة دون أخطاء المسارات"""
@@ -47,6 +115,7 @@ def launch_account_browser(playwright_instance, profile_dir: str | Path, visible
     """
     profile_path = resolve_cross_platform_profile(profile_dir)
     profile_path.mkdir(parents=True, exist_ok=True)
+    _cleanup_stale_profile_locks(profile_path)
 
     # التحقق من وجود شاشة عرض افتراضية (Xvfb أو خادم X11)
     has_display = bool(os.environ.get("DISPLAY"))
@@ -180,11 +249,32 @@ def auto_login_facebook(context: BrowserContext, page: Page, email: str, passwor
             status_callback(msg)
         print(f"[Login] {msg}")
 
-    # 1. التحقق أولاً: هل الجلسة مسجلة مسبقاً؟
+    set_login_error(context, "")
+
+    # 1. التحقق الحي من الجلسة (عدم الاكتفاء بوجود كوكي c_user لتجنب الكوكيز المنتهية)
     is_logged, fb_id = check_facebook_login_cookies(context)
     if is_logged:
-        log("الجلسة نشطة ومسجلة مسبقاً بنجاح.")
-        return True
+        curr_now = (getattr(page, "url", "") or "").lower()
+        if "facebook.com" not in curr_now:
+            try:
+                page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=35000)
+                time.sleep(1.5)
+                dismiss_dialogs(page)
+            except Exception as e:
+                log(f"تنبيه شبكة أثناء التحقق من الجلسة: {e}")
+
+        ok_live, live_reason = check_facebook_page_access(page)
+        is_still_logged, _ = check_facebook_login_cookies(context)
+        if is_still_logged and ok_live:
+            log("تم التحقق من الجلسة الحية: الحساب نشط ومسجل دخوله بنجاح.")
+            return True
+
+        if any(tag in live_reason for tag in ("Checkpoint", "2FA", "معطل", "مقيد")):
+            set_login_error(context, live_reason)
+            log(f"[-] {live_reason}")
+            return False
+
+        log(f"تنبيه: الجلسة المحفوظة منتهية ({live_reason or 'يتطلب دخول'})، جاري محاولة إعادة الدخول...")
 
     log("جاري التوجه إلى موقع فيسبوك...")
     try:
@@ -196,14 +286,16 @@ def auto_login_facebook(context: BrowserContext, page: Page, email: str, passwor
     dismiss_dialogs(page)
 
     # فحص مجدداً بعد فتح الصفحة
-    curr_after_open = (page.url or "").lower()
+    ok_after, after_reason = check_facebook_page_access(page)
     is_logged, fb_id = check_facebook_login_cookies(context)
-    if is_logged and not any(x in curr_after_open for x in ("checkpoint", "two_step_verification", "login.php", "suspended", "disabled")):
+    if is_logged and ok_after:
         log("تم التحقق من الجلسة، الحساب مسجل دخوله بالفعل.")
         return True
 
     if not email or not password:
-        log("تنبيه: لم يتم العثور على بريد أو كلمة مرور مسجلة لهذا الحساب.")
+        reason = after_reason or "لا توجد بيانات دخول محفوظة والجلسة غير نشطة"
+        set_login_error(context, reason)
+        log(f"تنبيه: {reason}")
         return False
 
     # 2. تعبئة الإيميل وكلمة السر بمحاكاة نقرات الكيبورد والأحداث الحقيقية
@@ -237,6 +329,7 @@ def auto_login_facebook(context: BrowserContext, page: Page, email: str, passwor
             email_input.press_sequentially(email, delay=random.randint(65, 120))
             time.sleep(random.uniform(0.6, 1.3))
         else:
+            set_login_error(context, "تعذر العثور على حقل البريد الإلكتروني بصفحة الدخول")
             log("[-] تعذر العثور على حقل إدخال البريد الإلكتروني بعد الانتظار.")
             return False
 
@@ -268,6 +361,7 @@ def auto_login_facebook(context: BrowserContext, page: Page, email: str, passwor
             pass_input.press_sequentially(password, delay=random.randint(60, 115))
             time.sleep(random.uniform(0.8, 1.6))
         else:
+            set_login_error(context, "تعذر العثور على حقل كلمة المرور بصفحة الدخول")
             log("[-] تعذر العثور على حقل إدخال كلمة المرور.")
             return False
 
@@ -326,6 +420,7 @@ def auto_login_facebook(context: BrowserContext, page: Page, email: str, passwor
             if error_msg.is_visible(timeout=500):
                 txt = error_msg.inner_text()
                 if "incorrect" in txt.lower() or "غير صحيحة" in txt:
+                    set_login_error(context, "كلمة المرور أو البريد الإلكتروني غير صحيحين")
                     log("تنبيه: كلمة المرور أو البريد الإلكتروني غير صحيحين!")
                     return False
         except Exception:
@@ -341,6 +436,8 @@ def auto_login_facebook(context: BrowserContext, page: Page, email: str, passwor
         log("تم تسجيل الدخول بنجاح.")
         return True
 
+    ok_f, f_reason = check_facebook_page_access(page)
+    set_login_error(context, f_reason or "انتهت مهلة انتظار تسجيل الدخول (تحقق من كلمة السر أو 2FA)")
     log("انتهت مهلة الانتظار دون اكتمال تسجيل الدخول.")
     return False
 

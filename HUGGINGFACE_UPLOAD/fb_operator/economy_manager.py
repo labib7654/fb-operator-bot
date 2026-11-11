@@ -16,13 +16,14 @@ from pathlib import Path
 
 import fb_operator.account_manager as acc_mgr
 import fb_operator.admin_manager as adm_mgr
+from fb_operator.config import (
+    BASE_DIR,
+    ECONOMY_SETTINGS_FILE,
+    POINTS_LEDGER_FILE,
+    INVITE_CODES_FILE,
+    SUPPORT_TICKETS_FILE,
+)
 from fb_operator.state_events import publish_event
-
-BASE_DIR = Path(__file__).resolve().parent
-ECONOMY_SETTINGS_FILE = BASE_DIR / "economy_settings.json"
-POINTS_LEDGER_FILE = BASE_DIR / "points_ledger.json"
-INVITE_CODES_FILE = BASE_DIR / "invite_codes.json"
-SUPPORT_TICKETS_FILE = BASE_DIR / "support_tickets.json"
 
 _economy_lock = threading.RLock()
 

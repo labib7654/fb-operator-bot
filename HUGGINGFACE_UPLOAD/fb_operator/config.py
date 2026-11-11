@@ -1,23 +1,76 @@
 """
-إعدادات وثوابت أداة FB Operator
+إعدادات وثوابت أداة FB Operator ومسارات البيانات الدائمة المعزولة عن مجلد الأكواد
 """
 
 import os
 from pathlib import Path
 
-# المسار الأساسي للأداة
+# مجلد الأكواد المصدري فقط (يُعاد بناؤه عند التحديثات ولا تُخزَّن فيه البيانات الحساسة)
 BASE_DIR = Path(__file__).resolve().parent
 
+
+def _resolve_persistent_data_dir() -> Path:
+    """
+    تحديد مجلد البيانات الدائم خارج مجلد الأكواد fb_operator:
+    1. متغير البيئة FB_DATA_DIR إن وُجد.
+    2. القرص الدائم /data في مساحات Hugging Face عند تفعيل Persistent Storage.
+    3. مجلد خارجي ثابت في مجلد المستخدم (~/.fb_operator_data) أو بجانب المشروع.
+    """
+    env_dir = (os.environ.get("FB_DATA_DIR") or "").strip()
+    if env_dir:
+        p = Path(env_dir).expanduser().resolve()
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    hf_persistent = Path("/data")
+    try:
+        if hf_persistent.exists() and hf_persistent.is_dir() and os.access(hf_persistent, os.W_OK):
+            p = hf_persistent / "fb_operator_data"
+            p.mkdir(parents=True, exist_ok=True)
+            return p
+    except Exception:
+        pass
+
+    try:
+        home_data = (Path.home() / ".fb_operator_data").resolve()
+        home_data.mkdir(parents=True, exist_ok=True)
+        if os.access(home_data, os.W_OK):
+            return home_data
+    except Exception:
+        pass
+
+    fallback = (BASE_DIR.parent / ".fb_operator_data").resolve()
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
+
+
+# المجلد المنفصل الدائم لكافة قواعد البيانات والملفات الشخصية والجلسات
+DATA_DIR = _resolve_persistent_data_dir()
+
 # مجلد حفظ جلسات وبروفايلات الحسابات (معزولة بالكامل)
-PROFILES_DIR = BASE_DIR / "profiles"
+PROFILES_DIR = DATA_DIR / "profiles"
 PROFILES_DIR.mkdir(parents=True, exist_ok=True)
 
-# ملف سجل الحسابات المحفوظة
-ACCOUNTS_FILE = BASE_DIR / "accounts.json"
+# مجلد حفظ ملفات الجلسات الخفيفة القابلة للاستعادة (Cookies + storage_state)
+SESSIONS_DIR = DATA_DIR / "sessions"
+SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+
+# مسارات قواعد البيانات في المجلد المنفصل الدائم
+ACCOUNTS_FILE = DATA_DIR / "accounts.json"
+USERS_FILE = DATA_DIR / "users.json"
+AUDIT_LOG_FILE = DATA_DIR / "audit_logs.json"
+ECONOMY_SETTINGS_FILE = DATA_DIR / "economy_settings.json"
+POINTS_LEDGER_FILE = DATA_DIR / "points_ledger.json"
+INVITE_CODES_FILE = DATA_DIR / "invite_codes.json"
+SUPPORT_TICKETS_FILE = DATA_DIR / "support_tickets.json"
+BACKUP_META_FILE = DATA_DIR / "backup_meta.json"
 
 # إعدادات التخفي وفترات الانتظار البشري (بالثواني)
 DEFAULT_MIN_DELAY = 2.5
 DEFAULT_MAX_DELAY = 5.0
+
+# مهلة التنظيف التلقائي للحسابات التالفة أو غير النشطة (بالساعات)
+BROKEN_ACCOUNT_TTL_HOURS = 24
 
 # مسار متصفح جوجل كروم على نظام ويندوز
 CHROME_EXECUTABLE = r"C:\Program Files\Google\Chrome\Application\chrome.exe"

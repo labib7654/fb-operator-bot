@@ -47,13 +47,14 @@ from fb_operator.admin_manager import (
     record_audit_log, load_audit_logs, SUPER_ADMIN_ID, PERMISSION_LABELS
 )
 from fb_operator.browser_manager import (
-    launch_account_browser, auto_login_facebook, check_facebook_login_cookies, human_delay
+    launch_account_browser, auto_login_facebook, check_facebook_login_cookies,
+    human_delay, get_login_error, check_facebook_page_access
 )
 from fb_operator.actions import (
     navigate_to_target, comment_on_posts, react_to_posts,
     send_friend_request, cancel_friend_request, follow_profile, unfollow_profile,
     send_direct_message, block_profile, report_profile, report_post,
-    interact_with_specific_comment
+    interact_with_specific_comment, get_page_diag
 )
 from fb_operator.webapp_server import (
     start_webapp_and_tunnel, get_public_webapp_url, update_menu_button_for_user
@@ -276,6 +277,39 @@ def user_has_any_action_perm(user_id: int) -> bool:
         "can_friend_follow", "can_message", "can_report"
     )
     return any(has_permission(user_id, k) for k in action_keys)
+
+
+def _has_any_enabled_mission_action(user_id: int, st: dict) -> tuple[bool, str]:
+    """التحقق الفعلي قبل الإطلاق من تفعيل أداة واحدة على الأقل واكتمال مدخلاتها"""
+    is_dev = is_super_admin(user_id)
+    has_p = lambda k: is_dev or has_permission(user_id, k)
+
+    url_val = (st.get("target_url") or "").strip()
+    has_post_url = bool((st.get("react_post_url") or "").strip() or (st.get("comment_post_url") or "").strip())
+    if not url_val.startswith("http") and not has_post_url:
+        return False, "⚠️ الرابط المستهدف غير صالح! اضغط (🔗 تعديل الرابط المستهدف) وأرسل رابط فيسبوك الصحيح أولاً."
+
+    enabled = []
+    if has_p("can_react") and st.get("like"):
+        enabled.append("تفاعل")
+    if has_p("can_comment") and st.get("comment"):
+        if not (st.get("comment_text") or "").strip():
+            return False, "⚠️ فعّلت التعليق بدون نص! افتح معالج التعليق وأرسل نص التعليق أولاً."
+        enabled.append("تعليق")
+    if has_p("can_interact_comments") and st.get("interact_cmt"):
+        enabled.append("تفاعل/رد على تعليق")
+    if has_p("can_friend_follow") and any(st.get(k) for k in ("friend", "cancel_friend", "follow", "unfollow")):
+        enabled.append("صداقة/متابعة")
+    if has_p("can_message") and st.get("message"):
+        if not (st.get("message_text") or "").strip():
+            return False, "⚠️ فعّلت الرسالة الخاصة بدون نص! افتح زر الرسالة واكتب نص الرسالة أولاً."
+        enabled.append("رسالة خاصة")
+    if has_p("can_report") and any(st.get(k) for k in ("report_post", "report_profile", "block")):
+        enabled.append("بلاغ/حظر")
+
+    if not enabled:
+        return False, "⚠️ لم تفعّل أي إجراء للتنفيذ بعد! اختر التفاعل أو التعليق أو الرسالة أو الصداقة أولاً ثم أطلق المهمة."
+    return True, ""
 
 
 def get_usable_accounts_for_user(user_id: int) -> list[dict]:
@@ -520,10 +554,11 @@ def get_main_dashboard_markup(user_id: int) -> types.InlineKeyboardMarkup:
 
     # 6. رسائل الماسنجر الخاصة
     if p_msg:
-        msg_tag = "✅ نشط" if st["message"] else "❌ معطل"
+        msg_st = "✅" if st["message"] else "❌"
+        raw_m = (st.get("message_text") or "").strip()
+        msg_snip = (raw_m[:15] + "..") if len(raw_m) > 15 else (raw_m or "بدون نص")
         markup.row(
-            types.InlineKeyboardButton(f"✉️ رسالة خاصة [{msg_tag}]", callback_data="toggle_message"),
-            types.InlineKeyboardButton("✏️ تعديل نص الرسالة", callback_data="menu_msg_config")
+            types.InlineKeyboardButton(f"✉️ رسالة خاصة [{msg_st}] ({msg_snip})", callback_data="menu_wizard_message")
         )
 
     # 7. البلاغات والحظر
@@ -1338,8 +1373,8 @@ def handle_callbacks(call: types.CallbackQuery):
         dest = data.split(":", 1)[1].strip()
         allowed_dests = {
             "back_to_main", "menu_wizard_react", "menu_wizard_comment", "menu_cmt_interact",
-            "menu_manage_accs", "menu_wallet", "menu_referral", "menu_support",
-            "menu_admin_economy", "menu_surveillance_radar"
+            "menu_wizard_message", "menu_manage_accs", "menu_wallet", "menu_referral",
+            "menu_support", "menu_admin_economy", "menu_surveillance_radar"
         }
         if dest not in allowed_dests:
             dest = "back_to_main"
@@ -1788,40 +1823,48 @@ def handle_callbacks(call: types.CallbackQuery):
     elif data == "menu_wizard_react":
         if not require_perm_or_deny(call, "can_react", "⛔ صلاحية التفاعلات والإعجاب غير مفعلة لحسابك."):
             return
+        cur_r = st.get("reaction_type", "like")
+        mk = lambda k, lbl: f"✅ {lbl}" if cur_r == k else lbl
+        has_r_url = bool((st.get("react_post_url") or "").strip())
+        cur_p = st.get("react_post_index", 1)
+        mp = lambda idx, lbl: f"✅ {lbl}" if (not has_r_url and cur_p == idx) else lbl
+        cur_acc = st.get("react_acc_count", 0)
+        ma = lambda n, lbl: f"✅ {lbl}" if cur_acc == n else lbl
+
         markup = types.InlineKeyboardMarkup(row_width=3)
         markup.row(
-            types.InlineKeyboardButton("👍 Like", callback_data="set_react_like"),
-            types.InlineKeyboardButton("❤️ Love", callback_data="set_react_love"),
-            types.InlineKeyboardButton("🤗 Care", callback_data="set_react_care")
+            types.InlineKeyboardButton(mk("like", "👍 Like"), callback_data="set_react_like"),
+            types.InlineKeyboardButton(mk("love", "❤️ Love"), callback_data="set_react_love"),
+            types.InlineKeyboardButton(mk("care", "🤗 Care"), callback_data="set_react_care")
         )
         markup.row(
-            types.InlineKeyboardButton("😂 Haha", callback_data="set_react_haha"),
-            types.InlineKeyboardButton("😮 Wow", callback_data="set_react_wow"),
-            types.InlineKeyboardButton("😢 Sad", callback_data="set_react_sad")
+            types.InlineKeyboardButton(mk("haha", "😂 Haha"), callback_data="set_react_haha"),
+            types.InlineKeyboardButton(mk("wow", "😮 Wow"), callback_data="set_react_wow"),
+            types.InlineKeyboardButton(mk("sad", "😢 Sad"), callback_data="set_react_sad")
         )
         markup.row(
-            types.InlineKeyboardButton("😡 Angry", callback_data="set_react_angry"),
-            types.InlineKeyboardButton("👎 إلغاء الإعجاب", callback_data="set_react_unlike")
+            types.InlineKeyboardButton(mk("angry", "😡 Angry"), callback_data="set_react_angry"),
+            types.InlineKeyboardButton(mk("unlike", "👎 إلغاء الإعجاب"), callback_data="set_react_unlike")
         )
         markup.row(
-            types.InlineKeyboardButton("🥇 الأول", callback_data="set_react_post_1"),
-            types.InlineKeyboardButton("🥈 الثاني", callback_data="set_react_post_2"),
-            types.InlineKeyboardButton("🥉 الثالث", callback_data="set_react_post_3")
+            types.InlineKeyboardButton(mp(1, "🥇 الأول"), callback_data="set_react_post_1"),
+            types.InlineKeyboardButton(mp(2, "🥈 الثاني"), callback_data="set_react_post_2"),
+            types.InlineKeyboardButton(mp(3, "🥉 الثالث"), callback_data="set_react_post_3")
         )
         markup.row(
-            types.InlineKeyboardButton("🔢 رقم منشور مخصص", callback_data="set_react_post_custom"),
-            types.InlineKeyboardButton("🔗 رابط منشور مباشر", callback_data="set_react_post_url")
+            types.InlineKeyboardButton(f"{'✅ ' if (not has_r_url and cur_p > 3) else ''}🔢 رقم منشور مخصص", callback_data="set_react_post_custom"),
+            types.InlineKeyboardButton(f"{'✅ ' if has_r_url else ''}🔗 رابط منشور مباشر", callback_data="set_react_post_url")
         )
         markup.row(
-            types.InlineKeyboardButton("🔥 جميع الحسابات", callback_data="set_react_acc_0"),
-            types.InlineKeyboardButton("1️⃣ حساب 1", callback_data="set_react_acc_1"),
-            types.InlineKeyboardButton("2️⃣ حسابين", callback_data="set_react_acc_2"),
-            types.InlineKeyboardButton("3️⃣ ثلاث", callback_data="set_react_acc_3")
+            types.InlineKeyboardButton(ma(0, "🔥 الكل"), callback_data="set_react_acc_0"),
+            types.InlineKeyboardButton(ma(1, "1️⃣ حساب"), callback_data="set_react_acc_1"),
+            types.InlineKeyboardButton(ma(2, "2️⃣ حسابين"), callback_data="set_react_acc_2"),
+            types.InlineKeyboardButton(ma(3, "3️⃣ ثلاث"), callback_data="set_react_acc_3")
         )
         markup.row(
             types.InlineKeyboardButton(f"الحالة: [{'مفعل ✅' if st['like'] else 'معطل ❌'}]", callback_data="toggle_react_active")
         )
-        markup.row(types.InlineKeyboardButton("🔙 العودة للوحة التحكم", callback_data="back_to_main"))
+        markup.row(types.InlineKeyboardButton("🔙 حفظ والعودة للوحة التحكم", callback_data="back_to_main"))
 
         curr_react = REACTION_ICONS.get(st["reaction_type"], "👍 إعجاب")
         p_desc = f"منشور رقم {st['react_post_index']}" if not st.get("react_post_url") else f"رابط مباشر ({esc(st['react_post_url'][:28])}...)"
@@ -1898,27 +1941,33 @@ def handle_callbacks(call: types.CallbackQuery):
     elif data == "menu_wizard_comment":
         if not require_perm_or_deny(call, "can_comment", "⛔ صلاحية كتابة التعليقات غير مفعلة لحسابك."):
             return
+        has_c_url = bool((st.get("comment_post_url") or "").strip())
+        cur_cp = st.get("comment_post_index", 1)
+        mp_c = lambda idx, lbl: f"✅ {lbl}" if (not has_c_url and cur_cp == idx) else lbl
+        cur_cacc = st.get("comment_acc_count", 0)
+        ma_c = lambda n, lbl: f"✅ {lbl}" if cur_cacc == n else lbl
+
         markup = types.InlineKeyboardMarkup(row_width=2)
-        markup.row(types.InlineKeyboardButton("✏️ كتابة/تعديل نص التعليق", callback_data="edit_comment_text"))
+        markup.row(types.InlineKeyboardButton("✏️ كتابة / تعديل نص التعليق", callback_data="edit_comment_text"))
         markup.row(
-            types.InlineKeyboardButton("🥇 الأول", callback_data="set_cmt_post_1"),
-            types.InlineKeyboardButton("🥈 الثاني", callback_data="set_cmt_post_2"),
-            types.InlineKeyboardButton("🥉 الثالث", callback_data="set_cmt_post_3")
+            types.InlineKeyboardButton(mp_c(1, "🥇 الأول"), callback_data="set_cmt_post_1"),
+            types.InlineKeyboardButton(mp_c(2, "🥈 الثاني"), callback_data="set_cmt_post_2"),
+            types.InlineKeyboardButton(mp_c(3, "🥉 الثالث"), callback_data="set_cmt_post_3")
         )
         markup.row(
-            types.InlineKeyboardButton("🔢 رقم مخصص", callback_data="set_cmt_post_custom"),
-            types.InlineKeyboardButton("🔗 رابط منشور مباشر", callback_data="set_cmt_post_url")
+            types.InlineKeyboardButton(f"{'✅ ' if (not has_c_url and cur_cp > 3) else ''}🔢 رقم مخصص", callback_data="set_cmt_post_custom"),
+            types.InlineKeyboardButton(f"{'✅ ' if has_c_url else ''}🔗 رابط منشور مباشر", callback_data="set_cmt_post_url")
         )
         markup.row(
-            types.InlineKeyboardButton("🔥 جميع الحسابات", callback_data="set_cmt_acc_0"),
-            types.InlineKeyboardButton("1️⃣ حساب 1", callback_data="set_cmt_acc_1"),
-            types.InlineKeyboardButton("2️⃣ حسابين", callback_data="set_cmt_acc_2"),
-            types.InlineKeyboardButton("3️⃣ ثلاث", callback_data="set_cmt_acc_3")
+            types.InlineKeyboardButton(ma_c(0, "🔥 الكل"), callback_data="set_cmt_acc_0"),
+            types.InlineKeyboardButton(ma_c(1, "1️⃣ حساب"), callback_data="set_cmt_acc_1"),
+            types.InlineKeyboardButton(ma_c(2, "2️⃣ حسابين"), callback_data="set_cmt_acc_2"),
+            types.InlineKeyboardButton(ma_c(3, "3️⃣ ثلاث"), callback_data="set_cmt_acc_3")
         )
         markup.row(
             types.InlineKeyboardButton(f"الحالة: [{'مفعل ✅' if st['comment'] else 'معطل ❌'}]", callback_data="toggle_comment_active")
         )
-        markup.row(types.InlineKeyboardButton("🔙 العودة للوحة التحكم", callback_data="back_to_main"))
+        markup.row(types.InlineKeyboardButton("🔙 حفظ والعودة للوحة التحكم", callback_data="back_to_main"))
 
         post_desc = f"منشور رقم {st['comment_post_index']}" if not st["comment_post_url"] else f"رابط مباشر ({esc(st['comment_post_url'][:28])}...)"
         acc_desc = "جميع الحسابات" if st["comment_acc_count"] == 0 else f"{st['comment_acc_count']} حسابات"
@@ -1984,6 +2033,15 @@ def handle_callbacks(call: types.CallbackQuery):
     elif data == "toggle_comment_active":
         if not require_perm_or_deny(call, "can_comment", "⛔ صلاحية التعليقات غير مفعلة لحسابك."):
             return
+        if not st["comment"] and not (st.get("comment_text") or "").strip():
+            st["input_mode"] = "waiting_comment_text"
+            safe_answer(call.id, "أرسل نص التعليق أولاً لتفعيله")
+            safe_send(
+                call.message.chat.id,
+                "💬 <b>أرسل الآن نص التعليق الجديد الذي ترغب بنشره:</b>",
+                reply_markup=_prompt_back_markup("menu_wizard_comment")
+            )
+            return
         st["comment"] = not st["comment"]
         safe_answer(call.id, f"التعليق: {'مفعل ✅' if st['comment'] else 'معطل ❌'}")
         call.data = "menu_wizard_comment"
@@ -2027,22 +2085,49 @@ def handle_callbacks(call: types.CallbackQuery):
         safe_answer(call.id, f"إلغاء المتابعة: {'مفعل ✅' if st['unfollow'] else 'معطل ❌'}")
 
     # D) الرسائل الخاصة (can_message)
+    elif data == "menu_wizard_message":
+        if not require_perm_or_deny(call, "can_message", "⛔ صلاحية الرسائل الخاصة غير مفعلة لحسابك."):
+            return
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        markup.row(types.InlineKeyboardButton("✏️ كتابة / تعديل نص رسالتك", callback_data="menu_msg_config"))
+        markup.row(types.InlineKeyboardButton(f"الحالة: [{'مفعل ✅' if st['message'] else 'معطل ❌'}]", callback_data="toggle_message"))
+        markup.row(types.InlineKeyboardButton("🔙 حفظ والعودة للوحة التحكم", callback_data="back_to_main"))
+        safe_edit_message(
+            "✉️ <b>معالج رسائل الماسنجر الخاصة:</b>\n\n"
+            f"📝 <b>النص الحالي للرسالة:</b>\n<i>'{esc(st['message_text'])}'</i>\n\n"
+            f"🔗 <b>الهدف الحالي:</b> <code>{esc((st.get('target_url') or '')[:45])}</code>\n"
+            f"🔘 <b>الحالة:</b> {'مفعل ✅' if st['message'] else 'معطل ❌'}\n\n"
+            "<i>اضغط (✏️ كتابة / تعديل نص رسالتك) لكتابة رسالة جديدة وتفعيلها تلقائياً.</i>",
+            call.message.chat.id, call.message.message_id, reply_markup=markup
+        )
+
     elif data == "toggle_message":
         if not require_perm_or_deny(call, "can_message", "⛔ صلاحية الرسائل الخاصة غير مفعلة لحسابك."):
             return
+        if not st["message"] and not (st.get("message_text") or "").strip():
+            st["input_mode"] = "waiting_msg_text"
+            safe_answer(call.id, "أرسل نص الرسالة الخاصة أولاً لتفعيلها")
+            safe_send(
+                call.message.chat.id,
+                "✍️ <b>اكتب الآن نص الرسالة الخاصة التي تريد إرسالها عبر ماسنجر:</b>",
+                reply_markup=_prompt_back_markup("menu_wizard_message")
+            )
+            return
         st["message"] = not st["message"]
-        safe_edit_reply_markup(call.message.chat.id, call.message.message_id, get_main_dashboard_markup(user_id))
         safe_answer(call.id, f"الرسائل الخاصة: {'مفعل ✅' if st['message'] else 'معطل ❌'}")
+        call.data = "menu_wizard_message"
+        handle_callbacks(call)
 
     elif data == "menu_msg_config":
         if not require_perm_or_deny(call, "can_message", "⛔ صلاحية الرسائل الخاصة غير مفعلة لحسابك."):
             return
         st["input_mode"] = "waiting_msg_text"
+        safe_answer(call.id)
         safe_send(
             call.message.chat.id,
             f"✉️ <b>النص الحالي للرسالة الخاصة:</b>\n<i>'{esc(st['message_text'])}'</i>\n\n"
-            "أرسل الآن النص الجديد للرسالة الخاصة:",
-            reply_markup=_prompt_back_markup("back_to_main")
+            "✍️ <b>أرسل الآن نص رسالتك الخاصة الجديد (وسيتفعل تلقائياً عند الإرسال):</b>",
+            reply_markup=_prompt_back_markup("menu_wizard_message")
         )
 
     # E) البلاغات والحظر (can_report)
@@ -2320,6 +2405,10 @@ def handle_callbacks(call: types.CallbackQuery):
         if not usable:
             safe_answer(call.id, "⛔ لا توجد حسابات متاحة أو مصرح لك باستخدامها للتنفيذ!", show_alert=True)
             return
+        has_act, act_err = _has_any_enabled_mission_action(user_id, st)
+        if not has_act:
+            safe_answer(call.id, act_err, show_alert=True)
+            return
         if st["is_running"]:
             safe_answer(call.id, "⚠️ هناك مهمة قيد التشغيل بالفعل لحسابك حالياً!", show_alert=True)
             return
@@ -2380,10 +2469,9 @@ def check_all_sessions_worker(chat_id: int, requester_id: int):
                         page = ctx.pages[0] if ctx.pages else ctx.new_page()
                         page.goto("https://www.facebook.com/", timeout=25000, wait_until="domcontentloaded")
                         human_delay(1.5, 2.5)
-                        curr_url = (page.url or "").lower()
-                        blocked_state = any(x in curr_url for x in ("checkpoint", "two_step_verification", "login.php", "suspended", "disabled"))
+                        ok_live, live_reason = check_facebook_page_access(page)
                         is_logged, fb_id = check_facebook_login_cookies(ctx)
-                        is_active = bool(is_logged and not blocked_state)
+                        is_active = bool(is_logged and ok_live)
                     finally:
                         try:
                             ctx.close()
@@ -2413,7 +2501,7 @@ def check_all_sessions_worker(chat_id: int, requester_id: int):
             else:
                 update_account(a["id"], {
                     "status": "يتطلب تسجيل الدخول",
-                    "diagnostic_reason": "انتهت الجلسة أو يتطلب تحققاً"
+                    "diagnostic_reason": live_reason or "انتهت الجلسة أو يتطلب تحققاً"
                 }, sync_git=False)
         except Exception:
             pass
@@ -3036,6 +3124,7 @@ def execute_mission_worker(chat_id: int, user_id: int):
         actions_done = 0
         total_accounts = len(target_accounts)
         target_url = st["target_url"]
+        run_issues = []
 
         for idx, acc in enumerate(target_accounts, 1):
             # التحقق الفوري أثناء التشغيل تحسباً لحظْر أو سحب الصلاحيات في المنتصف
@@ -3061,47 +3150,100 @@ def execute_mission_worker(chat_id: int, user_id: int):
                         ctx = launch_account_browser(p, acc["profile_dir"], visible=False)
                         try:
                             page = ctx.pages[0] if ctx.pages else ctx.new_page()
+                            acc_actions = 0
+
+                            def _record_issue(step_lbl: str, fallback_msg: str):
+                                diag = get_page_diag(page) or fallback_msg
+                                msg_line = f"• <b>{esc(label_acc)} ({step_lbl}):</b> {esc(diag)}"
+                                run_issues.append(msg_line)
+                                update_live_status(f"⚠️ {msg_line}")
 
                             logged = auto_login_facebook(ctx, page, acc.get("email", ""), acc.get("password", ""), max_wait=35)
                             if not logged:
-                                update_live_status(f"⚠️ <b>الحساب {esc(label_acc)} غير مسجل دخوله، تم تخطيه.</b>")
+                                login_err = get_login_error(ctx) or "الحساب غير مسجل دخوله أو الجلسة منتهية"
+                                run_issues.append(f"• <b>{esc(label_acc)} (الدخول):</b> {esc(login_err)}")
+                                update_live_status(f"⚠️ <b>{esc(label_acc)}:</b> {esc(login_err)}")
+                                try:
+                                    update_account(acc["id"], {
+                                        "status": "يتطلب تسجيل الدخول",
+                                        "diagnostic_reason": login_err
+                                    }, sync_git=False)
+                                except Exception:
+                                    pass
+                                try:
+                                    page.screenshot(path=shot_path)
+                                    with open(shot_path, "rb") as shot_file:
+                                        bot.send_photo(chat_id, shot_file, caption=f"⚠️ <b>لقطة سبب تعذر الدخول ({esc(label_acc)}):</b>\n{esc(login_err)}")
+                                except Exception:
+                                    pass
                                 continue
 
                             if not navigate_to_target(page, target_url):
-                                update_live_status(f"❌ <b>تعذر فتح الرابط بالحساب {esc(label_acc)}.</b>")
+                                _record_issue("فتح الرابط", "تعذر فتح الرابط المستهدف أو أنه مقيد/غير متاح")
+                                try:
+                                    page.screenshot(path=shot_path)
+                                    with open(shot_path, "rb") as shot_file:
+                                        bot.send_photo(chat_id, shot_file, caption=f"❌ <b>لقطة تعذر فتح الرابط ({esc(label_acc)})</b>")
+                                except Exception:
+                                    pass
                                 continue
 
                             # عمليات مستوى البروفايل (صداقة، متابعة، مراسلة، بلاغ حساب، حظر)
                             if has_permission(user_id, "can_friend_follow"):
-                                if st["friend"] and send_friend_request(page):
-                                    actions_done += 1
-                                    safe_send(chat_id, f"➕ <b>تم إرسال طلب صداقة بـ {esc(label_acc)}.</b>")
-                                elif st["cancel_friend"] and cancel_friend_request(page):
-                                    actions_done += 1
-                                    safe_send(chat_id, f"❌ <b>تم إلغاء طلب الصداقة بـ {esc(label_acc)}.</b>")
+                                if st["friend"]:
+                                    if send_friend_request(page):
+                                        actions_done += 1
+                                        acc_actions += 1
+                                        safe_send(chat_id, f"➕ <b>تم إرسال طلب صداقة بـ {esc(label_acc)}.</b>")
+                                    else:
+                                        _record_issue("طلب صداقة", "زر إضافة صديق غير متاح بالصفحة")
+                                elif st["cancel_friend"]:
+                                    if cancel_friend_request(page):
+                                        actions_done += 1
+                                        acc_actions += 1
+                                        safe_send(chat_id, f"❌ <b>تم إلغاء طلب الصداقة بـ {esc(label_acc)}.</b>")
+                                    else:
+                                        _record_issue("إلغاء الصداقة", "لا يوجد طلب صداقة معلق أو علاقة لإلغائها")
 
-                                if st["follow"] and follow_profile(page):
-                                    actions_done += 1
-                                    safe_send(chat_id, f"🔔 <b>تمت متابعة الحساب بـ {esc(label_acc)}.</b>")
-                                elif st["unfollow"] and unfollow_profile(page):
-                                    actions_done += 1
-                                    safe_send(chat_id, f"🔕 <b>تم إلغاء المتابعة بـ {esc(label_acc)}.</b>")
+                                if st["follow"]:
+                                    if follow_profile(page):
+                                        actions_done += 1
+                                        acc_actions += 1
+                                        safe_send(chat_id, f"🔔 <b>تمت متابعة الحساب بـ {esc(label_acc)}.</b>")
+                                    else:
+                                        _record_issue("متابعة", "زر المتابعة غير متوفر أو الحساب متابَع مسبقاً")
+                                elif st["unfollow"]:
+                                    if unfollow_profile(page):
+                                        actions_done += 1
+                                        acc_actions += 1
+                                        safe_send(chat_id, f"🔕 <b>تم إلغاء المتابعة بـ {esc(label_acc)}.</b>")
+                                    else:
+                                        _record_issue("إلغاء المتابعة", "لم يتم العثور على زر إلغاء المتابعة")
 
                             if has_permission(user_id, "can_message") and st["message"] and st["message_text"]:
                                 if send_direct_message(page, st["message_text"], target_url=target_url):
                                     actions_done += 1
+                                    acc_actions += 1
                                     safe_send(chat_id, f"✉️ <b>تم إرسال رسالة خاصة بـ {esc(label_acc)}.</b>")
+                                else:
+                                    _record_issue("رسالة خاصة", "تعذر إرسال الرسالة بالماسنجر أو الحساب يمنع الرسائل")
 
                             if has_permission(user_id, "can_report") and st["report_profile"]:
                                 update_live_status(f"🛡️ <b>جاري تنفيذ بلاغ الحساب بـ {esc(label_acc)}...</b>")
                                 if report_profile(page, reason=st["rep_reason"], victim=st["rep_victim"]):
                                     actions_done += 1
+                                    acc_actions += 1
                                     safe_send(chat_id, f"🛡️ <b>تم تأكيد استلام بلاغ الحساب بـ {esc(label_acc)}!</b>")
+                                else:
+                                    _record_issue("بلاغ حساب", "تعذر إتمام خطوات بلاغ الحساب")
 
                             if has_permission(user_id, "can_report") and st["block"]:
                                 if block_profile(page):
                                     actions_done += 1
+                                    acc_actions += 1
                                     safe_send(chat_id, f"🚫 <b>تم حظر الحساب المستهدف بـ {esc(label_acc)}.</b>")
+                                else:
+                                    _record_issue("حظر", "تعذر العثور على خيار حظر الحساب")
 
                             # عمليات مستوى المنشور والتعليقات
                             on_custom_url = False
@@ -3109,13 +3251,17 @@ def execute_mission_worker(chat_id: int, user_id: int):
                                 r_lim = st.get("react_acc_count", 0)
                                 if r_lim == 0 or idx <= r_lim:
                                     r_url = st.get("react_post_url", "").strip()
+                                    nav_ok = True
                                     if r_url:
-                                        navigate_to_target(page, r_url)
+                                        nav_ok = navigate_to_target(page, r_url)
                                         on_custom_url = True
-                                    if react_to_posts(page, reaction=st["reaction_type"], post_index=1 if r_url else st["react_post_index"]):
+                                    if nav_ok and react_to_posts(page, reaction=st["reaction_type"], post_index=1 if r_url else st["react_post_index"]):
                                         actions_done += 1
+                                        acc_actions += 1
                                         r_name = REACTION_ICONS.get(st["reaction_type"], st["reaction_type"])
                                         safe_send(chat_id, f"💖 <b>تم وضع التفاعل ({r_name}) بـ {esc(label_acc)}.</b>")
+                                    else:
+                                        _record_issue("التفاعل", "لم يتم العثور على المنشور أو زر التفاعل")
 
                             if has_permission(user_id, "can_comment") and st["comment"] and st["comment_text"]:
                                 c_lim = st.get("comment_acc_count", 0)
@@ -3127,18 +3273,22 @@ def execute_mission_worker(chat_id: int, user_id: int):
                                     c_cnt = comment_on_posts(
                                         page,
                                         comment_text=st["comment_text"],
-                                        post_index=st["comment_post_index"],
+                                        post_index=1 if c_url else st["comment_post_index"],
                                         post_url=c_url
                                     )
                                     if c_url:
                                         on_custom_url = True
                                     if c_cnt > 0:
                                         actions_done += c_cnt
+                                        acc_actions += c_cnt
                                         safe_send(chat_id, f"💬 <b>تم نشر التعليق بـ {esc(label_acc)}:</b>\n<i>'{esc(st['comment_text'])}'</i>")
+                                    else:
+                                        _record_issue("التعليق", "التعليقات مقيدة أو تعذر الوصول لصندوق التعليق")
 
                             if has_permission(user_id, "can_interact_comments") and st["interact_cmt"]:
                                 if on_custom_url:
                                     navigate_to_target(page, target_url)
+                                    on_custom_url = False
                                 if interact_with_specific_comment(
                                     page, post_index=1,
                                     target_mode=st["cmt_target_mode"],
@@ -3147,18 +3297,31 @@ def execute_mission_worker(chat_id: int, user_id: int):
                                     reply_text=st["cmt_reply"]
                                 ):
                                     actions_done += 1
+                                    acc_actions += 1
                                     safe_send(chat_id, f"🎯 <b>تم التفاعل والرد على التعليق المحدد بـ {esc(label_acc)}!</b>")
+                                else:
+                                    _record_issue("رد على تعليق", "لم يتم العثور على التعليق المطابق")
 
                             if has_permission(user_id, "can_report") and st["report_post"]:
+                                if on_custom_url:
+                                    navigate_to_target(page, target_url)
                                 update_live_status(f"🛡️ <b>جاري تنفيذ بلاغ المنشور بـ {esc(label_acc)}...</b>")
                                 if report_post(page, reason=st["rep_reason"], victim=st["rep_victim"]):
                                     actions_done += 1
+                                    acc_actions += 1
                                     safe_send(chat_id, f"🛡️ <b>تم تأكيد استلام بلاغ المنشور بـ {esc(label_acc)}!</b>")
+                                else:
+                                    _record_issue("بلاغ منشور", "تعذر إتمام خطوات بلاغ المنشور")
 
                             try:
                                 page.screenshot(path=shot_path)
+                                shot_caption = (
+                                    f"📸 <b>إثبات التنفيذ بالحساب:</b> {esc(label_acc)}"
+                                    if acc_actions > 0
+                                    else f"📸 <b>لقطة تشخيصية لصفحة المتصفح (0 إجراءات بالحساب):</b> {esc(label_acc)}"
+                                )
                                 with open(shot_path, "rb") as shot_file:
-                                    bot.send_photo(chat_id, shot_file, caption=f"📸 <b>إثبات التنفيذ بالحساب:</b> {esc(label_acc)}")
+                                    bot.send_photo(chat_id, shot_file, caption=shot_caption)
                             except Exception:
                                 pass
 
@@ -3169,6 +3332,8 @@ def execute_mission_worker(chat_id: int, user_id: int):
                             except Exception:
                                 pass
                     except Exception as err:
+                        err_txt = f"• <b>{esc(label_acc)} (خطأ متصفح):</b> <code>{esc(err)}</code>"
+                        run_issues.append(err_txt)
                         safe_send(chat_id, f"❌ <b>خطأ بالحساب {esc(label_acc)}:</b> <code>{esc(err)}</code>")
                     finally:
                         if os.path.exists(shot_path):
@@ -3180,14 +3345,30 @@ def execute_mission_worker(chat_id: int, user_id: int):
             if idx < total_accounts:
                 time.sleep(3)
 
-        update_live_status(
-            "🎉 <b>اكتملت المهمة بنجاح!</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            f"✅ <b>إجمالي الإجراءات المنفذة:</b> {actions_done}\n"
-            f"👥 <b>الحسابات المشاركة:</b> {total_accounts}\n"
-            "━━━━━━━━━━━━━━━━━━━━",
-            reply_markup=_back_home_markup()
-        )
+        if actions_done > 0:
+            notes_block = ""
+            if run_issues:
+                notes_block = "\n\n⚠️ <b>ملاحظات لبعض المحاولات:</b>\n" + "\n".join(run_issues[:5])
+            update_live_status(
+                "🎉 <b>اكتملت المهمة بنجاح!</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"✅ <b>إجمالي الإجراءات المنفذة:</b> {actions_done}\n"
+                f"👥 <b>الحسابات المشاركة:</b> {total_accounts}\n"
+                f"━━━━━━━━━━━━━━━━━━━━{notes_block}",
+                reply_markup=_back_home_markup()
+            )
+        else:
+            reasons_txt = "\n".join(run_issues[:6]) if run_issues else "• لم تتطابق عناصر الصفحة المستهدفة أو الحسابات لم تكن مسجلة."
+            update_live_status(
+                "⚠️ <b>انتهت المهمة دون تنفيذ أي إجراء فعلي (0)</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"❌ <b>إجمالي الإجراءات المنفذة:</b> 0\n"
+                f"👥 <b>الحسابات المفحوصة:</b> {total_accounts}\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"📋 <b>الأسباب المسجلة:</b>\n{reasons_txt}\n\n"
+                "💡 <i>تحقق من لقطة الشاشة المرفقة، وافحص الجلسات عبر (🔄 فحص الجلسات) أو تأكد أن الرابط عام ومتاح.</i>",
+                reply_markup=_back_home_markup()
+            )
 
     except Exception as e:
         update_live_status(f"❌ حدث خطأ أثناء التنفيذ: <code>{esc(e)}</code>", reply_markup=_back_home_markup())

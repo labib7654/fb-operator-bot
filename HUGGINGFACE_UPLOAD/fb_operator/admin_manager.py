@@ -12,10 +12,8 @@ import threading
 from pathlib import Path
 from datetime import datetime
 from fb_operator.account_manager import git_sync_save
+from fb_operator.config import USERS_FILE, AUDIT_LOG_FILE
 from fb_operator.state_events import publish_event
-
-USERS_FILE = Path(__file__).resolve().parent / "users.json"
-AUDIT_LOG_FILE = Path(__file__).resolve().parent / "audit_logs.json"
 
 _users_lock = threading.RLock()
 _audit_lock = threading.RLock()
