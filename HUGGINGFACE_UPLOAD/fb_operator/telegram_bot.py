@@ -28,6 +28,9 @@ import io
 import re
 import html
 import time
+import atexit
+import signal
+import secrets
 import tempfile
 import threading
 from datetime import datetime
@@ -53,7 +56,7 @@ from fb_operator.admin_manager import (
 from fb_operator.browser_manager import (
     launch_account_browser, auto_login_facebook, check_facebook_login_cookies,
     human_delay, get_login_error, check_facebook_page_access,
-    save_account_storage_state
+    diagnose_facebook_challenge, save_account_storage_state, get_profile_lock
 )
 from fb_operator.actions import (
     navigate_to_target, comment_on_posts, react_to_posts,
@@ -67,11 +70,20 @@ from fb_operator.webapp_server import (
 from fb_operator.state_events import publish_event, register_listener
 from fb_operator.persistence_manager import (
     bootstrap_persistence, export_backup_zip_bytes, restore_backup_zip_bytes,
+    inspect_backup_zip_bytes, merge_backup_zip_bytes, merge_legacy_json_bytes,
     hf_dataset_sync_upload, flush_cloud_backups, get_persistence_status,
+    cloud_db_sync_upload, cloud_db_sync_download,
     load_backup_settings, save_backup_settings, parse_backup_interval,
     format_backup_interval, send_backup_to_channel, load_ui_states_data,
     save_ui_states_data, register_pre_backup_callback, register_restore_callback,
     MIN_BACKUP_INTERVAL_SEC, MAX_BACKUP_INTERVAL_SEC
+)
+from fb_operator.cloud_db import (
+    load_cloud_db_config, save_cloud_db_config, clear_cloud_db_config,
+    test_cloud_db_connection, get_cloud_db_status_summary, get_provider_setup_guide
+)
+from fb_operator.hitl_manager import (
+    register_hitl_verified_callback, submit_telegram_otp_for_account
 )
 from fb_operator.economy_manager import (
     OP_COST_LABELS_AR, load_economy_settings, update_economy_settings,
@@ -218,17 +230,8 @@ def _track_view(user_id: int, chat_id: int, msg_id: int | None, view: str, targe
         }
 
 
-# أقفال عزل بروفايلات المتصفح ومنع تشغيل نفس البروفايل في خيطين متزامنين
-_profile_locks: dict[str, threading.Lock] = {}
-_profile_locks_guard = threading.Lock()
+# أقفال عزل بروفايلات المتصفح مستوردة بشكل موحد من browser_manager (get_profile_lock)
 _browser_semaphore = threading.BoundedSemaphore(4)
-
-
-def get_profile_lock(account_id: str) -> threading.Lock:
-    with _profile_locks_guard:
-        if account_id not in _profile_locks:
-            _profile_locks[account_id] = threading.Lock()
-        return _profile_locks[account_id]
 
 
 # ----------------- إدارة الجلسات المتعددة وعزل المستخدمين (Multi-Tenant Engine) -----------------
@@ -1179,6 +1182,188 @@ def _render_backup_schedule_view() -> tuple[str, types.InlineKeyboardMarkup]:
     return "\n".join(lines), markup
 
 
+_pending_upload_lock = threading.Lock()
+_pending_restore_uploads: dict[str, dict] = {}
+
+
+def _stage_pending_backup(uid: int, raw_bytes: bytes, fname: str) -> str:
+    now = time.time()
+    with _pending_upload_lock:
+        for k, v in list(_pending_restore_uploads.items()):
+            if (now - v.get("ts", 0)) > 600:
+                _pending_restore_uploads.pop(k, None)
+        while len(_pending_restore_uploads) >= 5:
+            oldest_k = min(_pending_restore_uploads.keys(), key=lambda x: _pending_restore_uploads[x].get("ts", 0))
+            _pending_restore_uploads.pop(oldest_k, None)
+        tok = secrets.token_hex(5)
+        _pending_restore_uploads[tok] = {"uid": int(uid), "raw": raw_bytes, "fname": fname, "ts": now}
+        return tok
+
+
+def _pop_pending_backup(tok: str, uid: int) -> dict | None:
+    with _pending_upload_lock:
+        rec = _pending_restore_uploads.get(tok)
+        if not rec or int(rec.get("uid", 0)) != int(uid):
+            return None
+        if (time.time() - rec.get("ts", 0)) > 600:
+            _pending_restore_uploads.pop(tok, None)
+            return None
+        return _pending_restore_uploads.pop(tok, None)
+
+
+def _format_external_vault_summary(st_info: dict | None = None) -> tuple[str, str]:
+    info = st_info if isinstance(st_info, dict) else get_persistence_status()
+    ext_v = info.get("external_vault") or {}
+    fname = str(ext_v.get("filename") or "fb_operator_vault.json")
+    configured = bool(ext_v.get("configured"))
+    exists = bool(ext_v.get("exists"))
+    encrypted = bool(ext_v.get("encrypted"))
+    status_txt = str(ext_v.get("status") or "-")
+
+    if exists:
+        enc_label = "مشفّر (FB_VAULT_KEY)" if encrypted else "نص عادي"
+        badge = f"🟢 {fname} ({enc_label} — {status_txt})"
+    elif configured:
+        badge = f"🟡 {fname} (مهيّأ وسيُكتب تلقائياً بجانب المجلد)"
+    else:
+        badge = f"⚪ غير مكتشف — أنشئ {fname} بجانب HUGGINGFACE_UPLOAD"
+
+    warn = ""
+    if exists and not encrypted and os.environ.get("GITHUB_REPOSITORY"):
+        warn = "⚠️ تنبيه أمان: أضف FB_VAULT_KEY في GitHub Secrets أو اجعل المستودع Private لحماية الجلسات وكلمات المرور."
+    return badge, warn
+
+
+def _render_cloud_db_view() -> tuple[str, types.InlineKeyboardMarkup]:
+    st_db = get_cloud_db_status_summary()
+    cfg = st_db.get("config_masked") or {}
+    prov = (st_db.get("provider") or "none").lower()
+    prov_names = {
+        "turso": "Turso Cloud (libSQL مجاني 9GB — بلا فيزا)",
+        "supabase": "Supabase PostgreSQL (مجاني 500MB — بلا فيزا)",
+        "firebase": "Firebase Realtime DB (Spark مجاني — بلا فيزا)",
+        "none": "غير مربوطة (تعتمد على SQLite المحلي + HF/Telegram الآن)",
+    }
+    sql_ok = "✅ نشطة" if st_db.get("sqlite_mirror_exists") else "⏳ ستُنشأ تلقائياً"
+    lines = [
+        "🗄️ <b>ربط قاعدة بيانات سحابية خارجية مجانية (بلا فيزا)</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"💾 <b>مرآة SQLite WAL المحلية:</b> {sql_ok}",
+        f"☁️ <b>المزود السحابي الحالي:</b> {esc(prov_names.get(prov, prov))}",
+        f"📡 <b>حالة المزامنة:</b> {esc(st_db.get('last_status', '-'))}",
+    ]
+    if prov == "turso":
+        lines.append(f"🔗 <b>رابط Turso:</b> <code>{esc(cfg.get('turso_url', '-'))}</code>")
+        lines.append(f"🔑 <b>التوكن:</b> <code>{esc(cfg.get('turso_token', '-'))}</code>")
+    elif prov == "supabase":
+        lines.append(f"🔗 <b>رابط Supabase:</b> <code>{esc(cfg.get('supabase_url', '-'))}</code>")
+        lines.append(f"🔑 <b>المفتاح:</b> <code>{esc(cfg.get('supabase_key', '-'))}</code>")
+    elif prov == "firebase":
+        lines.append(f"🔗 <b>رابط Firebase:</b> <code>{esc(cfg.get('firebase_url', '-'))}</code>")
+    ext_badge, ext_warn = _format_external_vault_summary()
+    lines.append(f"📦 <b>الملف الخارجي الشقيق:</b> {esc(ext_badge)}")
+    if ext_warn:
+        lines.append(esc(ext_warn))
+    if st_db.get("last_error"):
+        lines.append(f"⚠️ <b>آخر تنبيه:</b> <code>{esc(st_db.get('last_error', ''))}</code>")
+    lines.extend([
+        "━━━━━━━━━━━━━━━━━━━━",
+        "💡 <i>اربط أي قاعدة مجانية من الأسفل (كلها 100% بلا بطاقة بنكية) لتبقى جميع الحسابات، الجلسات، النقاط، المستخدمين، وسجلات البوت محفوظة حتى لو حُذفت الاستضافة أو تغيّرت!</i>",
+    ])
+
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.row(types.InlineKeyboardButton("🟢 ربط Turso المجاني (موصى به — بلا إعداد جدول)", callback_data="cdb_pick_turso"))
+    markup.row(
+        types.InlineKeyboardButton("🟣 ربط Supabase PostgreSQL", callback_data="cdb_pick_supabase"),
+        types.InlineKeyboardButton("🟡 ربط Firebase RTDB", callback_data="cdb_pick_firebase"),
+    )
+    if st_db.get("enabled"):
+        markup.row(
+            types.InlineKeyboardButton("📤 رفع ومزامنة الكل للقاعدة الآن", callback_data="cdb_sync_push"),
+            types.InlineKeyboardButton("🔀 سحب ودمج من القاعدة السحابية", callback_data="cdb_sync_pull_merge"),
+        )
+        markup.row(
+            types.InlineKeyboardButton("🧪 فحص الاتصال", callback_data="cdb_test"),
+            types.InlineKeyboardButton("🗑️ فصل القاعدة السحابية", callback_data="cdb_clear"),
+        )
+    markup.row(
+        types.InlineKeyboardButton("🔄 تحديث", callback_data="menu_cloud_db"),
+        types.InlineKeyboardButton("🔙 العودة لخزنة النسخ", callback_data="menu_backup_vault"),
+    )
+    return "\n".join(lines), markup
+
+
+def _build_hitl_action_markup(acc_id: str, can_otp: bool = True, can_del: bool = False, include_back: bool = False) -> types.InlineKeyboardMarkup:
+    mk = types.InlineKeyboardMarkup(row_width=2)
+    w_url = get_public_webapp_url()
+    if w_url:
+        sep = "&" if "?" in w_url else "?"
+        mk.row(types.InlineKeyboardButton("🖥️ الشاشة الحية لحل التحقق بنفسي", web_app=types.WebAppInfo(url=f"{w_url}{sep}hitl={acc_id}")))
+    else:
+        mk.row(types.InlineKeyboardButton("🖥️ كيف أفتح الشاشة الحية؟", callback_data=f"hitl_help_{acc_id}"))
+    if can_otp:
+        mk.row(types.InlineKeyboardButton("🔐 إرسال رمز 2FA / OTP الآن", callback_data=f"hitl_otp_{acc_id}"))
+    if can_del:
+        mk.row(types.InlineKeyboardButton("🗑️ حذف الحساب التالف الآن", callback_data=f"del_acc_{acc_id}"))
+    if include_back:
+        mk.row(types.InlineKeyboardButton("🔙 إدارة الحسابات", callback_data="menu_manage_accs"))
+    return mk
+
+
+def _on_hitl_account_verified(acc_id: str, fb_id: str, actor_uid: int) -> None:
+    acc = get_account_by_id(acc_id)
+    if not acc:
+        return
+    owner_id = int(acc.get("owner_id") or 0)
+    owner_name = str(acc.get("owner_name") or f"مستخدم_{owner_id}")
+    upd = {
+        "status": "نشط ومسجل",
+        "diagnostic_reason": "تم إكمال التحقق وتثبيت الجلسة عبر الشاشة الحية",
+    }
+    if fb_id:
+        upd["fb_id"] = fb_id
+    update_account(acc_id, upd)
+    if owner_id > 0:
+        record_account_result_for_user(owner_id, is_active=True)
+    rew = {}
+    if owner_id > 0 and not is_super_admin(owner_id):
+        rew = reward_account_activation(owner_id, acc_id, acc_name=acc.get("name", ""))
+        if rew.get("referral_awarded", 0) > 0 and rew.get("referral_inviter_id"):
+            safe_send(
+                rew["referral_inviter_id"],
+                f"🎁 <b>مكافأة إحالة (+{rew['referral_awarded']} نقاط)!</b>\n"
+                f"قام المدعو <b>{esc(owner_name)}</b> بتفعيل أول حساب فيسبوك نشط له بنجاح.\n"
+                f"💰 رصيدك الآن: <b>{rew['referral_inviter_balance']}</b> نقطة!"
+            )
+    record_audit_log(
+        actor_uid or owner_id,
+        owner_name,
+        "HITL_VERIFIED",
+        f"تفعيل الحساب عبر الشاشة الحية: {acc.get('name')} ({acc_id}) | FB={fb_id}",
+    )
+    notify_uid = actor_uid or owner_id
+    if notify_uid:
+        rew_note = _format_reward_notice(rew, acc.get("name", acc_id), is_super_admin(owner_id))
+        safe_send(
+            notify_uid,
+            f"✅ <b>تم إكمال التحقق وتثبيت جلسة '{esc(acc.get('name', acc_id))}' بنجاح!</b>\n"
+            f"🆔 <b>معرّف فيسبوك:</b> <code>{esc(fb_id or '-')}</code>\n"
+            f"🍪 تم حفظ الجلسة الدائمة ومزامنتها بالكامل.{rew_note}",
+            reply_markup=_back_home_markup("menu_manage_accs"),
+        )
+    if owner_id > 0 and not is_super_admin(owner_id):
+        u_rec = load_users().get(str(owner_id), {})
+        _notify_developer_account_result(
+            owner_id=owner_id,
+            owner_name=owner_name,
+            owner_username=str(u_rec.get("username") or ""),
+            acc=acc,
+            is_active=True,
+            diag_reason="تم إكمال التحقق يدوياً في الشاشة الحية",
+            fb_id=fb_id,
+        )
+
+
 def _render_backup_vault_view() -> tuple[str, types.InlineKeyboardMarkup]:
     st_info = get_persistence_status()
     bkp = st_info.get("backup_channel") or {}
@@ -1201,11 +1386,21 @@ def _render_backup_vault_view() -> tuple[str, types.InlineKeyboardMarkup]:
         eta_txt = "مستحقة الآن" if rem <= 0 else format_backup_interval(rem).replace("كل ", "بعد ", 1)
 
     hf_badge = "🟢 مفعّل تلقائياً" if st_info.get("hf_enabled") else "⚪ غير مضبوط (اختياري عبر HF_TOKEN)"
+    cdb_info = st_db = st_info.get("cloud_db") or {}
+    cdb_badge = (
+        f"🟢 {str(cdb_info.get('provider', '')).upper()} ({cdb_info.get('last_status', 'متصل')})"
+        if cdb_info.get("enabled")
+        else "⚪ غير مربوطة بعد (SQLite محلي نشط)"
+    )
+    ext_badge, ext_warn = _format_external_vault_summary(st_info)
+    ext_line = f"📦 <b>القاعدة الخارجية المستقلة:</b> {esc(ext_badge)}" + (f"\n{esc(ext_warn)}" if ext_warn else "")
     has_vol = Path("/data").exists() and os.access("/data", os.W_OK)
     lines = [
         "💾 <b>خزنة النسخ الاحتياطي الشاملة والاستعادة الفورية</b>",
         "━━━━━━━━━━━━━━━━━━━━",
+        ext_line,
         f"📡 <b>قناة النسخ الاحتياطي:</b> {ch_badge}",
+        f"🗄️ <b>قاعدة البيانات السحابية (بلا فيزا):</b> {esc(cdb_badge)}",
         f"⏱️ <b>التوقيت المجدول:</b> {esc(bkp.get('interval_label', 'كل 1 ساعة'))} | {'🟢 مفعّل' if en_flag else '🔴 متوقف'} ({esc(eta_txt)})",
         f"⚡ <b>النسخ الفوري عند التعديل:</b> {'🟢 مفعّل' if och_flag else '⚪ معطل'} | <b>المُرسل للقناة:</b> {bkp.get('channel_backup_count', 0)} نسخة",
         f"🕒 <b>آخر نسخة/استعادة:</b> {esc(st_info.get('last_backup_iso'))}",
@@ -1221,9 +1416,10 @@ def _render_backup_vault_view() -> tuple[str, types.InlineKeyboardMarkup]:
         f"• 🎛️ حالات الضبط والواجهة والأزرار: <b>{st_info.get('ui_states_count', 0)}</b> | 📜 السجل الأمني: <b>{st_info.get('audit_count', 0)}</b>",
         f"☁️ <b>مزامنة HF:</b> {hf_badge} | 💾 <b>التخزين:</b> {'/data' if has_vol else 'معزول'}",
         "━━━━━━━━━━━━━━━━━━━━",
-        "📥 <b>لاسترجاع أي نسخة كما كانت تماماً:</b> أرسل ملف الـ <code>.zip</code> هنا أو أعد توجيهه من القناة وسيعود كل شيء فوراً.",
+        "📥 <b>لاسترجاع أو دمج أي نسخة (.zip أو JSON قديم):</b> أرسل الملف هنا أو أعد توجيهه، وإذا وُجدت بيانات حالية سيخيرك البوت بين <b>الدمج الذكي بدون حذف/تكرار</b> أو الاستبدال الكامل.",
     ])
     markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.row(types.InlineKeyboardButton("🗄️ ربط قاعدة بيانات مجانية (بلا فيزا)", callback_data="menu_cloud_db"))
     if ch_id:
         markup.row(
             types.InlineKeyboardButton("📡 تغيير قناة النسخ", callback_data="bkp_set_channel"),
@@ -1921,6 +2117,211 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         txt, markup = _render_admin_economy_view()
         _track_view(user_id, call.message.chat.id, call.message.message_id, "economy")
         safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+        return
+
+    elif data == "menu_cloud_db":
+        if not is_super_admin(user_id):
+            record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", "محاولة فتح إعدادات القاعدة السحابية بدون صلاحية")
+            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+            return
+        txt, markup = _render_cloud_db_view()
+        _track_view(user_id, call.message.chat.id, call.message.message_id, "cloud_db")
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+        return
+
+    elif data.startswith("cdb_pick_"):
+        if not is_super_admin(user_id):
+            record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", f"محاولة ضبط مزود القاعدة {data}")
+            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+            return
+        prov = data.replace("cdb_pick_", "", 1)
+        if prov not in ("turso", "supabase", "firebase"):
+            safe_answer(call.id, "⚠️ مزود غير معروف.", show_alert=True)
+            return
+        st["input_mode"] = f"waiting_cdb_{prov}"
+        safe_answer(call.id)
+        safe_send(
+            call.message.chat.id,
+            get_provider_setup_guide(prov),
+            reply_markup=_prompt_back_markup("menu_cloud_db"),
+        )
+        return
+
+    elif data == "cdb_sync_push":
+        if not is_super_admin(user_id):
+            record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", "محاولة دفع القاعدة السحابية بدون صلاحية")
+            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+            return
+        res_p = cloud_db_sync_upload(force=True)
+        ok_p = bool(res_p.get("ok") and not res_p.get("cloud_skipped"))
+        msg_p = (
+            f"✅ تمت مزامنة {res_p.get('keys', 0)} سجل/ملف إلى القاعدة السحابية بنجاح!"
+            if ok_p
+            else str(res_p.get("error") or "تأكد من ضبط بيانات القاعدة أولاً")
+        )
+        safe_answer(call.id, msg_p[:180], show_alert=True)
+        txt, markup = _render_cloud_db_view()
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+        return
+
+    elif data == "cdb_sync_pull_merge":
+        if not is_super_admin(user_id):
+            record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", "محاولة سحب ودمج من القاعدة السحابية بدون صلاحية")
+            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+            return
+        res_pm = cloud_db_sync_download(mode="merge")
+        if res_pm.get("ok") and res_pm.get("mode") == "merge":
+            s_m = res_pm.get("stats", {})
+            safe_answer(
+                call.id,
+                f"✅ تم الدمج من السحابة! حسابات مضافة: {s_m.get('accounts_added', 0)} | مكررة محفوظة: {s_m.get('accounts_deduped', 0)}",
+                show_alert=True,
+            )
+            record_audit_log(user_id, call.from_user.first_name or "", "CLOUD_DB_MERGED", f"دمج من السحابة: +{s_m.get('accounts_added', 0)} حساب")
+        else:
+            safe_answer(call.id, f"⚠️ {res_pm.get('error') or res_pm.get('reason') or 'السحابة فارغة'}", show_alert=True)
+        txt, markup = _render_cloud_db_view()
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+        return
+
+    elif data == "cdb_test":
+        if not is_super_admin(user_id):
+            record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", "محاولة فحص القاعدة السحابية بدون صلاحية")
+            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+            return
+        res_t = test_cloud_db_connection()
+        if res_t.get("ok"):
+            safe_answer(call.id, f"✅ متصل بنجاح ({res_t.get('provider')}) | ملفات: {res_t.get('docs_count')} | جلسات: {res_t.get('sessions_count')}", show_alert=True)
+        else:
+            safe_answer(call.id, f"❌ {str(res_t.get('error') or 'فشل الاتصال')[:180]}", show_alert=True)
+        return
+
+    elif data == "cdb_clear":
+        if not is_super_admin(user_id):
+            record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", "محاولة فصل القاعدة السحابية بدون صلاحية")
+            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+            return
+        clear_cloud_db_config()
+        safe_answer(call.id, "🗑️ تم فصل القاعدة السحابية الخارجية (بقي SQLite المحلي نشطاً).", show_alert=True)
+        txt, markup = _render_cloud_db_view()
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+        return
+
+    elif data.startswith("bkp_upload_merge:") or data.startswith("bkp_upload_replace:") or data.startswith("bkp_upload_cancel:"):
+        if not is_super_admin(user_id):
+            record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", f"محاولة التحكم بملف نسخ احتياطي مرفوع {data}")
+            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+            return
+        action_bkp, tok = data.split(":", 1)
+        staged = _pop_pending_backup(tok, user_id)
+        if not staged:
+            safe_answer(call.id, "⌛ انتهت صلاحية هذا الملف المعلق أو تم تنفيذه مسبقاً. أعد إرسال الملف.", show_alert=True)
+            return
+        if action_bkp == "bkp_upload_cancel":
+            safe_answer(call.id, "❌ تم إلغاء العملية دون تعديل البيانات.")
+            safe_edit_message("❌ <b>تم إلغاء معالجة الملف المرفوع مع الإبقاء على بياناتك الحالية كما هي.</b>", call.message.chat.id, call.message.message_id, reply_markup=_back_home_markup("menu_backup_vault"))
+            return
+        if action_bkp == "bkp_upload_merge":
+            res_m = merge_backup_zip_bytes(staged["raw"])
+            if res_m.get("ok"):
+                sm = res_m["stats"]
+                reload_user_states_from_disk()
+                try:
+                    update_menu_button_for_user(bot, user_id, is_allowed=True)
+                except Exception:
+                    pass
+                record_audit_log(
+                    user_id, call.from_user.first_name or "", "BACKUP_MERGED",
+                    f"دمج ذكي لنسخة {staged['fname']}: +{sm['accounts_added']} حساب، مكرر محمي {sm['accounts_deduped']}، +{sm['sessions_merged']} جلسة"
+                )
+                safe_answer(call.id, "✅ تم الدمج الذكي للنسخة بنجاح!")
+                safe_edit_message(
+                    "🔀 <b>تم الدمج الذكي للنسخة بنجاح دون حذف الجديد أو تكرار القديم!</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📱 <b>حسابات جديدة مضافة:</b> +{sm['accounts_added']}\n"
+                    f"🛡️ <b>حسابات متطابقة (مُفلترة بلا تكرار):</b> {sm['accounts_deduped']} (تحديث/ترقية {sm['accounts_upgraded']})\n"
+                    f"🍪 <b>جلسات مدموجة/مستعادة:</b> {sm['sessions_merged']}\n"
+                    f"👥 <b>مستخدمون جدد:</b> +{sm['users_added']} | مدموجون: {sm['users_merged']}\n"
+                    f"💰 <b>قيود مالية جديدة:</b> +{sm['ledger_added']} (مكرر محجوب: {sm['ledger_deduped']})\n"
+                    f"📊 <b>الإجمالي بعد الدمج:</b> {res_m['users_count']} مستخدم | {res_m['accounts_count']} حساب | {res_m['sessions_count']} جلسة\n"
+                    "💡 <i>يمكنك الآن إرسال أي نسخة أقدم أو ملف JSON آخر وسيستمر الدمج الذكي بنفس الدقة!</i>",
+                    call.message.chat.id,
+                    call.message.message_id,
+                    reply_markup=_back_home_markup("menu_backup_vault"),
+                )
+            else:
+                safe_answer(call.id, "⚠️ تعذر الدمج")
+                safe_edit_message(f"⚠️ <b>تعذر دمج النسخة:</b> {esc(res_m.get('error', 'خطأ'))}", call.message.chat.id, call.message.message_id)
+            return
+        # bkp_upload_replace
+        res_r = restore_backup_zip_bytes(staged["raw"])
+        if res_r.get("ok"):
+            reload_user_states_from_disk()
+            record_audit_log(user_id, call.from_user.first_name or "", "BACKUP_RESTORED", f"استبدال كامل من {staged['fname']}: users={res_r.get('users_count', 0)}, accs={res_r.get('accounts_count', 0)}")
+            safe_answer(call.id, "✅ تم الاستبدال الكامل بالنسخة!")
+            safe_edit_message(
+                "✅ <b>تم استبدال القاعدة بهذه النسخة كاملةً!</b>\n"
+                f"👥 المستخدمون: <b>{res_r.get('users_count', 0)}</b> | 📱 الحسابات: <b>{res_r.get('accounts_count', 0)}</b> | 🔑 الجلسات: <b>{res_r.get('sessions_restored', 0)}</b>",
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=_back_home_markup("menu_backup_vault"),
+            )
+        else:
+            safe_answer(call.id, "⚠️ فشلت الاستعادة")
+            safe_edit_message(f"⚠️ {esc(res_r.get('error', 'خطأ'))}", call.message.chat.id, call.message.message_id)
+        return
+
+    elif data.startswith("hitl_otp_"):
+        acc_id = data[len("hitl_otp_"):]
+        acc = get_account_by_id(acc_id)
+        if not acc:
+            safe_answer(call.id, "الحساب غير موجود.", show_alert=True)
+            return
+        can_access = is_super_admin(user_id) or (
+            int(acc.get("owner_id") or 0) == int(user_id)
+            and (has_permission(user_id, "can_add_accounts") or has_permission(user_id, "can_use_accounts"))
+        )
+        if not can_access:
+            record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", f"محاولة إرسال 2FA لحساب لا يملكه: {acc_id}")
+            safe_answer(call.id, "⛔ لا تملك صلاحية التحقق لهذا الحساب.", show_alert=True)
+            return
+        st["input_mode"] = f"waiting_hitl_otp_{acc_id}"
+        safe_answer(call.id)
+        safe_send(
+            call.message.chat.id,
+            f"🔐 <b>إرسال رمز الأمان (2FA / OTP) للحساب '{esc(acc.get('name', acc_id))}'</b>\n"
+            "أرسل الرمز الرقمي (مثال: <code>123456</code>) الآن وسيدخله البوت مباشرة في صفحة فيسبوك ويثبّت الجلسة.",
+            reply_markup=_prompt_back_markup("menu_manage_accs"),
+        )
+        return
+
+    elif data.startswith("hitl_help_"):
+        acc_id = data[len("hitl_help_"):]
+        acc = get_account_by_id(acc_id)
+        if not acc:
+            safe_answer(call.id, "الحساب غير موجود.", show_alert=True)
+            return
+        can_access = is_super_admin(user_id) or (
+            int(acc.get("owner_id") or 0) == int(user_id)
+            and (has_permission(user_id, "can_add_accounts") or has_permission(user_id, "can_use_accounts"))
+        )
+        if not can_access:
+            record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", f"محاولة وصول لمساعدة الشاشة الحية لحساب لا يملكه: {acc_id}")
+            safe_answer(call.id, "⛔ غير مصرح لك.", show_alert=True)
+            return
+        w_url = get_public_webapp_url()
+        safe_answer(call.id)
+        if w_url:
+            sep = "&" if "?" in w_url else "?"
+            mk = types.InlineKeyboardMarkup()
+            mk.row(types.InlineKeyboardButton("🖥️ فتح الشاشة الحية الآن", web_app=types.WebAppInfo(url=f"{w_url}{sep}hitl={acc_id}")))
+            safe_send(call.message.chat.id, "🖥️ اضغط الزر أدناه لفتح متصفح الحساب الحقيقي وحل التحقق بنفسك:", reply_markup=mk)
+        else:
+            safe_send(
+                call.message.chat.id,
+                "💡 نفق HTTPS للوحة المصغرة غير متاح حالياً، أو اضغط زر <b>📱 لوحة التحكم</b> ثم تبويب <b>الحسابات → الشاشة الحية لحل التحقق</b> بمجرد توفر رابط الويب.",
+                reply_markup=_back_home_markup("menu_manage_accs"),
+            )
         return
 
     elif data == "menu_backup_vault":
@@ -3048,9 +3449,21 @@ def check_all_sessions_worker(chat_id: int, requester_id: int):
                         page = ctx.pages[0] if ctx.pages else ctx.new_page()
                         page.goto("https://www.facebook.com/", timeout=25000, wait_until="domcontentloaded")
                         human_delay(1.5, 2.5)
-                        ok_live, live_reason = check_facebook_page_access(page)
+                        diag_chk = diagnose_facebook_challenge(page)
+                        ok_live = bool(diag_chk.get("is_ok"))
+                        live_reason = str(diag_chk.get("message") or "")
                         is_logged, fb_id = check_facebook_login_cookies(ctx)
                         is_active = bool(is_logged and ok_live)
+                        # إعادة دخول ذكية تلقائية إذا انتهت الكوكيز فقط ولدينا كلمة مرور حقيقية
+                        real_pwd = a.get("password", "")
+                        if not is_active and diag_chk.get("code") in ("full_login", "password_only") and real_pwd and real_pwd != "[SESSION_COOKIES]":
+                            safe_edit_message(f"🔑 <b>إعادة تسجيل الدخول تلقائياً ({idx}/{total}):</b> {esc(a['name'])}...", chat_id, status_msg_id)
+                            relog_ok = auto_login_facebook(ctx, page, a.get("email", ""), real_pwd, max_wait=28)
+                            is_logged, fb_id = check_facebook_login_cookies(ctx)
+                            diag_after = diagnose_facebook_challenge(page)
+                            is_active = bool(relog_ok and is_logged and diag_after.get("is_ok"))
+                            if not is_active:
+                                live_reason = get_login_error(ctx) or diag_after.get("message") or live_reason
                         if is_active:
                             save_account_storage_state(ctx, a["profile_dir"])
                     finally:
@@ -3209,6 +3622,100 @@ def _handle_text_inputs_impl(message: types.Message):
             "📥 أرسل ملف النسخة الاحتياطية (<code>.zip</code>) كمستند (File/Document) أو أعد توجيهه مباشرة من قناة النسخ الاحتياطي.",
             reply_markup=_prompt_back_markup("menu_backup_vault"),
         )
+        return
+
+    elif mode and mode.startswith("waiting_cdb_"):
+        st["input_mode"] = None
+        if not is_super_admin(user_id):
+            record_audit_log(user_id, full_name, "SECURITY_BLOCK", f"محاولة تعديل القاعدة السحابية عبر نص {mode}")
+            return
+        prov = mode[len("waiting_cdb_"):]
+        parts = [ln.strip() for ln in re.split(r"[\r\n\s]+", text.strip()) if ln.strip()]
+        if prov not in ("turso", "supabase", "firebase") or not parts:
+            bot.reply_to(message, "❌ صيغة غير صالحة. أرسل الرابط والمفتاح/التوكن في سطرين.", reply_markup=_prompt_back_markup("menu_cloud_db"))
+            return
+        url_val = parts[0]
+        secret_val = parts[1] if len(parts) >= 2 else ""
+        if prov in ("turso", "supabase") and not secret_val:
+            bot.reply_to(message, "⚠️ يلزم إرسال الرابط والمفتاح (Token / Key) معاً في سطرين أو مفصولين بمسافة.", reply_markup=_prompt_back_markup("menu_cloud_db"))
+            return
+        test_cfg = {"provider": prov, "enabled": True}
+        if prov == "turso":
+            test_cfg.update({"turso_url": url_val, "turso_token": secret_val})
+        elif prov == "supabase":
+            test_cfg.update({"supabase_url": url_val, "supabase_key": secret_val})
+        else:
+            test_cfg.update({"firebase_url": url_val, "firebase_auth": secret_val})
+
+        try:
+            bot.delete_message(message.chat.id, message.message_id)
+        except Exception:
+            pass
+
+        wait_m = bot.send_message(message.chat.id, f"🔄 جاري اختبار الاتصال بـ <b>{prov.upper()}</b> وتجهيز المزامنة...")
+        chk = test_cloud_db_connection(test_cfg)
+        if not chk.get("ok"):
+            safe_edit_message(
+                f"❌ <b>تعذر الاتصال بالقاعدة:</b>\n<code>{esc(chk.get('error', 'خطأ غير معروف'))}</code>",
+                message.chat.id, wait_m.message_id,
+                reply_markup=_prompt_back_markup("menu_cloud_db"),
+            )
+            return
+
+        save_patch = {"provider": prov}
+        if prov == "turso":
+            save_patch.update({"turso_url": url_val, "turso_token": secret_val})
+        elif prov == "supabase":
+            save_patch.update({"supabase_url": url_val, "supabase_key": secret_val})
+        else:
+            save_patch.update({"firebase_url": url_val, "firebase_auth": secret_val})
+        save_cloud_db_config(save_patch)
+        push_res = cloud_db_sync_upload(force=True)
+        record_audit_log(user_id, full_name, "CLOUD_DB_LINKED", f"تم ربط القاعدة السحابية: {prov}")
+        if push_res.get("ok") and not push_res.get("cloud_skipped"):
+            safe_edit_message(
+                f"✅ <b>تم ربط قاعدة البيانات السحابية ({prov.upper()}) ومزامنة كافة البيانات والجلسات بنجاح!</b>\n"
+                f"📦 السجلات المرفوعة الآن: <b>{push_res.get('keys', 0)}</b>\n"
+                "🔐 <i>تم حذف رسالتك المحتوية على المفتاح من المحادثة لحمايتها.</i>",
+                message.chat.id, wait_m.message_id,
+                reply_markup=_back_home_markup("menu_cloud_db"),
+            )
+        else:
+            safe_edit_message(
+                f"✅ تم حفظ الإعداد والاتصال ناجح، لكن تنبيه أثناء الرفع الأول:\n<code>{esc(push_res.get('error', ''))}</code>",
+                message.chat.id, wait_m.message_id,
+                reply_markup=_back_home_markup("menu_cloud_db"),
+            )
+        return
+
+    elif mode and mode.startswith("waiting_hitl_otp_"):
+        st["input_mode"] = None
+        acc_id = mode[len("waiting_hitl_otp_"):]
+        acc = get_account_by_id(acc_id)
+        if not acc:
+            bot.reply_to(message, "❌ الحساب لم يعد موجوداً.")
+            return
+        can_access = is_super_admin(user_id) or (
+            int(acc.get("owner_id") or 0) == int(user_id)
+            and (has_permission(user_id, "can_add_accounts") or has_permission(user_id, "can_use_accounts"))
+        )
+        if not can_access:
+            record_audit_log(user_id, full_name, "SECURITY_BLOCK", f"محاولة إدخال OTP لحساب لا يملكه {acc_id}")
+            return
+        wait_otp = bot.reply_to(message, f"🔐 جاري توصيل رمز التحقق للحساب <b>{esc(acc.get('name', acc_id))}</b>...")
+        otp_res = submit_telegram_otp_for_account(acc_id, text.strip(), actor_uid=user_id)
+        if otp_res.get("completed"):
+            safe_edit_message(
+                f"✅ <b>تم قبول الرمز وتفعيل الحساب '{esc(acc.get('name', acc_id))}' بنجاح!</b>",
+                message.chat.id, wait_otp.message_id,
+                reply_markup=_back_home_markup("menu_manage_accs"),
+            )
+        else:
+            safe_edit_message(
+                f"⚠️ <b>لم تكتمل الجلسة بعد إدخال الرمز:</b>\n{esc(otp_res.get('challenge_message') or otp_res.get('error') or 'يمكنك فتح الشاشة الحية لإكمال الخطوة يدوياً.')}",
+                message.chat.id, wait_otp.message_id,
+                reply_markup=_build_hitl_action_markup(acc_id, can_otp=True, include_back=True),
+            )
         return
 
     elif mode == "waiting_url":
@@ -3631,28 +4138,53 @@ def handle_document_uploads(message: types.Message):
         try:
             finfo = bot.get_file(doc.file_id)
             raw_bytes = bot.download_file(finfo.file_path)
-            res = restore_backup_zip_bytes(raw_bytes)
-            if res.get("ok"):
-                get_user_state(user_id)["input_mode"] = None
-                try:
-                    update_menu_button_for_user(bot, user_id, is_allowed=True)
-                except Exception:
-                    pass
-                record_audit_log(user_id, full_name, "BACKUP_RESTORED", f"استعادة نسخة احتياطية: users={res.get('users_count', 0)}, accs={res.get('accounts_count', 0)}, sessions={res.get('sessions_restored', 0)}")
-                bot.reply_to(
-                    message,
-                    "✅ <b>تمت استعادة النسخة الاحتياطية بالكامل كما كانت تماماً!</b>\n"
-                    "━━━━━━━━━━━━━━━━━━━━\n"
-                    f"👥 <b>المستخدمون والصلاحيات:</b> {res.get('users_count', 0)}\n"
-                    f"📱 <b>الحسابات والإيميلات:</b> {res.get('accounts_count', 0)}\n"
-                    f"🔑 <b>الجلسات المحفوظة:</b> {res.get('sessions_restored', 0)}\n"
-                    f"🎛️ <b>إعدادات اللوحة والأزرار الظاهرية/الداخلية:</b> {'✅ استعيدت' if res.get('ui_states_restored') else 'افتراضي'}\n"
-                    f"📡 <b>قناة النسخ والجدولة:</b> {'✅ استعيدت' if res.get('backup_settings_restored') else 'كما هي'}\n"
-                    f"📄 <b>إجمالي ملفات البيانات المستعادة:</b> {len(res.get('restored_files', []))}"
-                )
-                cmd_start(message)
-            else:
-                bot.reply_to(message, f"⚠️ <b>تعذر استعادة النسخة الاحتياطية:</b> {esc(res.get('error', 'خطأ غير معروف'))}")
+            insp = inspect_backup_zip_bytes(raw_bytes)
+            if not insp.get("ok"):
+                bot.reply_to(message, f"⚠️ <b>تعذر فحص ملف النسخة:</b> {esc(insp.get('error', 'خطأ غير معروف'))}")
+                return
+
+            if not insp.get("has_existing_data"):
+                res = restore_backup_zip_bytes(raw_bytes)
+                if res.get("ok"):
+                    get_user_state(user_id)["input_mode"] = None
+                    reload_user_states_from_disk()
+                    try:
+                        update_menu_button_for_user(bot, user_id, is_allowed=True)
+                    except Exception:
+                        pass
+                    record_audit_log(user_id, full_name, "BACKUP_RESTORED", f"استعادة نسخة احتياطية: users={res.get('users_count', 0)}, accs={res.get('accounts_count', 0)}, sessions={res.get('sessions_restored', 0)}")
+                    bot.reply_to(
+                        message,
+                        "✅ <b>تمت استعادة النسخة الاحتياطية بالكامل كما كانت تماماً!</b>\n"
+                        "━━━━━━━━━━━━━━━━━━━━\n"
+                        f"👥 <b>المستخدمون والصلاحيات:</b> {res.get('users_count', 0)}\n"
+                        f"📱 <b>الحسابات والإيميلات:</b> {res.get('accounts_count', 0)}\n"
+                        f"🔑 <b>الجلسات المحفوظة:</b> {res.get('sessions_restored', 0)}\n"
+                        f"🎛️ <b>إعدادات اللوحة والأزرار الظاهرية/الداخلية:</b> {'✅ استعيدت' if res.get('ui_states_restored') else 'افتراضي'}\n"
+                        f"📡 <b>قناة النسخ والجدولة:</b> {'✅ استعيدت' if res.get('backup_settings_restored') else 'كما هي'}\n"
+                        f"📄 <b>إجمالي ملفات البيانات المستعادة:</b> {len(res.get('restored_files', []))}"
+                    )
+                    cmd_start(message)
+                else:
+                    bot.reply_to(message, f"⚠️ <b>تعذر استعادة النسخة الاحتياطية:</b> {esc(res.get('error', 'خطأ غير معروف'))}")
+                return
+
+            tok = _stage_pending_backup(user_id, raw_bytes, fname)
+            mk_choice = types.InlineKeyboardMarkup()
+            mk_choice.row(types.InlineKeyboardButton("🔀 دمج ذكي (حفظ الحالي + إضافة المفقود بلا تكرار)", callback_data=f"bkp_upload_merge:{tok}"))
+            mk_choice.row(types.InlineKeyboardButton("♻️ استبدال كامل (حذف الحالي والرجوع لهذه النسخة)", callback_data=f"bkp_upload_replace:{tok}"))
+            mk_choice.row(types.InlineKeyboardButton("❌ إلغاء", callback_data=f"bkp_upload_cancel:{tok}"))
+            bot.reply_to(
+                message,
+                "📦 <b>النظام يحتوي حالياً على بيانات — اختر طريقة استيراد هذا الملف!</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"📁 <b>محتوى الملف المرفوع (<code>{esc(fname)}</code>):</b>\n"
+                f"• المستخدمون: <b>{insp['users_count']}</b> | الحسابات: <b>{insp['accounts_count']}</b> | الجلسات: <b>{insp['sessions_count']}</b>\n"
+                f"• القيود المالية: <b>{insp['ledger_count']}</b> | التذاكر: <b>{insp['tickets_count']}</b> | الضبط: <b>{insp['ui_states_count']}</b>\n\n"
+                f"🛡️ <b>بياناتك الحالية الآن:</b> {insp['current_users_count']} مستخدم | {insp['current_accounts_count']} حساب\n"
+                "💡 <i>اختر <b>🔀 دمج ذكي</b> لدمج أي عدد من النسخ القديمة مع فلترة المكرر تلقائياً بدون خسارة أي بيانات حالية!</i>",
+                reply_markup=mk_choice,
+            )
         except Exception as e:
             bot.reply_to(message, f"❌ خطأ أثناء معالجة ملف النسخة الاحتياطية: <code>{esc(e)}</code>")
         return
@@ -3670,6 +4202,30 @@ def handle_document_uploads(message: types.Message):
             _process_cookie_import_submission(message, raw_bytes.decode("utf-8", errors="ignore"))
         except Exception as e:
             bot.reply_to(message, f"❌ تعذر قراءة ملف الجلسة: <code>{esc(e)}</code>", reply_markup=_prompt_back_markup("menu_manage_accs"))
+        return
+
+    if is_super_admin(user_id) and fname.endswith(".json"):
+        if fsize > 5 * 1024 * 1024:
+            bot.reply_to(message, "⚠️ حجم ملف JSON كبير جداً (الحد الأقصى 5MB).")
+            return
+        try:
+            finfo = bot.get_file(doc.file_id)
+            raw_bytes = bot.download_file(finfo.file_path)
+            m_res = merge_legacy_json_bytes(raw_bytes, filename_hint=fname)
+            if m_res.get("ok"):
+                sm = m_res["stats"]
+                record_audit_log(user_id, full_name, "LEGACY_JSON_MERGED", f"دمج ملف JSON قديم ({fname}): +{sm['accounts_added']} حساب، +{sm['users_added']} مستخدم")
+                bot.reply_to(
+                    message,
+                    f"🔀 <b>تم دمج ملف <code>{esc(fname)}</code> مع القاعدة بنجاح دون تكرار!</b>\n"
+                    f"• حسابات مضافة: <b>+{sm['accounts_added']}</b> | متطابقة محفوظة: <b>{sm['accounts_deduped']}</b>\n"
+                    f"• مستخدمون مضافون: <b>+{sm['users_added']}</b> | الإجمالي الآن: <b>{m_res['accounts_count']}</b> حساب / <b>{m_res['users_count']}</b> مستخدم",
+                    reply_markup=_back_home_markup("menu_backup_vault"),
+                )
+            else:
+                bot.reply_to(message, f"⚠️ {esc(m_res.get('error', 'تعذر دمج هذا الملف'))}\n💡 إذا كان ملف كوكيز متصفح لحساب واحد، افتح <b>🍪 استيراد جلسة/كوكيز</b> أولاً.")
+        except Exception as e:
+            bot.reply_to(message, f"❌ خطأ أثناء قراءة ملف JSON: <code>{esc(e)}</code>")
         return
 
 
@@ -3706,6 +4262,11 @@ def _notify_developer_account_result(
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("🛰️ فتح بطاقة المستخدم في الرادار", callback_data=f"surv_user_{owner_id}"))
     if not is_active:
+        w_url = get_public_webapp_url()
+        if w_url:
+            sep = "&" if "?" in w_url else "?"
+            markup.add(types.InlineKeyboardButton("🖥️ فتح الشاشة الحية لهذا الحساب", web_app=types.WebAppInfo(url=f"{w_url}{sep}hitl={acc['id']}")))
+        markup.add(types.InlineKeyboardButton("🔐 إرسال رمز 2FA / OTP", callback_data=f"hitl_otp_{acc['id']}"))
         markup.add(types.InlineKeyboardButton("🗑️ حذف هذا الحساب التالف فوراً", callback_data=f"del_acc_{acc['id']}"))
     safe_send(SUPER_ADMIN_ID, alert_txt, reply_markup=markup)
 
@@ -3757,20 +4318,8 @@ def async_login_account_worker(
 
                     if not logged:
                         ctx_err = get_login_error(ctx)
-                        page_content = (page.content() or "").lower()
-                        page_url = (page.url or "").lower()
-                        if ctx_err and any(k in ctx_err for k in ("Arkose", "CAPTCHA", "Checkpoint", "غير صحيحين", "معطل", "مقيد")):
-                            diag_reason = ctx_err
-                        elif "arkose" in page_content or "matchkey" in page_content or "أكمل تحدي" in page_content or "captcha" in page_url:
-                            diag_reason = "لغز تحقق من الإنسان Arkose Labs CAPTCHA — يتطلب استيراد جلسة صالحة من متصفحك"
-                        elif "checkpoint" in page_url or "two_step_verification" in page_url or "approval" in page_url:
-                            diag_reason = "يطلب رمز أمان 2FA أو تأكيد هوية (Checkpoint)"
-                        elif "suspended" in page_url or "disabled" in page_url or "موقوف" in page_content:
-                            diag_reason = "الحساب معطل أو موقوف من إدارة فيسبوك"
-                        elif "incorrect" in page_content or "غير صحيحة" in page_content or "wrong credentials" in page_content:
-                            diag_reason = "البريد الإلكتروني أو كلمة المرور غير صحيحة"
-                        else:
-                            diag_reason = ctx_err or "تعذر إكمال الجلسة تلقائياً (انظر لقطة الشاشة)"
+                        diag_page = diagnose_facebook_challenge(page)
+                        diag_reason = ctx_err or diag_page.get("message") or "تعذر إكمال الجلسة تلقائياً (انظر لقطة الشاشة)"
                 finally:
                     try:
                         if logged:
@@ -3826,18 +4375,15 @@ def async_login_account_worker(
                 owner_id, owner_name, "ACCOUNT_INACTIVE",
                 f"حساب غير نشط/فاشل: {acc['name']} ({acc['email']}) [{acc['id']}] | السبب: {diag_reason}"
             )
-            fail_markup = _back_home_markup("menu_manage_accs")
             can_del = is_super_admin(owner_id) or has_permission(owner_id, "can_delete_accounts")
             can_add = is_super_admin(owner_id) or has_permission(owner_id, "can_add_accounts")
-            if can_del:
-                fail_markup.row(types.InlineKeyboardButton("🗑️ حذف الحساب التالف الآن", callback_data=f"del_acc_{acc['id']}"))
+            fail_markup = _build_hitl_action_markup(acc["id"], can_otp=True, can_del=can_del, include_back=True)
             if can_add:
                 fail_markup.row(types.InlineKeyboardButton("🍪 استيراد جلسة/كوكيز من متصفحك", callback_data="act_import_cookies"))
             safe_edit_message(
-                f"⚠️ <b>تم حفظ بيانات الحساب '<code>{esc(acc['email'])}</code>' ولكن لم تكتمل الجلسة تلقائياً.</b>\n"
+                f"⚠️ <b>تم حفظ بيانات الحساب '<code>{esc(acc['email'])}</code>' ولكن يتطلب إكمال التحقق.</b>\n"
                 f"🔍 <b>السبب المشخص:</b> {esc(diag_reason)}\n\n"
-                f"💡 <i>فيسبوك يحجب أحياناً تسجيل الدخول من السيرفرات السحابية بلُغز أمني (CAPTCHA). "
-                f"الحل المضمون: سجل دخولك من متصفحك واستورد الجلسة عبر (🍪 استيراد جلسة/كوكيز).\n"
+                f"💡 <i>اضغط <b>🖥️ الشاشة الحية لحل التحقق بنفسي</b> لتجاوز الفحص البشري مباشرة داخل تلغرام، أو أرسل رمز 2FA، أو استورد الكوكيز.\n"
                 f"⏳ يُحذف الحساب التالف تلقائياً بعد {BROKEN_ACCOUNT_TTL_HOURS} ساعة إن لم يتفعّل.</i>",
                 chat_id, msg_id,
                 reply_markup=fail_markup
@@ -3845,7 +4391,12 @@ def async_login_account_worker(
             if has_shot:
                 try:
                     with open(shot_path, "rb") as sf:
-                        bot.send_photo(chat_id, sf, caption="📸 <b>لقطة حية من متصفح فيسبوك لما ظهر أثناء محاولة الدخول:</b>")
+                        bot.send_photo(
+                            chat_id,
+                            sf,
+                            caption=f"📸 <b>لقطة حية من متصفح فيسبوك ({esc(acc['name'])}) — افتح الشاشة الحية لإكماله الآن:</b>",
+                            reply_markup=_build_hitl_action_markup(acc["id"], can_otp=True, can_del=False, include_back=False),
+                        )
                 except Exception:
                     pass
 
@@ -3982,7 +4533,14 @@ def execute_mission_worker(chat_id: int, user_id: int):
                                     f"⚙️ <b>تقدم الخلفية ({idx}/{total_accounts}):</b> {esc(label_acc)} — {step_lbl}"
                                 )
 
-                            logged = auto_login_facebook(ctx, page, acc.get("email", ""), acc.get("password", ""), max_wait=35)
+                            is_ck_acc = acc.get("password") == "[SESSION_COOKIES]"
+                            logged = auto_login_facebook(
+                                ctx,
+                                page,
+                                "" if is_ck_acc else acc.get("email", ""),
+                                "" if is_ck_acc else acc.get("password", ""),
+                                max_wait=35,
+                            )
                             if not logged:
                                 login_err = get_login_error(ctx) or "الحساب غير مسجل دخوله أو الجلسة منتهية"
                                 run_issues.append(f"• <b>{esc(label_acc)} (الدخول):</b> {esc(login_err)}")
@@ -3994,10 +4552,20 @@ def execute_mission_worker(chat_id: int, user_id: int):
                                     }, sync_git=False)
                                 except Exception:
                                     pass
+                                can_fix_acc = is_super_admin(user_id) or (
+                                    int(acc.get("owner_id") or 0) == int(user_id)
+                                    and (has_permission(user_id, "can_add_accounts") or has_permission(user_id, "can_use_accounts"))
+                                )
+                                shot_mk = _build_hitl_action_markup(acc["id"], can_otp=True, can_del=False) if can_fix_acc else None
                                 try:
                                     page.screenshot(path=shot_path)
                                     with open(shot_path, "rb") as shot_file:
-                                        bot.send_photo(chat_id, shot_file, caption=f"⚠️ <b>لقطة سبب تعذر الدخول ({esc(label_acc)}):</b>\n{esc(login_err)}")
+                                        bot.send_photo(
+                                            chat_id,
+                                            shot_file,
+                                            caption=f"⚠️ <b>لقطة سبب تعذر الدخول ({esc(label_acc)}):</b>\n{esc(login_err)}",
+                                            reply_markup=shot_mk,
+                                        )
                                 except Exception:
                                     pass
                                 continue
@@ -4271,13 +4839,48 @@ def _maintenance_sync_worker() -> None:
                 pass
 
 
+_shutdown_lock = threading.Lock()
+_shutdown_done_ts = 0.0
+_shutdown_registered = False
+_stop_polling_event = threading.Event()
+
+
+def _graceful_shutdown_sync():
+    global _shutdown_done_ts
+    now = time.time()
+    with _shutdown_lock:
+        if now - _shutdown_done_ts < 2.0:
+            return
+        _shutdown_done_ts = now
+    try:
+        flush_cloud_backups(bot, SUPER_ADMIN_ID, force=True)
+    except Exception:
+        pass
+    try:
+        git_sync_save(async_mode=False)
+    except Exception:
+        pass
+
+
+def _handle_exit_signal(signum, _frame):
+    _stop_polling_event.set()
+    try:
+        bot.stop_polling()
+    except Exception:
+        pass
+    _graceful_shutdown_sync()
+    raise SystemExit(0)
+
+
 def run_telegram_bot():
-    global _live_sync_started
+    global _live_sync_started, _shutdown_registered
     print("=" * 60)
     print("🚀 بدء تشغيل بوت تلغرام FB Operator في السحاب 24/7...")
     boot_info = bootstrap_persistence()
     reload_user_states_from_disk()
     print(f"💾 مسار البيانات الدائم: {boot_info.get('data_dir')}")
+    if boot_info.get("external_vault_path"):
+        print(f"📦 ملف القاعدة الخارجية الشقيق: {boot_info.get('external_vault_path')} ({boot_info.get('external_vault_restore', '-')})")
     bkp_cfg = load_backup_settings()
     if bkp_cfg.get("channel_id"):
         print(f"📡 قناة النسخ الاحتياطي: {bkp_cfg.get('channel_title')} ({bkp_cfg.get('channel_id')}) | {bkp_cfg.get('interval_label')}")
@@ -4288,7 +4891,19 @@ def run_telegram_bot():
     print(f"👑 معرف المطور الرئيسي الحصين: {SUPER_ADMIN_ID}")
     print("=" * 60)
 
+    if not _shutdown_registered:
+        atexit.register(_graceful_shutdown_sync)
+        if threading.current_thread() is threading.main_thread():
+            for _sig in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGINT", None)):
+                if _sig is not None:
+                    try:
+                        signal.signal(_sig, _handle_exit_signal)
+                    except Exception:
+                        pass
+        _shutdown_registered = True
+
     if not _live_sync_started:
+        register_hitl_verified_callback(_on_hitl_account_verified)
         register_listener(_on_state_event)
         threading.Thread(target=_live_inline_sync_worker, daemon=True).start()
         threading.Thread(target=_maintenance_sync_worker, daemon=True).start()
@@ -4301,7 +4916,7 @@ def run_telegram_bot():
     except Exception:
         pass
 
-    while True:
+    while not _stop_polling_event.is_set():
         try:
             bot.infinity_polling(
                 timeout=25,
@@ -4309,7 +4924,12 @@ def run_telegram_bot():
                 skip_pending=True,
                 allowed_updates=["message", "callback_query"],
             )
+        except (KeyboardInterrupt, SystemExit):
+            _graceful_shutdown_sync()
+            raise
         except Exception as e:
+            if _stop_polling_event.is_set():
+                break
             err_s = str(e)
             if "409" in err_s or "terminated by other getUpdates" in err_s:
                 print("[CONFLICT 409] تحذير خطير: توجد نسخة أخرى تعمل بنفس BOT_TOKEN (مثل GitHub Actions أو Space قديم) وتسبب تضارب الردود! ألغِ النسخة القديمة أو جدّد التوكن عبر @BotFather (/revoke).")

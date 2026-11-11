@@ -20,6 +20,7 @@ from telebot import types
 from fb_operator.webapp_ui import get_miniapp_html
 from fb_operator.state_events import get_seq, publish_event, wait_for_relevant_events
 import fb_operator.economy_manager as eco
+import fb_operator.hitl_manager as hitl
 
 _url_lock = threading.Lock()
 _public_webapp_url: str | None = None
@@ -338,6 +339,27 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
             hooks["record_audit_log"](uid, str(tg_user.get("first_name") or ""), "SECURITY_BLOCK", detail)
             self._send_json(403, {"error": msg})
 
+        def _authorize_hitl_acc(self, uid: int, tg_user: dict[str, Any], is_dev: bool, perms: dict[str, Any], acc_id: str) -> dict[str, Any] | None:
+            clean_id = str(acc_id or "").strip()
+            if not clean_id:
+                self._send_json(400, {"error": "معرّف الحساب مطلوب."})
+                return None
+            acc = hooks["get_account_by_id"](clean_id)
+            if not acc:
+                self._send_json(404, {"error": "الحساب غير موجود."})
+                return None
+            if not is_dev:
+                can_acc = bool(perms.get("can_add_accounts") or perms.get("can_use_accounts"))
+                if int(acc.get("owner_id") or 0) != int(uid) or not can_acc:
+                    self._deny_perm(
+                        uid,
+                        tg_user,
+                        f"محاولة IDOR فتح الشاشة الحية لحساب لا يملكه ({clean_id})",
+                        "لا تملك صلاحية فتح الشاشة الحية لهذا الحساب."
+                    )
+                    return None
+            return acc
+
         def do_GET(self) -> None:
             path = urllib.parse.urlparse(self.path).path
 
@@ -591,6 +613,26 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
 
                 logs = list(reversed(hooks["load_audit_logs"](50)))
                 self._send_json(200, {"logs": logs})
+                return
+
+            if path == "/api/hitl/state":
+                auth = self._authenticate(touch_login=False)
+                if not auth:
+                    return
+                uid, tg_user, user_rec = auth
+                if not self._require_approved(uid, tg_user, user_rec):
+                    return
+                is_dev = hooks["is_super_admin"](uid)
+                perms = {k: True for k in hooks["PERMISSION_LABELS"]} if is_dev else hooks["get_user_permissions"](uid)
+                qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                acc_id = (qs.get("acc_id") or qs.get("account_id") or [""])[0]
+                if not self._authorize_hitl_acc(uid, tg_user, is_dev, perms, acc_id):
+                    return
+                st_hitl = hitl.get_hitl_state(acc_id)
+                if not st_hitl:
+                    self._send_json(200, {"ok": True, "running": False, "acc_id": acc_id})
+                else:
+                    self._send_json(200, {"ok": True, **st_hitl})
                 return
 
             self._send_json(404, {"error": "المسار غير موجود"})
@@ -1140,6 +1182,37 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                     return
                 updated = eco.update_economy_settings(body, actor_uid=uid)
                 self._send_json(200, {"ok": True, "economy_settings": updated, "message": "✅ تم حفظ إعدادات النقاط والتسعيرة والوضع العام بنجاح."})
+                return
+
+            if path == "/api/hitl/start":
+                acc_id = str(body.get("account_id") or body.get("acc_id") or "").strip()
+                if not self._authorize_hitl_acc(uid, tg_user, is_dev, perms, acc_id):
+                    return
+                res_h = hitl.start_hitl_session(acc_id, actor_uid=uid)
+                if not res_h.get("ok"):
+                    self._send_json(400, {"error": res_h.get("error", "تعذر فتح الشاشة الحية.")})
+                    return
+                hooks["record_audit_log"](uid, user_label, "HITL_SESSION_OPENED", f"فتح الشاشة الحية لحل تحقق الحساب ({acc_id})")
+                self._send_json(200, res_h)
+                return
+
+            if path == "/api/hitl/input":
+                acc_id = str(body.get("account_id") or body.get("acc_id") or "").strip()
+                if not self._authorize_hitl_acc(uid, tg_user, is_dev, perms, acc_id):
+                    return
+                res_in = hitl.send_hitl_input(acc_id, body)
+                if not res_in.get("ok"):
+                    self._send_json(400, {"error": res_in.get("error", "تعذر إرسال التفاعل للشاشة الحية."), **res_in})
+                    return
+                self._send_json(200, res_in)
+                return
+
+            if path == "/api/hitl/stop":
+                acc_id = str(body.get("account_id") or body.get("acc_id") or "").strip()
+                if not self._authorize_hitl_acc(uid, tg_user, is_dev, perms, acc_id):
+                    return
+                hitl.stop_hitl_session(acc_id)
+                self._send_json(200, {"ok": True, "running": False, "acc_id": acc_id})
                 return
 
             self._send_json(404, {"error": "المسار غير موجود"})

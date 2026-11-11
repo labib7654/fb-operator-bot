@@ -65,6 +65,57 @@ INVITE_CODES_FILE = DATA_DIR / "invite_codes.json"
 SUPPORT_TICKETS_FILE = DATA_DIR / "support_tickets.json"
 BACKUP_META_FILE = DATA_DIR / "backup_meta.json"
 UI_STATES_FILE = DATA_DIR / "ui_states.json"
+CLOUD_DB_CONFIG_FILE = DATA_DIR / "cloud_db_config.json"
+SQLITE_MIRROR_FILE = DATA_DIR / "fb_operator.db"
+
+# ملف قاعدة البيانات الخارجي المعزول خارج مجلد الأكواد (بجانب HUGGINGFACE_UPLOAD/ في جذر المستودع)
+EXTERNAL_VAULT_FILENAME = "fb_operator_vault.json"
+
+
+def resolve_external_vault_file() -> Path | None:
+    """
+    تحديد مسار ملف قاعدة البيانات الخارجي (خارج مجلد التحديثات HUGGINGFACE_UPLOAD) بحيث لا يُمس ولا يُستبدل عند رفع المجلد بالكامل:
+    1. متغير البيئة FB_VAULT_FILE إن تم تحديده.
+    2. ملف fb_operator_vault.json موجود فعلاً بجانب HUGGINGFACE_UPLOAD أو في مجلد التشغيل الحالي.
+    3. أو جذر مستودع Git (.git / .github) بجانب المجلد لتتم المزامنة التلقائية معه.
+    """
+    env_v = (os.environ.get("FB_VAULT_FILE") or "").strip()
+    if env_v:
+        return Path(env_v).expanduser().resolve()
+
+    parent_up = BASE_DIR.parent       # HUGGINGFACE_UPLOAD أو جذر المشروع
+    repo_root = parent_up.parent      # جذر مستودع GitHub (بجانب HUGGINGFACE_UPLOAD)
+    cwd = Path.cwd().resolve()
+
+    candidates: list[Path] = []
+    for raw_c in (
+        repo_root / EXTERNAL_VAULT_FILENAME,
+        cwd / EXTERNAL_VAULT_FILENAME,
+        parent_up / EXTERNAL_VAULT_FILENAME,
+    ):
+        try:
+            rc = raw_c.resolve()
+        except Exception:
+            rc = raw_c
+        if rc not in candidates:
+            candidates.append(rc)
+
+    for cand in candidates:
+        if cand.exists() and cand.is_file():
+            return cand
+
+    is_gh_actions = os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
+    for root_dir in (repo_root, cwd, parent_up):
+        try:
+            r = root_dir.resolve()
+            if r != BASE_DIR.resolve() and ((r / ".git").exists() or (is_gh_actions and (r / ".github").exists())):
+                return (r / EXTERNAL_VAULT_FILENAME).resolve()
+        except Exception:
+            pass
+    return None
+
+
+EXTERNAL_VAULT_FILE = resolve_external_vault_file()
 
 # إعدادات التخفي وفترات الانتظار البشري (بالثواني)
 DEFAULT_MIN_DELAY = 2.5

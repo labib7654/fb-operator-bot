@@ -138,61 +138,88 @@ def _atomic_write_json(path: Path, data) -> None:
     os.replace(tmp_path, path)
 
 
-def _run_git_sync() -> None:
-    """تنفيذ مزامنة Git الآمنة لملفات الحالة والجلسات فقط بدون تضارب خيوط"""
+_last_git_sync_ts = 0.0
+
+
+def _resolve_active_vault_target() -> Path | None:
+    vp = getattr(_cfg, "EXTERNAL_VAULT_FILE", None)
+    if vp:
+        return Path(vp)
+    fn = getattr(_cfg, "resolve_external_vault_file", None)
+    return fn() if callable(fn) else None
+
+
+def _run_git_sync(force: bool = False) -> None:
+    """تنفيذ مزامنة Git الآمنة للملف الخارجي المعزول (fb_operator_vault.json) فقط خارج مجلد الأكواد"""
+    global _last_git_sync_ts
     with _git_lock:
         try:
-            cwd = str(BASE_OPERATOR_DIR)
-            # التحقق أولاً من وجود مستودع git صالح
+            now = time.time()
+            if not force and (now - _last_git_sync_ts) < 15.0:
+                return
+            vault_path = _resolve_active_vault_target()
+            if not vault_path or not vault_path.exists():
+                return
+
+            cwd = str(vault_path.parent)
             chk = subprocess.run(
-                ["git", "rev-parse", "--is-inside-work-tree"],
-                cwd=cwd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                ["git", "rev-parse", "--show-toplevel"],
+                cwd=cwd, check=False, capture_output=True, text=True, timeout=5
             )
-            if chk.returncode != 0:
+            if chk.returncode != 0 or not (chk.stdout or "").strip():
+                return
+            repo_top = Path(chk.stdout.strip()).resolve()
+            rel_vault = str(vault_path.resolve().relative_to(repo_top)).replace("\\", "/")
+
+            # التحقق من وجود remote فعلي قبل محاولة الدفع
+            rem = subprocess.run(
+                ["git", "remote", "get-url", "origin"],
+                cwd=str(repo_top), check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5
+            )
+            if rem.returncode != 0:
                 return
 
-            subprocess.run(["git", "config", "user.name", "github-actions[bot]"], cwd=cwd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.run(["git", "config", "user.email", "github-actions[bot]@users.noreply.github.com"], cwd=cwd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["git", "config", "user.name", "github-actions[bot]"], cwd=str(repo_top), check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            subprocess.run(["git", "config", "user.email", "github-actions[bot]@users.noreply.github.com"], cwd=str(repo_top), check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
 
-            targets = [
-                name for name in (
-                    "accounts.json",
-                    "users.json",
-                    "audit_logs.json",
-                    "economy_settings.json",
-                    "points_ledger.json",
-                    "invite_codes.json",
-                    "support_tickets.json",
-                    "profiles",
-                )
-                if (BASE_OPERATOR_DIR / name).exists()
-            ]
-            if not targets:
-                return
-
-            subprocess.run(["git", "add", "--"] + targets, cwd=cwd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            # الالتزام فقط إن كان هناك تغييرات مرحّلة
-            diff_chk = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=cwd, check=False)
+            subprocess.run(["git", "add", "--", rel_vault], cwd=str(repo_top), check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+            diff_chk = subprocess.run(["git", "diff", "--cached", "--quiet", "--", rel_vault], cwd=str(repo_top), check=False, timeout=5)
             if diff_chk.returncode == 0:
                 return
 
-            subprocess.run(["git", "commit", "-m", "Auto-sync accounts, permissions, and audit logs [skip ci]"], cwd=cwd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.run(["git", "push"], cwd=cwd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(
+                ["git", "commit", "-m", f"Auto-sync {rel_vault} [skip ci]", "--", rel_vault],
+                cwd=str(repo_top), check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10
+            )
+            subprocess.run(
+                ["git", "pull", "--rebase", "--autostash"],
+                cwd=str(repo_top), check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20
+            )
+            subprocess.run(
+                ["git", "push"],
+                cwd=str(repo_top), check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=25
+            )
+            _last_git_sync_ts = time.time()
         except Exception:
             pass
 
 
+def sync_external_vault_git(force: bool = False) -> None:
+    """تزامن ملف الخزنة الخارجي مع مستودع GitHub دون لمس مجلد الأكواد"""
+    _run_git_sync(force=force)
+
+
 def git_sync_save(async_mode: bool = True) -> None:
-    """مزامنة وحفظ التغييرات تلقائياً في مستودع GitHub وطبقة النسخ السحابي لتبقى الجلسات والصلاحيات دائمة"""
+    """مزامنة وحفظ التغييرات تلقائياً في الملف الخارجي بجانب المجلد وفي السحابة"""
     try:
         from fb_operator.persistence_manager import notify_data_changed
         notify_data_changed("mutation")
     except Exception:
         pass
     if async_mode:
-        threading.Thread(target=_run_git_sync, daemon=True).start()
+        threading.Thread(target=_run_git_sync, kwargs={"force": False}, daemon=True).start()
     else:
-        _run_git_sync()
+        _run_git_sync(force=True)
 
 
 def load_accounts() -> list[dict]:

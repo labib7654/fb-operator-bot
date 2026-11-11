@@ -6,6 +6,7 @@
 
 import os
 import re
+import sys
 import json
 import time
 import random
@@ -17,6 +18,18 @@ from fb_operator.config import DEFAULT_MIN_DELAY, DEFAULT_MAX_DELAY, PROFILES_DI
 _LOGIN_ERROR_LOCK = threading.Lock()
 _LOGIN_ERRORS: dict[int, str] = {}
 _CTX_PROFILES: dict[int, Path] = {}
+
+_PROFILE_LOCKS_GUARD = threading.Lock()
+_PROFILE_LOCKS: dict[str, threading.RLock] = {}
+
+
+def get_profile_lock(account_id: str) -> threading.RLock:
+    """إرجاع قفل مشترك موحّد لكل حساب لمنع تعارض Chromium بين مهام البوت وواجهة التدخل البشري"""
+    key = str(account_id or "").strip() or "_default"
+    with _PROFILE_LOCKS_GUARD:
+        if key not in _PROFILE_LOCKS:
+            _PROFILE_LOCKS[key] = threading.RLock()
+        return _PROFILE_LOCKS[key]
 
 
 def _get_profiles_dir() -> Path:
@@ -120,7 +133,7 @@ def save_account_storage_state(context: BrowserContext, profile_dir_or_id: str |
 
 
 def restore_account_storage_state(context: BrowserContext, profile_dir_or_id: str | Path) -> bool:
-    """استعادة الجلسة المحفوظة (storage_state) إلى المتصفح قبل التوجه إلى فيسبوك"""
+    """استعادة الجلسة المحفوظة (cookies + localStorage origins) إلى المتصفح قبل التوجه إلى فيسبوك"""
     session_file = _resolve_session_file(profile_dir_or_id)
     if not session_file.exists():
         return False
@@ -151,82 +164,264 @@ def restore_account_storage_state(context: BrowserContext, profile_dir_or_id: st
         if not valid_cookies:
             return False
         context.add_cookies(valid_cookies)
+
+        # استعادة localStorage لجميع النطاقات المسجلة بالجلسة لتفادي ظهور "جهاز جديد" في فيسبوك
+        origins = data.get("origins", []) if isinstance(data, dict) else []
+        origin_map: dict[str, dict[str, str]] = {}
+        for orig in origins:
+            if not isinstance(orig, dict):
+                continue
+            o_url = str(orig.get("origin") or "").strip()
+            ls_list = orig.get("localStorage", [])
+            if not o_url or not isinstance(ls_list, list):
+                continue
+            kv_pairs = {}
+            for kv in ls_list:
+                if isinstance(kv, dict) and kv.get("name") is not None and kv.get("value") is not None:
+                    kv_pairs[str(kv["name"])] = str(kv["value"])
+            if kv_pairs:
+                origin_map[o_url] = kv_pairs
+
+        if origin_map:
+            init_js = (
+                "(() => {"
+                f"const _m = {json.dumps(origin_map, ensure_ascii=False)};"
+                "const items = _m[window.location.origin];"
+                "if (!items) return;"
+                "for (const [k, v] of Object.entries(items)) {"
+                "  try { if (!window.localStorage.getItem(k)) window.localStorage.setItem(k, v); } catch (e) {}"
+                "}"
+                "})();"
+            )
+            try:
+                context.add_init_script(init_js)
+            except Exception:
+                pass
         return True
     except Exception:
         return False
 
 
-def _detect_arkose_captcha(page: Page) -> str:
-    """الكشف السلبي عن تحدي Arkose MatchKey أو تحقق الإنسان للتوقف الآمن دون التفاعل معه"""
+def diagnose_facebook_challenge(page: Page) -> dict:
+    """
+    تشخيص دقيق لحالة الصفحة الحية في فيسبوك لتصنيف العائق بدقة تامة:
+    (reCAPTCHA، Arkose، رمز 2FA/OTP، موافقة جهاز، فحص هوية، حساب معطل، نموذج كلمة مرور فقط، أو دخول كامل).
+    تنبيه صارم: لا يتفاعل تلقائياً مع أي CAPTCHA مطلقاً — للتصنيف وإشعار المستخدم/الشاشة الحية فقط.
+    """
     curr_url = (getattr(page, "url", "") or "").lower()
-    if any(k in curr_url for k in ("arkoselabs", "funcaptcha", "/challenge")):
-        return "لغز تحقق من الإنسان Arkose Labs CAPTCHA — يتطلب استيراد جلسة صالحة من متصفحك"
+
+    # قراءة آمنة لنصوص الصفحة وإطاراتها
+    snippet = ""
+    has_recaptcha_dom = False
+    has_arkose_dom = False
+    has_otp_input = False
+    has_email_input = False
+    has_pass_input = False
     try:
-        iframe_loc = page.locator('iframe[src*="arkose"], iframe[src*="funcaptcha"], iframe[src*="captcha"]')
-        if iframe_loc.count() > 0:
-            return "لغز تحقق من الإنسان Arkose Labs CAPTCHA — يتطلب استيراد جلسة صالحة من متصفحك"
+        dom_info = page.evaluate(
+            """() => {
+                const txt = (document.body && document.body.innerText ? document.body.innerText.slice(0, 2600) : '');
+                const iframes = Array.from(document.querySelectorAll('iframe')).map(f => (f.src || '') + ' ' + (f.title || '')).join(' ');
+                const rec = !!document.querySelector('.g-recaptcha, [data-sitekey], iframe[src*="recaptcha"], #recaptcha');
+                const ark = !!document.querySelector('iframe[src*="arkose"], iframe[src*="funcaptcha"]');
+                const otp = !!document.querySelector('input[name="approvals_code"], input#approvals_code, input[autocomplete="one-time-code"]');
+                const em = Array.from(document.querySelectorAll('input[name="email"], input#email')).some(el => el.offsetParent !== null);
+                const pw = Array.from(document.querySelectorAll('input[name="pass"], input#pass, input[type="password"]')).some(el => el.offsetParent !== null);
+                return { txt: txt + ' ' + iframes, rec, ark, otp, em, pw };
+            }"""
+        )
+        if isinstance(dom_info, dict):
+            snippet = str(dom_info.get("txt") or "").lower()
+            has_recaptcha_dom = bool(dom_info.get("rec"))
+            has_arkose_dom = bool(dom_info.get("ark"))
+            has_otp_input = bool(dom_info.get("otp"))
+            has_email_input = bool(dom_info.get("em"))
+            has_pass_input = bool(dom_info.get("pw"))
+        elif isinstance(dom_info, str):
+            snippet = dom_info.lower()
     except Exception:
         pass
-    try:
-        snippet = page.evaluate("() => (document.body && document.body.innerText ? document.body.innerText.slice(0, 1800) : '')")
-        if isinstance(snippet, str) and snippet:
-            low = snippet.lower()
-            if any(k in low for k in (
-                "arkose labs",
-                "matchkey",
-                "أكمل تحدي",
-                "تحقق من أنك إنسان",
-                "verify that you're human",
-                "complete a challenge",
-                "confirm you're human",
-                "solve a puzzle",
-            )):
-                return "لغز تحقق من الإنسان Arkose Labs CAPTCHA — يتطلب استيراد جلسة صالحة من متصفحك"
-    except Exception:
-        pass
+
+    # Fallback سريع عبر locators إن تعذر evaluate أو في حال اختلفت صيغة الإرجاع
+    if not snippet:
+        try:
+            raw_txt = page.evaluate("() => (document.body && document.body.innerText) ? document.body.innerText.slice(0, 2600) : ''")
+            if isinstance(raw_txt, str):
+                snippet = raw_txt.lower()
+        except Exception:
+            pass
+    if not has_arkose_dom:
+        try:
+            if page.locator('iframe[src*="arkose"], iframe[src*="funcaptcha"]').count() > 0:
+                has_arkose_dom = True
+        except Exception:
+            pass
+    if not has_recaptcha_dom:
+        try:
+            if page.locator('iframe[src*="recaptcha"], .g-recaptcha, [data-sitekey]').count() > 0:
+                has_recaptcha_dom = True
+        except Exception:
+            pass
+    if not has_email_input:
+        try:
+            if page.locator('input[name="email"], input#email').first.is_visible(timeout=200):
+                has_email_input = True
+        except Exception:
+            pass
+    if not has_pass_input:
+        try:
+            if page.locator('input[name="pass"], input#pass, input[type="password"]').first.is_visible(timeout=200):
+                has_pass_input = True
+        except Exception:
+            pass
+
+    if (
+        has_recaptcha_dom
+        or "recaptcha" in curr_url
+        or any(k in snippet for k in (
+            "أنا لست برنامج روبوت", "لست برنامج روبوت", "i'm not a robot", "i am not a robot",
+            "recaptcha", "تأكيد أنك لست روبوت", "اختر كل المربعات"
+        ))
+    ):
+        return {
+            "code": "recaptcha",
+            "is_ok": False,
+            "is_challenge": True,
+            "can_otp": False,
+            "can_hitl": True,
+            "message": "يطلب تحقق أمان (أنا لست برنامج روبوت - reCAPTCHA) — افتح الشاشة الحية لإكماله بنفسك",
+        }
+
+    if (
+        has_arkose_dom
+        or any(k in curr_url for k in ("arkoselabs", "funcaptcha", "/challenge"))
+        or any(k in snippet for k in (
+            "arkose labs", "matchkey", "أكمل تحدي", "تحقق من أنك إنسان",
+            "verify that you're human", "complete a challenge", "confirm you're human", "solve a puzzle"
+        ))
+    ):
+        return {
+            "code": "arkose",
+            "is_ok": False,
+            "is_challenge": True,
+            "can_otp": False,
+            "can_hitl": True,
+            "message": "لغز تحقق من الإنسان (Arkose Labs CAPTCHA) — افتح الشاشة الحية لإكماله بنفسك",
+        }
+
+    if any(x in curr_url for x in ("suspended", "disabled", "/account_status")) or any(
+        k in snippet for k in ("تم تعليق حسابك", "your account has been suspended", "تم تعطيل حسابك", "account has been disabled")
+    ):
+        return {
+            "code": "suspended",
+            "is_ok": False,
+            "is_challenge": False,
+            "can_otp": False,
+            "can_hitl": True,
+            "message": "الحساب معطل أو موقوف من إدارة فيسبوك",
+        }
+
+    if any(k in snippet for k in (
+        "كلمة السر التي أدخلتها غير صحيحة", "the password you've entered is incorrect",
+        "wrong credentials", "invalid username or password", "البريد الإلكتروني أو كلمة المرور غير صحيحة"
+    )):
+        return {
+            "code": "wrong_password",
+            "is_ok": False,
+            "is_challenge": False,
+            "can_otp": False,
+            "can_hitl": True,
+            "message": "البريد الإلكتروني أو كلمة المرور غير صحيحة",
+        }
+
+    if has_otp_input or (
+        ("two_step_verification" in curr_url or "checkpoint" in curr_url)
+        and any(k in snippet for k in (
+            "أدخل الرمز", "enter code", "login code", "authentication app", "رمز الأمان",
+            "المصادقة الثنائية", "تطبيق المصادقة", "sms", "6-digit", "أرقام"
+        ))
+    ):
+        return {
+            "code": "2fa_otp",
+            "is_ok": False,
+            "is_challenge": True,
+            "can_otp": True,
+            "can_hitl": True,
+            "message": "الحساب يطلب رمز أمان 2FA / OTP — أرسل الرمز عبر البوت أو افتح الشاشة الحية",
+        }
+
+    if any(k in snippet for k in (
+        "تحقق من إشعاراتك", "check your notifications", "approve", "جهاز آخر", "تم إرسال إشعار"
+    )) and ("checkpoint" in curr_url or "two_step_verification" in curr_url or "approv" in curr_url):
+        return {
+            "code": "device_approval",
+            "is_ok": False,
+            "is_challenge": True,
+            "can_otp": False,
+            "can_hitl": True,
+            "message": "ينتظر الموافقة من جهاز آخر مسجل (أو افتح الشاشة الحية لاختيار طريقة أخرى)",
+        }
+
+    if any(x in curr_url for x in ("checkpoint", "two_step_verification", "/recover/")):
+        return {
+            "code": "identity_check",
+            "is_ok": False,
+            "is_challenge": True,
+            "can_otp": True,
+            "can_hitl": True,
+            "message": "الحساب يطلب فحص أمان وهوية (Checkpoint) — افتح الشاشة الحية لمعاينة خطوات فيسبوك",
+        }
+
+    if has_pass_input and not has_email_input:
+        return {
+            "code": "password_only",
+            "is_ok": False,
+            "is_challenge": False,
+            "can_otp": False,
+            "can_hitl": True,
+            "message": "جلسة محفوظة تطلب إعادة إدخال كلمة المرور",
+        }
+
+    if any(x in curr_url for x in ("login.php", "/login/", "login/?next=")) or (has_email_input and has_pass_input):
+        return {
+            "code": "full_login",
+            "is_ok": False,
+            "is_challenge": False,
+            "can_otp": False,
+            "can_hitl": True,
+            "message": "انتهت صلاحية الجلسة والحساب غير مسجل — يطلب تسجيل الدخول",
+        }
+
+    if any(k in snippet for k in (
+        "هذا المحتوى غير متوفر", "content isn't available",
+        "page isn't available", "الصفحة غير متوفرة", "broken link"
+    )):
+        return {
+            "code": "content_unavailable",
+            "is_ok": False,
+            "is_challenge": False,
+            "can_otp": False,
+            "can_hitl": False,
+            "message": "الرابط أو المحتوى المستهدف غير متاح أو خاص أو محذوف",
+        }
+
+    return {"code": "ok", "is_ok": True, "is_challenge": False, "can_otp": False, "can_hitl": False, "message": ""}
+
+
+def _detect_arkose_captcha(page: Page) -> str:
+    """الكشف السلبي عن تحدي التحقق البشري للتوقف الآمن دون التفاعل معه تلقائياً"""
+    d = diagnose_facebook_challenge(page)
+    if d.get("code") in ("arkose", "recaptcha"):
+        return d["message"]
     return ""
 
 
 def check_facebook_page_access(page: Page) -> tuple[bool, str]:
     """
-    فحص حالة الصفحة الحية في فيسبوك لاكتشاف الحجب أو انتهاء الجلسة أو تحدي CAPTCHA أو عدم توفر المحتوى فوراً
-    بدلاً من إهدار الوقت في البحث عن أزرار غير موجودة.
+    فحص حالة الصفحة الحية في فيسبوك لاكتشاف الحجب أو انتهاء الجلسة أو تحدي reCAPTCHA/Arkose أو عدم توفر المحتوى فوراً.
     """
-    arkose_msg = _detect_arkose_captcha(page)
-    if arkose_msg:
-        return False, arkose_msg
-
-    curr_url = (getattr(page, "url", "") or "").lower()
-    if any(x in curr_url for x in ("checkpoint", "two_step_verification", "/recover/")):
-        return False, "الحساب يطلب تحقق أمان (Checkpoint / 2FA)"
-    if any(x in curr_url for x in ("suspended", "disabled", "/account_status")):
-        return False, "الحساب مقيد أو معطل من فيسبوك"
-    if any(x in curr_url for x in ("login.php", "/login/", "login/?next=")):
-        return False, "انتهت صلاحية الجلسة والحساب غير مسجل دخوله"
-
-    try:
-        has_email = page.locator('input[name="email"]').first.is_visible(timeout=350)
-        has_pass = page.locator('input[name="pass"]').first.is_visible(timeout=350)
-        if has_email and has_pass:
-            return False, "ظهرت صفحة تسجيل الدخول (الجلسة غير نشطة)"
-    except Exception:
-        pass
-
-    try:
-        snippet = page.evaluate("() => (document.body && document.body.innerText ? document.body.innerText.slice(0, 1500) : '')")
-        if isinstance(snippet, str) and snippet:
-            low = snippet.lower()
-            if any(k in low for k in (
-                "هذا المحتوى غير متوفر", "content isn't available",
-                "page isn't available", "الصفحة غير متوفرة", "broken link"
-            )):
-                return False, "الرابط أو المحتوى المستهدف غير متاح أو خاص أو محذوف"
-            if any(k in low for k in ("تم تعليق حسابك", "your account has been suspended", "تم تعطيل حسابك", "account has been disabled")):
-                return False, "الحساب معطل أو موقوف من إدارة فيسبوك"
-    except Exception:
-        pass
-
-    return True, ""
+    d = diagnose_facebook_challenge(page)
+    return bool(d.get("is_ok")), str(d.get("message") or "")
 
 def human_delay(min_seconds: float = DEFAULT_MIN_DELAY, max_seconds: float = DEFAULT_MAX_DELAY) -> None:
     """توقف عشوائي لمحاكاة التردد البشري وتجنب كشف الروبوتات"""
@@ -248,21 +443,23 @@ def check_facebook_login_cookies(context: BrowserContext) -> tuple[bool, str]:
         pass
     return False, ""
 
-def launch_account_browser(playwright_instance, profile_dir: str | Path, visible: bool = True) -> BrowserContext:
+def launch_account_browser(
+    playwright_instance,
+    profile_dir: str | Path,
+    visible: bool = True,
+    viewport_size: tuple[int, int] = (1920, 1080),
+) -> BrowserContext:
     """
-    تشغيل متصفح جوجل كروم الحقيقي ببروفايل مستمر للحساب.
-    إذا كان النظام يحتوي على شاشة عرض افتراضية (Xvfb في السيرفر أو شاشة محلية)،
-    يتم تشغيل المتصفح بوضع Headless=False ليعمل تماماً كأنه حاسوب مكتبي حقيقي.
+    تشغيل متصفح جوجل كروم الحقيقي ببروفايل مستمر للحساب مع اتساق كامل للبصمة
+    (عدم تزوير Windows UA فوق خادم Linux لتفادي إطلاق فحص الروبوت reCAPTCHA من Meta).
     """
     profile_path = resolve_cross_platform_profile(profile_dir)
     profile_path.mkdir(parents=True, exist_ok=True)
     _cleanup_stale_profile_locks(profile_path)
 
-    # التحقق من وجود شاشة عرض افتراضية (Xvfb أو خادم X11)
     has_display = bool(os.environ.get("DISPLAY"))
-    
-    # إذا كانت هناك شاشة عرض متاحة (مثل سيرفر جيت هب مع Xvfb)، نلغي وضع الهيدلس ليعمل المتصفح كسطح مكتب حقيقي
     use_headless = not visible and not has_display
+    vw, vh = int(viewport_size[0]), int(viewport_size[1])
 
     args = [
         "--no-first-run",
@@ -274,8 +471,7 @@ def launch_account_browser(playwright_instance, profile_dir: str | Path, visible
         "--disable-single-click-autofill",
         "--disable-autofill-keyboard-accessory-view",
         "--disable-infobars",
-        "--start-maximized",
-        "--window-size=1920,1080",
+        f"--window-size={vw},{vh}",
         "--disable-notifications",
         "--no-sandbox",
         "--disable-setuid-sandbox",
@@ -283,109 +479,89 @@ def launch_account_browser(playwright_instance, profile_dir: str | Path, visible
         "--lang=ar-EG,ar,en-US,en"
     ]
 
-    real_user_agent = (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/131.0.0.0 Safari/537.36"
-    )
-
     launch_kwargs = {
         "user_data_dir": str(profile_path),
         "headless": use_headless,
         "args": args,
-        "viewport": {"width": 1920, "height": 1080},
-        "screen": {"width": 1920, "height": 1080},
+        "viewport": {"width": vw, "height": vh},
+        "screen": {"width": vw, "height": vh},
         "device_scale_factor": 1,
-        "user_agent": real_user_agent,
-        "locale": "ar-EG"
+        "locale": "ar-EG",
+        "timezone_id": "Asia/Riyadh",
     }
 
     try:
-        # محاولة فتح القناة الرسمية لمتصفح كروم المثبت بالنظام
         context = playwright_instance.chromium.launch_persistent_context(
             channel="chrome", **launch_kwargs
         )
     except Exception:
-        # في حال عدم توفر قناة كروم، استخدام كروميوم مع كامل الخصائص
         context = playwright_instance.chromium.launch_persistent_context(**launch_kwargs)
 
-    # حقن سكريبت التخفي المتقدم المضاد لكشف الروبوتات وفلاتر فيسبوك (Stealth Shield)
-    stealth_script = """
-        // 1. مسح مؤشر الأتمتة navigator.webdriver
-        Object.defineProperty(navigator, 'webdriver', {
+    is_linux = sys.platform.startswith("linux")
+    webgl_vendor = "Intel Open Source Technology Center" if is_linux else "Intel Inc."
+    webgl_renderer = (
+        "Mesa DRI Intel(R) UHD Graphics 630 (CFL GT2)"
+        if is_linux
+        else "ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)"
+    )
+
+    stealth_script = f"""
+        // 1. إزالة مؤشر الأتمتة webdriver بدون تعارض مع نظام التشغيل الفعلي
+        Object.defineProperty(navigator, 'webdriver', {{
             get: () => undefined
-        });
+        }});
 
-        // 2. محاكاة كائن نافذة كروم الطبيعية window.chrome
-        window.chrome = {
-            app: {
-                isInstalled: false,
-                InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' },
-                RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' }
-            },
-            runtime: {
-                OnInstalledReason: { CHROME_UPDATE: 'chrome_update', INSTALL: 'install', SHARED_MODULE_UPDATE: 'shared_module_update', UPDATE: 'update' },
-                OnRestartRequiredReason: { APP_UPDATE: 'app_update', OS_UPDATE: 'os_update', PERIODIC: 'periodic' },
-                PlatformArch: { ARM: 'arm', ARM64: 'arm64', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' },
-                PlatformNaclArch: { ARM: 'arm', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' },
-                PlatformOs: { ANDROID: 'android', CROS: 'cros', LINUX: 'linux', MAC: 'mac', OPENBSD: 'openbsd', WIN: 'win' }
-            },
-            csi: function() {},
-            loadTimes: function() {}
-        };
-
-        // 3. محاكاة مكونات إضافات المتصفح Plugins الطبيعية
-        Object.defineProperty(navigator, 'plugins', {
-            get: () => {
-                const plugins = [
-                    { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-                    { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
-                    { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' }
-                ];
-                plugins.item = (i) => plugins[i];
-                plugins.namedItem = (name) => plugins.find(p => p.name === name);
-                plugins.refresh = () => {};
-                return plugins;
-            }
-        });
-
-        // 4. محاكاة كارت الشاشة الطبيعي (Intel UHD Graphics) بدلاً من SwiftShader الخاص بالبوتات
+        // 2. توحيد WebGL بما ينسجم طبيعياً مع نظام التشغيل الفعلي ({'Linux' if is_linux else 'Windows'})
+        const _v = {json.dumps(webgl_vendor)};
+        const _r = {json.dumps(webgl_renderer)};
         const getParameterProto = WebGLRenderingContext.prototype.getParameter;
-        WebGLRenderingContext.prototype.getParameter = function(param) {
-            if (param === 37445) return 'Intel Inc.'; // UNMASKED_VENDOR_WEBGL
-            if (param === 37446) return 'ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)'; // UNMASKED_RENDERER_WEBGL
+        WebGLRenderingContext.prototype.getParameter = function(param) {{
+            if (param === 37445) return _v;
+            if (param === 37446) return _r;
             return getParameterProto.apply(this, arguments);
-        };
-        if (typeof WebGL2RenderingContext !== 'undefined') {
+        }};
+        if (typeof WebGL2RenderingContext !== 'undefined') {{
             const getParameterProto2 = WebGL2RenderingContext.prototype.getParameter;
-            WebGL2RenderingContext.prototype.getParameter = function(param) {
-                if (param === 37445) return 'Intel Inc.';
-                if (param === 37446) return 'ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)';
+            WebGL2RenderingContext.prototype.getParameter = function(param) {{
+                if (param === 37445) return _v;
+                if (param === 37446) return _r;
                 return getParameterProto2.apply(this, arguments);
-            };
-        }
+            }};
+        }}
 
-        // 5. محاكاة اللغات والإشعارات
-        Object.defineProperty(navigator, 'languages', {
+        // 3. تناسق اللغات وتعطيل نوافذ مدير كلمات المرور
+        Object.defineProperty(navigator, 'languages', {{
             get: () => ['ar-EG', 'ar', 'en-US', 'en']
-        });
+        }});
 
-        if (navigator.credentials) {
+        if (navigator.credentials) {{
             navigator.credentials.get = () => Promise.resolve(null);
             navigator.credentials.store = () => Promise.resolve();
             navigator.credentials.create = () => Promise.resolve(null);
             navigator.credentials.preventSilentAccess = () => Promise.resolve();
-        }
+        }}
     """
     context.add_init_script(stealth_script)
     _CTX_PROFILES[id(context)] = profile_path
     restore_account_storage_state(context, profile_path)
     return context
 
+
+def _warmup_human_presence(page: Page) -> None:
+    """تمهيد حركي بشري خفيف قبل إدخال البيانات لتجنب السلوك الآلي الجامد"""
+    try:
+        vw = (page.viewport_size or {}).get("width", 1280)
+        vh = (page.viewport_size or {}).get("height", 800)
+        page.mouse.move(random.uniform(vw * 0.25, vw * 0.65), random.uniform(vh * 0.2, vh * 0.55), steps=random.randint(8, 15))
+        time.sleep(random.uniform(0.35, 0.75))
+    except Exception:
+        pass
+
+
 def auto_login_facebook(context: BrowserContext, page: Page, email: str, password: str, status_callback=None, max_wait: int = 90) -> bool:
     """
-    تسجيل الدخول التلقائي في فيسبوك باستخدام الإيميل وكلمة السر المحفوظين
-    مع كتابة بشرية والتعامل مع رمز التحقق (2FA) وتثبيت الجلسة
+    تسجيل الدخول وإعادة الدخول التلقائي في فيسبوك بمحاكاة بشرية متدرجة،
+    مع دعم نماذج (البريد + كلمة المرور) أو (إعادة إدخال كلمة المرور للحساب المحفوظ) أو (المتابعة بحساب مسجل).
     """
     def log(msg: str):
         if status_callback:
@@ -393,32 +569,34 @@ def auto_login_facebook(context: BrowserContext, page: Page, email: str, passwor
         print(f"[Login] {msg}")
 
     set_login_error(context, "")
+    clean_email = str(email or "").strip()
+    clean_pass = "" if str(password or "").strip() == "[SESSION_COOKIES]" else str(password or "")
 
-    # 1. التحقق الحي من الجلسة (عدم الاكتفاء بوجود كوكي c_user لتجنب الكوكيز المنتهية)
-    is_logged, fb_id = check_facebook_login_cookies(context)
+    # 1. التحقق الحي من الجلسة الحالية
+    is_logged, _ = check_facebook_login_cookies(context)
     if is_logged:
         curr_now = (getattr(page, "url", "") or "").lower()
         if "facebook.com" not in curr_now:
             try:
                 page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=35000)
-                time.sleep(1.5)
+                time.sleep(random.uniform(1.2, 2.0))
                 dismiss_dialogs(page)
             except Exception as e:
                 log(f"تنبيه شبكة أثناء التحقق من الجلسة: {e}")
 
-        ok_live, live_reason = check_facebook_page_access(page)
+        diag = diagnose_facebook_challenge(page)
         is_still_logged, _ = check_facebook_login_cookies(context)
-        if is_still_logged and ok_live:
+        if is_still_logged and diag["is_ok"]:
             save_account_storage_state(context)
             log("تم التحقق من الجلسة الحية: الحساب نشط ومسجل دخوله بنجاح.")
             return True
 
-        if any(tag in live_reason for tag in ("Checkpoint", "2FA", "معطل", "مقيد", "Arkose", "CAPTCHA")):
-            set_login_error(context, live_reason)
-            log(f"[-] {live_reason}")
+        if diag["code"] in ("recaptcha", "arkose", "suspended", "2fa_otp", "device_approval", "identity_check"):
+            set_login_error(context, diag["message"])
+            log(f"[-] {diag['message']}")
             return False
 
-        log(f"تنبيه: الجلسة المحفوظة منتهية ({live_reason or 'يتطلب دخول'})، جاري محاولة إعادة الدخول...")
+        log(f"تنبيه: الجلسة المحفوظة منتهية ({diag['message'] or 'يتطلب إعادة دخول'})، جاري محاولة إعادة الدخول التلقائية...")
 
     log("جاري التوجه إلى موقع فيسبوك...")
     try:
@@ -426,90 +604,135 @@ def auto_login_facebook(context: BrowserContext, page: Page, email: str, passwor
     except Exception as e:
         log(f"تنبيه بالشبكة أثناء الفتح: {e}")
 
-    time.sleep(2.0)
+    time.sleep(random.uniform(1.8, 2.8))
     dismiss_dialogs(page)
 
-    # فحص مجدداً بعد فتح الصفحة
-    ok_after, after_reason = check_facebook_page_access(page)
-    is_logged, fb_id = check_facebook_login_cookies(context)
-    if is_logged and ok_after:
+    diag_after = diagnose_facebook_challenge(page)
+    is_logged, _ = check_facebook_login_cookies(context)
+    if is_logged and diag_after["is_ok"]:
         save_account_storage_state(context)
         log("تم التحقق من الجلسة، الحساب مسجل دخوله بالفعل.")
         return True
 
-    if any(tag in after_reason for tag in ("Arkose", "CAPTCHA", "معطل", "مقيد")):
-        set_login_error(context, after_reason)
-        log(f"[-] {after_reason}")
+    if diag_after["code"] in ("recaptcha", "arkose", "suspended", "2fa_otp", "device_approval", "identity_check"):
+        set_login_error(context, diag_after["message"])
+        log(f"[-] {diag_after['message']}")
         return False
 
-    if not email or not password:
-        reason = after_reason or "لا توجد بيانات دخول محفوظة والجلسة غير نشطة"
+    if not clean_pass:
+        reason = diag_after["message"] or "انتهت جلسة الكوكيز ولا توجد كلمة مرور محفوظة لإعادة الدخول"
         set_login_error(context, reason)
         log(f"تنبيه: {reason}")
         return False
 
-    # 2. تعبئة الإيميل وكلمة السر بمحاكاة نقرات الكيبورد والأحداث الحقيقية
+    # دعم بطاقة "المتابعة باسم ..." في حال ظهورها قبل النموذج
     try:
-        log("كتابة البريد الإلكتروني...")
+        for cont_sel in (
+            'div[role="button"]:has-text("متابعة")',
+            'button:has-text("متابعة")',
+            'div[role="button"]:has-text("Continue")',
+            'button:has-text("Continue")',
+        ):
+            cloc = page.locator(cont_sel).first
+            if cloc.is_visible(timeout=450):
+                human_click(page, cloc, timeout=2500)
+                time.sleep(random.uniform(1.5, 2.5))
+                dismiss_dialogs(page)
+                d_cont = diagnose_facebook_challenge(page)
+                logged_now, _ = check_facebook_login_cookies(context)
+                if logged_now and d_cont["is_ok"]:
+                    save_account_storage_state(context)
+                    log("تم تسجيل الدخول عبر بطاقة المتابعة المحفوظة.")
+                    return True
+                break
+    except Exception:
+        pass
+
+    _warmup_human_presence(page)
+
+    # 2. تعبئة الحقول (نموذج كامل بالبريد + كلمة المرور، أو نموذج كلمة المرور فقط للحساب المحفوظ)
+    try:
         email_selectors = [
             'input[name="email"]',
             'input#email',
             'input[data-testid="royal_email"]',
             'input[aria-label*="البريد"]',
             'input[placeholder*="البريد"]',
-            'input[type="text"]',
-            'input[type="email"]'
+            'input[type="email"]',
         ]
-        email_input = None
-        for _ in range(12):
-            for sel in email_selectors:
-                loc = page.locator(sel).first
-                if loc.is_visible(timeout=1000):
-                    email_input = loc
-                    break
-            if email_input:
-                break
-            time.sleep(1.0)
-
-        if email_input:
-            email_input.click()
-            time.sleep(random.uniform(0.3, 0.7))
-            email_input.fill("")
-            time.sleep(0.2)
-            email_input.press_sequentially(email, delay=random.randint(65, 120))
-            time.sleep(random.uniform(0.6, 1.3))
-        else:
-            set_login_error(context, "تعذر العثور على حقل البريد الإلكتروني بصفحة الدخول")
-            log("[-] تعذر العثور على حقل إدخال البريد الإلكتروني بعد الانتظار.")
-            return False
-
-        log("كتابة كلمة المرور بمحاكاة بشرية...")
         pass_selectors = [
             'input[name="pass"]',
             'input#pass',
             'input[data-testid="royal_pass"]',
             'input[aria-label*="كلمة"]',
             'input[placeholder*="كلمة"]',
-            'input[type="password"]'
+            'input[type="password"]',
         ]
+
+        email_input = None
         pass_input = None
-        for _ in range(8):
+        for _ in range(10):
+            for sel in email_selectors:
+                loc = page.locator(sel).first
+                if loc.is_visible(timeout=500):
+                    email_input = loc
+                    break
             for sel in pass_selectors:
                 loc = page.locator(sel).first
-                if loc.is_visible(timeout=1000):
+                if loc.is_visible(timeout=500):
                     pass_input = loc
                     break
-            if pass_input:
+            if pass_input and (email_input or not clean_email or diag_after["code"] == "password_only"):
                 break
-            time.sleep(1.0)
+            if email_input and pass_input:
+                break
+            time.sleep(0.9)
+
+        # في حال ظهور صفحة اختيار حساب فقط بلا حقل بريد وكلمة سر، نبحث عن "استخدام حساب آخر"
+        if not pass_input and not email_input:
+            for other_sel in ('a:has-text("تسجيل الدخول إلى حساب آخر")', 'div[role="button"]:has-text("حساب آخر")', 'a:has-text("Log into another account")'):
+                try:
+                    oloc = page.locator(other_sel).first
+                    if oloc.is_visible(timeout=800):
+                        human_click(page, oloc, timeout=2500)
+                        time.sleep(1.5)
+                        break
+                except Exception:
+                    pass
+            for sel in email_selectors:
+                loc = page.locator(sel).first
+                if loc.is_visible(timeout=800):
+                    email_input = loc
+                    break
+            for sel in pass_selectors:
+                loc = page.locator(sel).first
+                if loc.is_visible(timeout=800):
+                    pass_input = loc
+                    break
+
+        if email_input and clean_email:
+            log("كتابة البريد الإلكتروني/الهاتف بمحاكاة بشرية...")
+            human_click(page, email_input, timeout=3000)
+            time.sleep(random.uniform(0.35, 0.75))
+            email_input.fill("")
+            time.sleep(random.uniform(0.15, 0.35))
+            email_input.press_sequentially(clean_email, delay=random.randint(60, 125))
+            time.sleep(random.uniform(0.65, 1.35))
+        elif not pass_input:
+            diag_miss = diagnose_facebook_challenge(page)
+            msg = diag_miss["message"] or "تعذر العثور على حقول تسجيل الدخول في الصفحة"
+            set_login_error(context, msg)
+            log(f"[-] {msg}")
+            return False
 
         if pass_input:
-            pass_input.click()
-            time.sleep(random.uniform(0.3, 0.6))
+            log("كتابة كلمة المرور بمحاكاة بشرية...")
+            human_click(page, pass_input, timeout=3000)
+            time.sleep(random.uniform(0.3, 0.7))
             pass_input.fill("")
-            time.sleep(0.2)
-            pass_input.press_sequentially(password, delay=random.randint(60, 115))
-            time.sleep(random.uniform(0.8, 1.6))
+            time.sleep(random.uniform(0.15, 0.3))
+            pass_input.press_sequentially(clean_pass, delay=random.randint(65, 120))
+            time.sleep(random.uniform(0.75, 1.45))
         else:
             set_login_error(context, "تعذر العثور على حقل كلمة المرور بصفحة الدخول")
             log("[-] تعذر العثور على حقل إدخال كلمة المرور.")
@@ -522,82 +745,73 @@ def auto_login_facebook(context: BrowserContext, page: Page, email: str, passwor
             'div[role="button"]:has-text("Log in")',
             'button[name="login"]',
             'button[type="submit"]',
-            'button:has-text("تسجيل الدخول")'
+            'button:has-text("تسجيل الدخول")',
         ]
 
         btn_clicked = False
         for sel in btn_selectors:
             loc = page.locator(sel).first
-            if loc.is_visible(timeout=2000):
-                loc.click()
-                btn_clicked = True
-                break
+            if loc.is_visible(timeout=1500):
+                btn_clicked = human_click(page, loc, timeout=3000)
+                if btn_clicked:
+                    break
 
         if not btn_clicked:
             page.keyboard.press("Enter")
 
     except Exception as e:
+        set_login_error(context, f"تعذر كتابة البيانات في حقول الدخول: {e}")
         log(f"تعذر كتابة البيانات في حقول الدخول: {e}")
         return False
 
-    # 3. مراقبة النتيجة حتى 90 ثانية (لكل السيناريوهات: دخول مباشر أو طلب 2FA)
+    # 3. مراقبة الاستجابة الفورية دون إضاعة وقت عند ظهور reCAPTCHA / 2FA / خطأ كلمة سر
     log("بانتظار استجابة فيسبوك وتثبيت الجلسة...")
     start_time = time.time()
     warned_2fa = False
 
     while time.time() - start_time < max_wait:
         if len(context.pages) == 0:
-            log("تم إغلاق المتصفح من قبل المستخدم.")
+            log("تم إغلاق المتصفح.")
             return False
 
-        # فحص نجاح الدخول عبر الكوكيز مع استبعاد صفحات التحقق أو التجميد
-        curr_url = (page.url or "").lower()
-        blocked_state = any(x in curr_url for x in ("checkpoint", "two_step_verification", "login.php", "suspended", "disabled"))
-        is_logged, fb_id = check_facebook_login_cookies(context)
-        if is_logged and not blocked_state:
-            time.sleep(3.0)  # مهلة لتثبيت الجلسة على القرص
+        diag = diagnose_facebook_challenge(page)
+        is_logged, _ = check_facebook_login_cookies(context)
+        if is_logged and diag["is_ok"]:
+            time.sleep(2.5)
             save_account_storage_state(context)
             log("تم تسجيل الدخول وتثبيت الجلسة الدائمة بنجاح!")
             return True
 
-        # التوقف الآمن الفوري إذا ظهر لغز Arkose CAPTCHA أو حساب موقوف
-        arkose_reason = _detect_arkose_captcha(page)
-        if arkose_reason:
-            set_login_error(context, arkose_reason)
-            log(f"[-] {arkose_reason}")
+        if diag["code"] in ("recaptcha", "arkose", "suspended", "wrong_password"):
+            set_login_error(context, diag["message"])
+            log(f"[-] {diag['message']}")
             return False
 
-        # فحص إذا ظهرت صفحة رمز التحقق 2FA
-        if ("checkpoint" in curr_url or "two_step_verification" in curr_url) and not warned_2fa:
-            log("تنبيه: فيسبوك يطلب رمز الأمان (2FA). يرجى إدخال الرمز في المتصفح الآن...")
-            warned_2fa = True
+        if diag["code"] in ("2fa_otp", "device_approval", "identity_check"):
+            if not warned_2fa:
+                log(f"تنبيه: {diag['message']}")
+                warned_2fa = True
+            # بعد مرور 6 ثوانٍ على شاشة التحقق في السحابة بدون حل، نتوقف فوراً ليتمكن المستخدم من حله عبر الشاشة الحية/OTP
+            if time.time() - start_time >= 6.0 and not visible_page_has_live_human(context):
+                set_login_error(context, diag["message"])
+                return False
 
-        # فحص إذا ظهرت رسالة خطأ صريحة في كلمة المرور
-        try:
-            error_msg = page.locator('#error_box, div[role="alert"]').first
-            if error_msg.is_visible(timeout=500):
-                txt = error_msg.inner_text()
-                if "incorrect" in txt.lower() or "غير صحيحة" in txt:
-                    set_login_error(context, "كلمة المرور أو البريد الإلكتروني غير صحيحين")
-                    log("تنبيه: كلمة المرور أو البريد الإلكتروني غير صحيحين!")
-                    return False
-        except Exception:
-            pass
+        time.sleep(1.3)
 
-        time.sleep(1.5)
-
-    # فحص أخير
-    curr_final = (page.url or "").lower()
-    blocked_final = any(x in curr_final for x in ("checkpoint", "two_step_verification", "login.php", "suspended", "disabled"))
-    is_logged, fb_id = check_facebook_login_cookies(context)
-    if is_logged and not blocked_final:
+    diag_final = diagnose_facebook_challenge(page)
+    is_logged, _ = check_facebook_login_cookies(context)
+    if is_logged and diag_final["is_ok"]:
         save_account_storage_state(context)
         log("تم تسجيل الدخول بنجاح.")
         return True
 
-    ok_f, f_reason = check_facebook_page_access(page)
-    set_login_error(context, f_reason or "انتهت مهلة انتظار تسجيل الدخول (تحقق من كلمة السر أو 2FA)")
+    set_login_error(context, diag_final["message"] or "انتهت مهلة انتظار تسجيل الدخول")
     log("انتهت مهلة الانتظار دون اكتمال تسجيل الدخول.")
+    return False
+
+
+def visible_page_has_live_human(context: BrowserContext) -> bool:
+    """التمييز بين التشغيل الآلي بالخلفية وجلسة الشاشة الحية التفاعلية (HITL)"""
     return False
 
 def dismiss_dialogs(page: Page) -> None:

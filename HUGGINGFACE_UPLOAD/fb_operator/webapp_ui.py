@@ -248,6 +248,83 @@ def get_miniapp_html() -> str:
             border-radius: var(--radius);
             margin-top: 24px;
         }
+        dialog.hitl-dialog {
+            width: min(760px, 96vw);
+            max-width: 96vw;
+            max-height: 92dvh;
+            margin: auto;
+            padding: 0;
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            background: var(--bg-sec);
+            color: var(--text);
+        }
+        dialog.hitl-dialog[open] {
+            display: flex;
+            flex-direction: column;
+        }
+        dialog.hitl-dialog:modal {
+            overscroll-behavior: contain;
+        }
+        dialog.hitl-dialog::backdrop {
+            overflow: hidden;
+            overscroll-behavior: contain;
+            background: rgba(0, 0, 0, 0.72);
+        }
+        .hitl-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+            padding: 12px 14px;
+            border-bottom: 1px solid var(--border);
+        }
+        .hitl-head h2 {
+            margin: 0;
+            font-size: 15px;
+            font-weight: 700;
+        }
+        .hitl-body {
+            padding: 12px 14px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        .hitl-stage {
+            position: relative;
+            width: 100%;
+            aspect-ratio: 16 / 10;
+            background: #0d1117;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            overflow: hidden;
+            cursor: crosshair;
+            touch-action: manipulation;
+        }
+        .hitl-stage img {
+            display: block;
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            user-select: none;
+            -webkit-user-drag: none;
+        }
+        .hitl-tap-dot {
+            position: absolute;
+            width: 18px;
+            height: 18px;
+            margin: -9px 0 0 -9px;
+            border-radius: 50%;
+            border: 2px solid #3fb950;
+            background: rgba(63, 185, 80, 0.25);
+            pointer-events: none;
+        }
+        .hitl-toolbar {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+        }
     </style>
 </head>
 <body>
@@ -539,7 +616,37 @@ def get_miniapp_html() -> str:
     </div>
 </div>
 
-<div id="toast" class="toast"></div>
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+<dialog id="hitlDialog" class="hitl-dialog" aria-labelledby="hitlDialogTitle" closedby="closerequest">
+    <div class="hitl-head">
+        <h2 id="hitlDialogTitle">الشاشة الحية التفاعلية لحل التحقق</h2>
+        <button type="button" class="btn btn-muted btn-sm" id="btnHitlClose" autofocus>إغلاق</button>
+    </div>
+    <div class="hitl-body">
+        <div id="hitlLiveStatus" role="status" aria-live="polite" class="status-banner" style="margin-top:0;">جاري تجهيز المتصفح...</div>
+        <div class="hitl-stage" id="hitlStage">
+            <img id="hitlScreenImg" alt="شاشة متصفح الحساب الحية — انقر مباشرة في موضع زر التحقق أو مربع الإدخال">
+            <div id="hitlTapDot" class="hitl-tap-dot hidden"></div>
+        </div>
+        <div class="hitl-toolbar">
+            <button type="button" class="btn btn-muted btn-sm" onclick="hitlScroll(-320)">أعلى</button>
+            <button type="button" class="btn btn-muted btn-sm" onclick="hitlScroll(320)">أسفل</button>
+            <button type="button" class="btn btn-muted btn-sm" onclick="hitlKey('Enter')">Enter</button>
+            <button type="button" class="btn btn-muted btn-sm" onclick="hitlKey('Backspace')">حذف حرف</button>
+            <button type="button" class="btn btn-muted btn-sm" onclick="hitlAction('reload')">تحديث الصفحة</button>
+            <button type="button" class="btn btn-muted btn-sm hidden" id="btnHitlPrefill" onclick="hitlAction('prefill_creds')">تعبئة البريد وكلمة المرور</button>
+        </div>
+        <div class="field" style="margin-bottom:0;">
+            <label for="hitlTextInput">إرسال نص أو رمز التحقق (2FA / OTP) إلى الصفحة الحية</label>
+            <div style="display:flex;gap:6px;flex-wrap:wrap;">
+                <input type="text" id="hitlTextInput" autocomplete="one-time-code" placeholder="أدخل رمز 2FA أو أي نص لإرساله للحقل المحدد..." style="flex:1;min-width:180px;">
+                <button type="button" class="btn btn-primary btn-sm" onclick="hitlSendText(true)">إرسال + Enter</button>
+                <button type="button" class="btn btn-muted btn-sm" onclick="hitlSendText(false)">كتابة فقط</button>
+            </div>
+        </div>
+    </div>
+</dialog>
 
 <script>
 const tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
@@ -789,6 +896,12 @@ async function bootstrap() {
         document.getElementById("appShell").classList.remove("hidden");
         renderApp();
         startEventSyncLoop();
+        const urlParams = new URLSearchParams(window.location.search);
+        const deepHitl = (urlParams.get("hitl") || "").trim();
+        if (deepHitl) {
+            if (currentTabs.some(t => t.id === "accounts")) switchTab("accounts", false);
+            openHitlLive(deepHitl);
+        }
     } catch (err) {
         document.getElementById("loadingBox").classList.add("hidden");
         const lb = document.getElementById("lockedBox");
@@ -1135,14 +1248,29 @@ function renderAccountsList() {
             row.appendChild(reasonLine);
         }
 
+        const btnRow = document.createElement("div");
+        btnRow.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;margin-top:6px;";
+
+        if (!a.is_active && (isDev || p.can_add_accounts || p.can_use_accounts)) {
+            const hitlBtn = document.createElement("button");
+            hitlBtn.type = "button";
+            hitlBtn.className = "btn btn-primary btn-sm";
+            hitlBtn.textContent = "الشاشة الحية لحل التحقق";
+            hitlBtn.onclick = () => openHitlLive(a.id, a.name);
+            btnRow.appendChild(hitlBtn);
+        }
+
         if (isDev || p.can_delete_accounts) {
             const delBtn = document.createElement("button");
             delBtn.type = "button";
             delBtn.className = "btn btn-danger btn-sm";
-            delBtn.style.marginTop = "6px";
             delBtn.textContent = "حذف الحساب";
             delBtn.onclick = () => deleteAccount(a.id);
-            row.appendChild(delBtn);
+            btnRow.appendChild(delBtn);
+        }
+
+        if (btnRow.childElementCount > 0) {
+            row.appendChild(btnRow);
         }
 
         box.appendChild(row);
@@ -2014,6 +2142,213 @@ async function saveEconomySettings() {
 
 document.getElementById("inpSelectedAcc")?.addEventListener("change", renderMissionCostBadge);
 document.getElementById("inpAccLimit")?.addEventListener("input", renderMissionCostBadge);
+
+// =========================================================================
+// الشاشة الحية التفاعلية لحل التحقق البشري (Interactive HITL Live View)
+// =========================================================================
+let hitlActiveAccId = null;
+let hitlPollTimer = null;
+let hitlLastFrameSeq = -1;
+
+function applyHitlSnapshot(st) {
+    if (!st) return;
+    const statusEl = document.getElementById("hitlLiveStatus");
+    const prefillBtn = document.getElementById("btnHitlPrefill");
+    const imgEl = document.getElementById("hitlScreenImg");
+
+    if (st.frame_b64 && st.frame_b64.startsWith("data:image/jpeg;base64,") && st.frame_seq !== hitlLastFrameSeq) {
+        imgEl.src = st.frame_b64;
+        hitlLastFrameSeq = st.frame_seq;
+    }
+    if (prefillBtn) {
+        const showPrefill = !!st.has_credentials && ["full_login", "password_only"].includes(st.challenge_code || "");
+        prefillBtn.classList.toggle("hidden", !showPrefill);
+    }
+
+    if (st.completed) {
+        statusEl.textContent = "تم التحقق وتثبيت جلسة الحساب بنجاح! معرّف الحساب: " + (st.fb_id || "-") + " — يمكنك إغلاق الشاشة الآن.";
+        statusEl.style.borderColor = "#3fb950";
+        showToast("تم تفعيل الحساب وحفظ الجلسة بنجاح!");
+        if (hitlPollTimer) { clearTimeout(hitlPollTimer); hitlPollTimer = null; }
+        refreshFromServer();
+        return;
+    }
+
+    statusEl.style.borderColor = st.error ? "#f47067" : "var(--border)";
+    if (st.error) {
+        statusEl.textContent = st.error;
+    } else if (!st.running && st.ready) {
+        statusEl.textContent = st.challenge_message || "أُغلقت جلسة المتصفح.";
+    } else {
+        const ttl = st.ttl_remaining != null ? (" | المتبقي: " + st.ttl_remaining + "ث") : "";
+        statusEl.textContent = (st.challenge_message || "جاري تحميل الصفحة...") + ttl;
+    }
+}
+
+function scheduleNextHitlFrame(accId) {
+    if (hitlPollTimer) {
+        clearTimeout(hitlPollTimer);
+        hitlPollTimer = null;
+    }
+    const dlg = document.getElementById("hitlDialog");
+    if (!accId || hitlActiveAccId !== accId || !dlg || !dlg.open) return;
+    hitlPollTimer = setTimeout(() => { pollHitlState(accId); }, 1100);
+}
+
+async function openHitlLive(accId, accName) {
+    const dlg = document.getElementById("hitlDialog");
+    if (!dlg) return;
+    hitlActiveAccId = accId;
+    hitlLastFrameSeq = -1;
+    const titleEl = document.getElementById("hitlDialogTitle");
+    if (titleEl) {
+        titleEl.textContent = "الشاشة الحية: " + (accName ? (accName + " (" + accId + ")") : accId);
+    }
+    const statusEl = document.getElementById("hitlLiveStatus");
+    if (statusEl) statusEl.textContent = "جاري تشغيل متصفح الحساب وفتح فيسبوك...";
+    const imgEl = document.getElementById("hitlScreenImg");
+    if (imgEl) imgEl.removeAttribute("src");
+
+    if (!dlg.open) {
+        dlg.showModal();
+    }
+    try {
+        const res = await apiCall("/api/hitl/start", "POST", { account_id: accId });
+        applyHitlSnapshot(res);
+        if (res && !res.completed && (res.running || !res.ready)) {
+            scheduleNextHitlFrame(accId);
+        }
+    } catch (e) {
+        if (statusEl) statusEl.textContent = "تعذر تشغيل الشاشة الحية: " + e.message;
+    }
+}
+
+async function pollHitlState(accId) {
+    const targetAcc = accId || hitlActiveAccId;
+    const dlg = document.getElementById("hitlDialog");
+    if (!targetAcc || hitlActiveAccId !== targetAcc || !dlg || !dlg.open) return;
+    let shouldContinue = true;
+    try {
+        const st = await apiCall("/api/hitl/state?acc_id=" + encodeURIComponent(targetAcc));
+        applyHitlSnapshot(st);
+        if (st.completed || (!st.running && st.ready)) {
+            shouldContinue = false;
+        }
+    } catch (e) {
+        // تجاهل الانقطاع العابر أثناء البث
+    }
+    if (shouldContinue && hitlActiveAccId === targetAcc && dlg.open) {
+        scheduleNextHitlFrame(targetAcc);
+    }
+}
+
+async function stopHitlLive() {
+    if (hitlPollTimer) {
+        clearTimeout(hitlPollTimer);
+        hitlPollTimer = null;
+    }
+    const accId = hitlActiveAccId;
+    hitlActiveAccId = null;
+    if (!accId) return;
+    try {
+        await apiCall("/api/hitl/stop", "POST", { account_id: accId });
+    } catch (e) {}
+}
+
+async function hitlSendText(withEnter) {
+    if (!hitlActiveAccId) return;
+    const inp = document.getElementById("hitlTextInput");
+    const txt = inp ? inp.value : "";
+    if (!txt) {
+        showToast("أدخل النص أو الرمز أولاً");
+        return;
+    }
+    try {
+        const res = await apiCall("/api/hitl/input", "POST", {
+            account_id: hitlActiveAccId,
+            action: "type",
+            text: txt,
+            submit: !!withEnter
+        });
+        if (inp) inp.value = "";
+        applyHitlSnapshot(res);
+    } catch (e) {
+        showToast(e.message);
+    }
+}
+
+async function hitlKey(k) {
+    if (!hitlActiveAccId) return;
+    try {
+        const res = await apiCall("/api/hitl/input", "POST", { account_id: hitlActiveAccId, action: "key", key: k });
+        applyHitlSnapshot(res);
+    } catch (e) {
+        showToast(e.message);
+    }
+}
+
+async function hitlScroll(dy) {
+    if (!hitlActiveAccId) return;
+    try {
+        const res = await apiCall("/api/hitl/input", "POST", { account_id: hitlActiveAccId, action: "scroll", dy: dy });
+        applyHitlSnapshot(res);
+    } catch (e) {
+        showToast(e.message);
+    }
+}
+
+async function hitlAction(act) {
+    if (!hitlActiveAccId) return;
+    try {
+        const res = await apiCall("/api/hitl/input", "POST", { account_id: hitlActiveAccId, action: act });
+        applyHitlSnapshot(res);
+    } catch (e) {
+        showToast(e.message);
+    }
+}
+
+(function wireHitlDialog() {
+    const dlg = document.getElementById("hitlDialog");
+    const closeBtn = document.getElementById("btnHitlClose");
+    const stage = document.getElementById("hitlStage");
+    const dot = document.getElementById("hitlTapDot");
+
+    if (closeBtn && dlg) {
+        closeBtn.addEventListener("click", () => dlg.close("user_close"));
+    }
+    if (dlg) {
+        dlg.addEventListener("close", () => {
+            dlg.returnValue = "";
+            stopHitlLive();
+        });
+    }
+    if (stage) {
+        stage.addEventListener("click", async (ev) => {
+            if (!hitlActiveAccId) return;
+            const rect = stage.getBoundingClientRect();
+            if (!rect.width || !rect.height) return;
+            const xNorm = Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width));
+            const yNorm = Math.max(0, Math.min(1, (ev.clientY - rect.top) / rect.height));
+            if (dot) {
+                dot.style.left = (xNorm * 100).toFixed(2) + "%";
+                dot.style.top = (yNorm * 100).toFixed(2) + "%";
+                dot.classList.remove("hidden");
+                setTimeout(() => dot.classList.add("hidden"), 550);
+            }
+            try {
+                const res = await apiCall("/api/hitl/input", "POST", {
+                    account_id: hitlActiveAccId,
+                    action: "click",
+                    x_norm: xNorm,
+                    y_norm: yNorm
+                });
+                applyHitlSnapshot(res);
+            } catch (e) {
+                showToast(e.message);
+            }
+        });
+    }
+})();
 
 bootstrap();
 </script>
