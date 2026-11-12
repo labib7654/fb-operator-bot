@@ -63,6 +63,7 @@ from fb_operator.browser_manager import (
 )
 from fb_operator.proxy_manager import (
     add_proxies_bulk,
+    bind_existing_accounts,
     check_all_proxies,
     clear_all_proxies,
     clear_dead_proxies,
@@ -1618,18 +1619,19 @@ def _render_proxies_view() -> tuple[str, types.InlineKeyboardMarkup]:
         types.InlineKeyboardButton("🩺 فحص كل البروكسيات", callback_data="prx_check_all"),
     )
     markup.row(
+        types.InlineKeyboardButton("🔗 توزيع وربط الحسابات الحالية", callback_data="prx_bind_existing"),
         types.InlineKeyboardButton("📥 جلب مجاني (GitHub) وفحص", callback_data="prx_fetch_github"),
+    )
+    markup.row(
         types.InlineKeyboardButton("📱 نفق الفورجي 4G (بدون VPS)", callback_data="prx_4g_menu"),
-    )
-    markup.row(
         types.InlineKeyboardButton("🔀 تبديل الوضع النشط", callback_data="prx_cycle_mode"),
+    )
+    markup.row(
         types.InlineKeyboardButton("🧹 حذف الميتة", callback_data="prx_clear_dead"),
-    )
-    markup.row(
         types.InlineKeyboardButton("🗑️ مسح الكل", callback_data="prx_clear_all"),
-        types.InlineKeyboardButton("🔄 تحديث", callback_data="menu_proxies"),
     )
     markup.row(
+        types.InlineKeyboardButton("🔄 تحديث", callback_data="menu_proxies"),
         types.InlineKeyboardButton("🔙 الرئيسية", callback_data="back_to_main"),
     )
     return "\n".join(lines), markup
@@ -2657,6 +2659,22 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
                 txt, markup = _render_proxies_view()
                 safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
             threading.Thread(target=_bg_check_proxies, daemon=True).start()
+            return
+        elif data == "prx_bind_existing":
+            b_res = bind_existing_accounts(rebalance_all=False)
+            record_audit_log(
+                user_id,
+                call.from_user.first_name or "",
+                "PROXIES_BIND_EXISTING",
+                f"ربط {b_res['newly_bound']} حساب جديد | مربوط مسبقاً {b_res['already_bound']}",
+            )
+            safe_answer(
+                call.id,
+                f"🔗 تم ربط {b_res['newly_bound']} حساباً (إجمالي المربوط: {b_res['newly_bound'] + b_res['already_bound']}/{b_res['total_accounts']}).",
+                show_alert=True,
+            )
+            txt, markup = _render_proxies_view()
+            safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
             return
         elif data == "prx_fetch_github":
             safe_answer(call.id, "📥 جاري سحب وفحص بروكسيات GitHub الحية...")

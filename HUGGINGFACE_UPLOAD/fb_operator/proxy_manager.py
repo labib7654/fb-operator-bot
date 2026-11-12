@@ -905,6 +905,79 @@ def resolve_proxy_for_account(
     return {"source": "direct", "raw_uri": "", "playwright_proxy": None, "geo_hints": {}}
 
 
+def bind_existing_accounts(rebalance_all: bool = False) -> dict[str, int]:
+    """
+    ربط وتوزيع كل الحسابات الموجودة حالياً (التي أُضيفت قبل البروكسيات) بالتوازن على التجمع المتاح،
+    وحفظ الربط في proxies.json وaccounts.json مع إطلاق المزامنة السحابية فوراً.
+    """
+    try:
+        from fb_operator import account_manager as acc_m
+        accounts = acc_m.load_accounts()
+    except Exception:
+        return {"total_accounts": 0, "newly_bound": 0, "already_bound": 0}
+
+    pending_acc_updates: list[tuple[str, dict[str, str]]] = []
+    newly_bound = 0
+    already_bound = 0
+
+    with _proxy_lock:
+        state = load_proxy_state()
+        if not state["proxies"] or state.get("mode") == "direct":
+            return {"total_accounts": len(accounts), "newly_bound": 0, "already_bound": len(state.get("bindings") or {})}
+
+        by_uri = {p["uri"]: p for p in state["proxies"]}
+        changed = False
+        for acc in accounts:
+            acc_id = str(acc.get("id") or "").strip()
+            if not acc_id:
+                continue
+            cur_uri = state["bindings"].get(acc_id, "")
+            cur_item = by_uri.get(cur_uri)
+            if not rebalance_all and cur_item and cur_item.get("alive") is not False:
+                already_bound += 1
+                if not acc.get("bound_proxy"):
+                    pending_acc_updates.append((
+                        acc_id,
+                        {
+                            "bound_proxy": mask_proxy_uri(cur_item["uri"]),
+                            "bound_proxy_country": str(cur_item.get("country_code") or "").upper(),
+                        },
+                    ))
+                continue
+
+            if rebalance_all and acc_id in state["bindings"]:
+                del state["bindings"][acc_id]
+            chosen = _pick_least_loaded_proxy(state)
+            if chosen:
+                state["bindings"][acc_id] = chosen["uri"]
+                changed = True
+                newly_bound += 1
+                pending_acc_updates.append((
+                    acc_id,
+                    {
+                        "bound_proxy": mask_proxy_uri(chosen["uri"]),
+                        "bound_proxy_country": str(chosen.get("country_code") or "").upper(),
+                    },
+                ))
+
+        if changed:
+            save_proxy_state(state, notify=True)
+
+    for aid, upd in pending_acc_updates:
+        try:
+            acc_m.update_account(aid, upd, sync_git=False)
+        except Exception:
+            pass
+    if pending_acc_updates:
+        _notify_change("proxies_bind_existing")
+
+    return {
+        "total_accounts": len(accounts),
+        "newly_bound": newly_bound,
+        "already_bound": already_bound,
+    }
+
+
 # ==============================================================================
 # محرك نفق الفورجي العكسي من الهاتف إلى السيرفر (go-gost v3 + cloudflared)
 # ==============================================================================
