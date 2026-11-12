@@ -54,6 +54,28 @@ PERMISSION_LABELS = {
 
 ALL_TRUE_PERMISSIONS = {k: True for k in DEFAULT_PERMISSIONS}
 
+# رتب التفويض الإداري (تحفظ role='user' لمنع كسر فحوصات الأمان المخصصة للمطور الحصين 7411444902)
+ADMIN_TIERS = ("none", "manager", "super_delegate")
+ADMIN_TIER_LABELS = {
+    "none": "👤 مستخدم عادي",
+    "manager": "🛡️ مدير / أدمن مساعد",
+    "super_delegate": "👑 أدمن فوق الأدمن (نائب المطور)",
+}
+
+ADMIN_RESTRICTION_LABELS = {
+    "block_payment_notices": "حجب رسائل الدفع والمحاسبة والتذاكر المالية",
+    "block_points_economy": "منع إدارة الاقتصاد والنقاط والأسعار",
+    "block_new_user_notices": "حجب إشعارات المسجلين الجدد وطلبات الانضمام",
+    "block_radar_users": "منع فتح رادار المستخدمين والتعديل",
+    "block_account_notices": "حجب إشعارات إضافة الحسابات الجديدة ولقطاتها",
+    "block_accounts_pool": "منع مشاهدة وإدارة كل حسابات البوت",
+    "block_proxies": "منع دخول إدارة البروكسيات ونفق 4G",
+    "block_backups": "منع النسخ الاحتياطي والاستعادة والقناة",
+    "block_announcements": "منع إنشاء وحذف الإعلانات العائمة",
+    "block_audit_logs": "منع استعراض سجل الرقابة والأحداث",
+}
+DEFAULT_ADMIN_RESTRICTIONS = {k: False for k in ADMIN_RESTRICTION_LABELS}
+
 
 def _atomic_write_json(path: Path, data) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -107,6 +129,14 @@ def _ensure_wallet_fields(u: dict) -> None:
     u["referred_count"] = _safe_nonneg_int(u.get("referred_count", 0))
     u["ref_code"] = str(u.get("ref_code") or "")[:32]
     u["profile_warnings_used"] = _safe_nonneg_int(u.get("profile_warnings_used", 0))
+    tier = str(u.get("admin_tier") or "none").strip()
+    if tier not in ADMIN_TIERS or u.get("status") != "approved":
+        tier = "none"
+    u["admin_tier"] = tier
+    raw_restr = u.get("admin_restrictions")
+    if not isinstance(raw_restr, dict):
+        raw_restr = {}
+    u["admin_restrictions"] = {rk: bool(raw_restr.get(rk, False)) for rk in ADMIN_RESTRICTION_LABELS}
 
 
 def _build_super_profile(existing: dict | None = None) -> dict:
@@ -145,6 +175,8 @@ def _copy_users_snapshot(raw: dict) -> dict:
             item = dict(v)
             if isinstance(v.get("permissions"), dict):
                 item["permissions"] = dict(v["permissions"])
+            if isinstance(v.get("admin_restrictions"), dict):
+                item["admin_restrictions"] = dict(v["admin_restrictions"])
             out[k] = item
         else:
             out[k] = v
@@ -315,13 +347,19 @@ def register_or_update_user(user_id: int, name: str, username: str = "", touch_l
 
 
 def get_user_permissions(user_id: int) -> dict:
-    """إرجاع خريطة الصلاحيات الـ 10 للمستخدم بشكل آمن"""
+    """إرجاع خريطة الصلاحيات الـ 11 للمستخدم بشكل آمن"""
     if is_super_admin(user_id):
         return {k: True for k in DEFAULT_PERMISSIONS}
     users = load_users()
     u = users.get(str(int(user_id)))
     if not u or u.get("status") != "approved" or u.get("role") != "user":
         return dict(DEFAULT_PERMISSIONS)
+    if u.get("admin_tier") == "super_delegate":
+        restr = u.get("admin_restrictions") or {}
+        perms = dict(ALL_TRUE_PERMISSIONS)
+        if restr.get("block_accounts_pool"):
+            perms["can_use_accounts"] = bool((u.get("permissions") or {}).get("can_use_accounts", False))
+        return perms
     raw_perms = u.get("permissions", {})
     return {k: bool(raw_perms.get(k, False)) for k in DEFAULT_PERMISSIONS}
 
@@ -350,7 +388,193 @@ def has_permission(user_id: int, permission: str) -> bool:
     u = users.get(str(int(user_id)))
     if not u or u.get("status") != "approved" or u.get("role") != "user":
         return False
+    if u.get("admin_tier") == "super_delegate":
+        if permission == "can_use_accounts" and (u.get("admin_restrictions") or {}).get("block_accounts_pool"):
+            return bool(u.get("permissions", {}).get(permission, False))
+        return True
     return bool(u.get("permissions", {}).get(permission, False))
+
+
+_CAP_TO_RESTRICTION = {
+    "payment_notices": "block_payment_notices",
+    "points_economy": "block_points_economy",
+    "new_user_notices": "block_new_user_notices",
+    "radar_users": "block_radar_users",
+    "account_notices": "block_account_notices",
+    "accounts_pool": "block_accounts_pool",
+    "proxies": "block_proxies",
+    "backups": "block_backups",
+    "announcements": "block_announcements",
+    "audit_logs": "block_audit_logs",
+}
+_MANAGER_ALLOWED_CAPS = frozenset({"radar_users", "new_user_notices", "account_notices"})
+
+
+def get_admin_tier(user_id: int | str) -> str:
+    if is_super_admin(user_id):
+        return "super_admin"
+    try:
+        uid = str(int(user_id))
+    except Exception:
+        return "none"
+    u = load_users().get(uid)
+    if not u or u.get("status") != "approved":
+        return "none"
+    t = str(u.get("admin_tier") or "none")
+    return t if t in ADMIN_TIERS else "none"
+
+
+def get_admin_restrictions(user_id: int | str) -> dict[str, bool]:
+    if is_super_admin(user_id):
+        return dict(DEFAULT_ADMIN_RESTRICTIONS)
+    try:
+        uid = str(int(user_id))
+    except Exception:
+        return dict(DEFAULT_ADMIN_RESTRICTIONS)
+    u = load_users().get(uid) or {}
+    raw = u.get("admin_restrictions") if isinstance(u.get("admin_restrictions"), dict) else {}
+    return {k: bool(raw.get(k, False)) for k in ADMIN_RESTRICTION_LABELS}
+
+
+def is_admin_delegate(user_id: int | str, include_manager: bool = True) -> bool:
+    t = get_admin_tier(user_id)
+    if t in ("super_admin", "super_delegate"):
+        return True
+    return bool(include_manager and t == "manager")
+
+
+def has_admin_capability(user_id: int | str, capability: str) -> bool:
+    """فحص صلاحية إدارية دقيقة للأدمن والمدير وأدمن فوق الأدمن مع احترام قيود المطور الأكبر."""
+    if is_super_admin(user_id):
+        return True
+    tier = get_admin_tier(user_id)
+    if tier == "none":
+        return False
+    if capability == "manage_admin_tiers":
+        return False  # تعيين الرتب والقيود حق حصري للمطور الرئيسي فقط
+    if capability not in _CAP_TO_RESTRICTION:
+        return False
+    if tier == "manager" and capability not in _MANAGER_ALLOWED_CAPS:
+        return False
+    restr = get_admin_restrictions(user_id)
+    return not bool(restr.get(_CAP_TO_RESTRICTION[capability], False))
+
+
+def get_user_admin_capabilities(user_id: int | str) -> dict[str, bool]:
+    caps = {c: has_admin_capability(user_id, c) for c in _CAP_TO_RESTRICTION}
+    caps["manage_admin_tiers"] = is_super_admin(user_id)
+    return caps
+
+
+def can_manage_target_user(actor_id: int | str, target_id: int | str) -> bool:
+    """التحقق الهرمي الصارم: لا أحد يلمس المطور الرئيسي، والنائب لا يلمس نائباً مثله، والمدير يلمس العاديين فقط."""
+    if is_super_admin(target_id):
+        return False
+    if is_super_admin(actor_id):
+        return True
+    if not has_admin_capability(actor_id, "radar_users"):
+        return False
+    actor_tier = get_admin_tier(actor_id)
+    target_tier = get_admin_tier(target_id)
+    if actor_tier == "super_delegate":
+        return target_tier in ("none", "manager")
+    if actor_tier == "manager":
+        return target_tier == "none"
+    return False
+
+
+def get_admin_notification_recipients(notice_kind: str) -> list[int]:
+    """قائمة مستلمي الإشعار الإداري (المطور الرئيسي دائماً + كل أدمن/مدير مصرح غير مقيد بهذا النوع)."""
+    recipients: list[int] = [SUPER_ADMIN_ID]
+    users = load_users()
+    for uid_s, u in users.items():
+        if not isinstance(u, dict) or uid_s == str(SUPER_ADMIN_ID):
+            continue
+        if u.get("status") != "approved":
+            continue
+        if u.get("admin_tier") not in ("manager", "super_delegate"):
+            continue
+        t_uid = int(u.get("id") or uid_s)
+        if has_admin_capability(t_uid, notice_kind) and t_uid not in recipients:
+            recipients.append(t_uid)
+    return recipients
+
+
+def set_admin_tier(target_uid: int, tier: str, actor_id: int) -> bool:
+    """تعيين رتبة إدارية (عادي / مدير / أدمن فوق الأدمن) — حصري للمطور الرئيسي 7411444902 فقط."""
+    if not is_super_admin(actor_id) or is_super_admin(target_uid):
+        return False
+    clean_tier = str(tier or "none").strip()
+    if clean_tier not in ADMIN_TIERS:
+        return False
+    ok = False
+    u_name = ""
+    with _users_lock:
+        users = load_users()
+        tid = str(int(target_uid))
+        u = users.get(tid)
+        if isinstance(u, dict):
+            if clean_tier != "none" and u.get("status") != "approved":
+                u["status"] = "approved"
+            u["role"] = "user"
+            u["admin_tier"] = clean_tier
+            if clean_tier == "none":
+                u["admin_restrictions"] = dict(DEFAULT_ADMIN_RESTRICTIONS)
+            u_name = str(u.get("name", ""))
+            save_users(users, sync_git=True)
+            ok = True
+    if ok:
+        record_audit_log(int(target_uid), u_name, "ADMIN_TIER_SET", f"تعيين الرتبة إلى: {ADMIN_TIER_LABELS.get(clean_tier, clean_tier)}")
+        publish_event("users", int(target_uid), "admin_tier")
+    return ok
+
+
+def toggle_admin_restriction(target_uid: int, key: str, actor_id: int) -> bool | None:
+    """تفعيل/تعطيل قيد إداري (مثل حجب رسائل الدفع) — حصري للمطور الرئيسي فقط."""
+    if not is_super_admin(actor_id) or is_super_admin(target_uid):
+        return None
+    if key not in ADMIN_RESTRICTION_LABELS:
+        return None
+    new_val: bool | None = None
+    u_name = ""
+    with _users_lock:
+        users = load_users()
+        tid = str(int(target_uid))
+        u = users.get(tid)
+        if isinstance(u, dict):
+            restr = u.setdefault("admin_restrictions", dict(DEFAULT_ADMIN_RESTRICTIONS))
+            new_val = not bool(restr.get(key, False))
+            restr[key] = new_val
+            u_name = str(u.get("name", ""))
+            save_users(users, sync_git=True)
+    if new_val is not None:
+        st_lbl = "حجب وتقييد" if new_val else "فتح وإتاحة"
+        record_audit_log(int(target_uid), u_name, "ADMIN_RESTRICTION_TOGGLE", f"{st_lbl}: {ADMIN_RESTRICTION_LABELS[key]}")
+        publish_event("users", int(target_uid), "admin_restriction")
+    return new_val
+
+
+def grant_all_user_permissions(target_uid: int, actor_id: int) -> bool:
+    """منح كافة المميزات التشغيلية الـ 11 للمستخدم بضغطة واحدة (بواسطة المطور أو المفوض المصرح)."""
+    if not can_manage_target_user(actor_id, target_uid):
+        return False
+    ok = False
+    u_name = ""
+    with _users_lock:
+        users = load_users()
+        tid = str(int(target_uid))
+        u = users.get(tid)
+        if isinstance(u, dict):
+            if u.get("status") != "approved":
+                u["status"] = "approved"
+            u["permissions"] = dict(ALL_TRUE_PERMISSIONS)
+            u_name = str(u.get("name", ""))
+            save_users(users, sync_git=True)
+            ok = True
+    if ok:
+        record_audit_log(int(target_uid), u_name, "PERM_GRANT_ALL", f"منح كافة المميزات التشغيلة بضغطة واحدة بواسطة {actor_id}")
+        publish_event("users", int(target_uid), "grant_all")
+    return ok
 
 
 def approve_user(user_id: int) -> bool:
@@ -384,6 +608,8 @@ def ban_user(user_id: int) -> bool:
         if uid in users:
             users[uid]["status"] = "banned"
             users[uid]["role"] = "user"
+            users[uid]["admin_tier"] = "none"
+            users[uid]["admin_restrictions"] = dict(DEFAULT_ADMIN_RESTRICTIONS)
             users[uid]["permissions"] = dict(DEFAULT_PERMISSIONS)
             save_users(users, sync_git=True)
             record_audit_log(int(user_id), users[uid].get("name", ""), "USER_BANNED", "تم حظر المستخدم وتجريده من كافة الصلاحيات")

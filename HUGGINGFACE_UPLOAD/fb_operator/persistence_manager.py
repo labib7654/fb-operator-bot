@@ -37,6 +37,7 @@ WHITELIST_JSON_FILES = (
     "backup_meta.json",
     "ui_states.json",
     "proxies.json",
+    "announcements.json",
 )
 
 _SESSION_ENTRY_RE = re.compile(r"^sessions/(acc_\d+)\.json$")
@@ -330,10 +331,12 @@ def _active_paths() -> tuple[dict[str, Path], Path, Path]:
     raw_meta = Path(cfg_m.BACKUP_META_FILE)
     raw_ui = Path(cfg_m.UI_STATES_FILE)
     raw_proxies = Path(getattr(cfg_m, "PROXIES_FILE", Path(cfg_m.DATA_DIR) / "proxies.json"))
+    raw_ann = Path(getattr(cfg_m, "ANNOUNCEMENTS_FILE", Path(cfg_m.DATA_DIR) / "announcements.json"))
     base_data_dir = Path(cfg_m.DATA_DIR)
     meta_path = (active_data_dir / "backup_meta.json") if (raw_meta.parent == base_data_dir and active_data_dir != base_data_dir) else raw_meta
     ui_path = (active_data_dir / "ui_states.json") if (raw_ui.parent == base_data_dir and active_data_dir != base_data_dir) else raw_ui
     proxies_path = (active_data_dir / "proxies.json") if (raw_proxies.parent == base_data_dir and active_data_dir != base_data_dir) else raw_proxies
+    ann_path = (active_data_dir / "announcements.json") if (raw_ann.parent == base_data_dir and active_data_dir != base_data_dir) else raw_ann
 
     json_map = {
         "accounts.json": Path(acc_m.ACCOUNTS_FILE),
@@ -346,6 +349,7 @@ def _active_paths() -> tuple[dict[str, Path], Path, Path]:
         "backup_meta.json": meta_path,
         "ui_states.json": ui_path,
         "proxies.json": proxies_path,
+        "announcements.json": ann_path,
     }
     profiles_dir = Path(acc_m.PROFILES_DIR)
     sessions_dir = Path(acc_m.SESSIONS_DIR)
@@ -583,7 +587,7 @@ def _parse_and_validate_backup_zip(raw_bytes: bytes) -> dict:
                         return {"ok": False, "error": f"ملف JSON تالف داخل النسخة: {clean_name}"}
                     if clean_name in ("accounts.json", "audit_logs.json", "points_ledger.json", "invite_codes.json", "support_tickets.json") and not isinstance(parsed, list):
                         return {"ok": False, "error": f"بنية غير صحيحة للملف: {clean_name}"}
-                    if clean_name in ("users.json", "economy_settings.json", "backup_meta.json", "ui_states.json", "proxies.json") and not isinstance(parsed, dict):
+                    if clean_name in ("users.json", "economy_settings.json", "backup_meta.json", "ui_states.json", "proxies.json", "announcements.json") and not isinstance(parsed, dict):
                         return {"ok": False, "error": f"بنية غير صحيحة للملف: {clean_name}"}
                     staged_json[clean_name] = content
                 else:
@@ -769,6 +773,7 @@ def _merge_staged_payload(staged_json: dict[str, bytes], staged_sessions: dict[s
         cur_ui: dict = _safe_parse(json_map["ui_states.json"].read_bytes() if json_map["ui_states.json"].exists() else None, {})
         cur_meta: dict = _safe_parse(json_map["backup_meta.json"].read_bytes() if json_map["backup_meta.json"].exists() else None, {})
         cur_proxies: dict = _safe_parse(json_map["proxies.json"].read_bytes() if json_map["proxies.json"].exists() else None, {})
+        cur_ann: dict = _safe_parse(json_map["announcements.json"].read_bytes() if json_map["announcements.json"].exists() else None, {})
 
         inc_accounts = _safe_parse(staged_json.get("accounts.json"), [])
         inc_users = _safe_parse(staged_json.get("users.json"), {})
@@ -780,6 +785,7 @@ def _merge_staged_payload(staged_json: dict[str, bytes], staged_sessions: dict[s
         inc_eco = _safe_parse(staged_json.get("economy_settings.json"), {})
         inc_meta = _safe_parse(staged_json.get("backup_meta.json"), {})
         inc_proxies = _safe_parse(staged_json.get("proxies.json"), {})
+        inc_ann = _safe_parse(staged_json.get("announcements.json"), {})
 
         stats = {
             "accounts_added": 0,
@@ -793,6 +799,7 @@ def _merge_staged_payload(staged_json: dict[str, bytes], staged_sessions: dict[s
             "invites_added": 0,
             "tickets_added": 0,
             "ui_states_added": 0,
+            "announcements_added": 0,
             "proxies_added": 0,
         }
 
@@ -929,10 +936,14 @@ def _merge_staged_payload(staged_json: dict[str, bytes], staged_sessions: dict[s
                 raw_p = clean_u.get("permissions") if isinstance(clean_u.get("permissions"), dict) else {}
                 clean_u["permissions"] = {pk: bool(raw_p.get(pk, False)) for pk in adm_m.DEFAULT_PERMISSIONS}
                 adm_m._ensure_wallet_fields(clean_u)
+                if clean_u.get("status") == "banned":
+                    clean_u["admin_tier"] = "none"
+                    clean_u["admin_restrictions"] = dict(adm_m.DEFAULT_ADMIN_RESTRICTIONS)
                 cur_users[uid_s] = clean_u
                 stats["users_added"] += 1
             else:
                 cur_u = cur_users[uid_s]
+                adm_m._ensure_wallet_fields(cur_u)
                 if cur_u.get("status") != "banned":
                     if inc_u.get("status") == "approved":
                         cur_u["status"] = "approved"
@@ -942,6 +953,17 @@ def _merge_staged_payload(staged_json: dict[str, bytes], staged_sessions: dict[s
                         pk: bool(cur_p.get(pk, False) or (inc_p.get(pk, False) if cur_u.get("status") == "approved" else False))
                         for pk in adm_m.DEFAULT_PERMISSIONS
                     }
+                    inc_tier = str(inc_u.get("admin_tier") or "none").strip().lower()
+                    if cur_u.get("admin_tier", "none") == "none" and cur_u.get("status") == "approved" and inc_tier in adm_m.ADMIN_TIERS and inc_tier != "none":
+                        cur_u["admin_tier"] = inc_tier
+                        inc_restr = inc_u.get("admin_restrictions") if isinstance(inc_u.get("admin_restrictions"), dict) else {}
+                        cur_u["admin_restrictions"] = {
+                            rk: bool(inc_restr.get(rk, False))
+                            for rk in adm_m.DEFAULT_ADMIN_RESTRICTIONS
+                        }
+                else:
+                    cur_u["admin_tier"] = "none"
+                    cur_u["admin_restrictions"] = dict(adm_m.DEFAULT_ADMIN_RESTRICTIONS)
                 if not cur_u.get("username") and inc_u.get("username"):
                     cur_u["username"] = inc_u["username"]
                 if not cur_u.get("ref_code") and inc_u.get("ref_code"):
@@ -1117,6 +1139,19 @@ def _merge_staged_payload(staged_json: dict[str, bytes], staged_sessions: dict[s
             if not cur_proxies.get("mode") and inc_proxies.get("mode"):
                 cur_proxies["mode"] = str(inc_proxies.get("mode"))
             _atomic_write_bytes(json_map["proxies.json"], json.dumps(cur_proxies, ensure_ascii=False, indent=2).encode("utf-8"))
+
+        if inc_ann and isinstance(inc_ann, dict):
+            if not isinstance(cur_ann, dict):
+                cur_ann = {"announcements": []}
+            cur_a_list = cur_ann.get("announcements") if isinstance(cur_ann.get("announcements"), list) else []
+            seen_aids = {str(a.get("id") or "") for a in cur_a_list if isinstance(a, dict) and a.get("id")}
+            for a_item in (inc_ann.get("announcements") or []):
+                if isinstance(a_item, dict) and a_item.get("id") and str(a_item["id"]) not in seen_aids:
+                    cur_a_list.append(dict(a_item))
+                    seen_aids.add(str(a_item["id"]))
+                    stats["announcements_added"] += 1
+            cur_ann["announcements"] = cur_a_list[-100:]
+            _atomic_write_bytes(json_map["announcements.json"], json.dumps(cur_ann, ensure_ascii=False, indent=2).encode("utf-8"))
 
         docs_now, sess_now = _collect_snapshot_unlocked(json_map, sessions_dir)
         cloud_db.write_local_sqlite_mirror(docs_now, sess_now)

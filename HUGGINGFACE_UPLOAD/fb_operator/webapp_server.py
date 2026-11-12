@@ -21,6 +21,7 @@ from telebot import types
 from fb_operator.webapp_ui import get_miniapp_html
 from fb_operator.state_events import get_seq, publish_event, wait_for_relevant_events
 import fb_operator.admin_manager as adm
+import fb_operator.announcement_manager as ann
 import fb_operator.economy_manager as eco
 import fb_operator.hitl_manager as hitl
 
@@ -360,6 +361,36 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
             hooks["record_audit_log"](uid, str(tg_user.get("first_name") or ""), "SECURITY_BLOCK", detail)
             self._send_json(403, {"error": msg})
 
+        def _has_cap(self, uid: int, cap: str) -> bool:
+            fn = hooks.get("has_admin_capability") or adm.has_admin_capability
+            return bool(fn(uid, cap))
+
+        def _can_manage(self, actor_uid: int, target_uid: int) -> bool:
+            fn = hooks.get("can_manage_target_user") or adm.can_manage_target_user
+            return bool(fn(actor_uid, target_uid))
+
+        def _get_caps(self, uid: int) -> dict[str, bool]:
+            fn = hooks.get("get_user_admin_capabilities") or adm.get_user_admin_capabilities
+            return dict(fn(uid))
+
+        def _get_tier(self, uid: int) -> str:
+            fn = hooks.get("get_admin_tier") or adm.get_admin_tier
+            return str(fn(uid))
+
+        def _get_restr(self, uid: int) -> dict[str, bool]:
+            fn = hooks.get("get_admin_restrictions") or adm.get_admin_restrictions
+            return dict(fn(uid))
+
+        def _get_recipients(self, notice_kind: str) -> list[int]:
+            fn = hooks.get("get_admin_notification_recipients") or adm.get_admin_notification_recipients
+            try:
+                recs = list(fn(notice_kind))
+            except Exception:
+                recs = []
+            if not recs and hooks.get("SUPER_ADMIN_ID"):
+                recs = [int(hooks["SUPER_ADMIN_ID"])]
+            return recs
+
         def _authorize_hitl_acc(self, uid: int, tg_user: dict[str, Any], is_dev: bool, perms: dict[str, Any], acc_id: str) -> dict[str, Any] | None:
             clean_id = str(acc_id or "").strip()
             if not clean_id:
@@ -369,7 +400,7 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
             if not acc:
                 self._send_json(404, {"error": "الحساب غير موجود."})
                 return None
-            if not is_dev:
+            if not (is_dev or self._has_cap(uid, "accounts_pool")):
                 can_acc = bool(perms.get("can_add_accounts") or perms.get("can_use_accounts"))
                 if int(acc.get("owner_id") or 0) != int(uid) or not can_acc:
                     self._deny_perm(
@@ -418,6 +449,9 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                         "can_redeem_invite": status == "pending",
                         "message": msg,
                         "is_super_admin": False,
+                        "admin_tier": "none",
+                        "capabilities": {},
+                        "announcements": [],
                         "event_seq": get_seq(),
                         "user": {"id": uid, "name": user_rec.get("name", ""), "username": user_rec.get("username", "")},
                     })
@@ -425,8 +459,14 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
 
                 perms = {k: True for k in hooks["PERMISSION_LABELS"]} if is_dev else hooks["get_user_permissions"](uid)
                 enabled_labels = [lbl for k, lbl in hooks["PERMISSION_LABELS"].items() if perms.get(k)]
+                caps = self._get_caps(uid)
+                tier = self._get_tier(uid)
+                restr = self._get_restr(uid)
+                cap_pool = bool(caps.get("accounts_pool") or is_dev)
+                cap_pay = bool(caps.get("payment_notices") or is_dev)
+                cap_ann = bool(caps.get("announcements") or is_dev)
 
-                usable_raw = hooks["get_usable_accounts_for_user"](uid) if (is_dev or perms.get("can_use_accounts") or perms.get("can_execute")) else []
+                usable_raw = hooks["get_usable_accounts_for_user"](uid) if (cap_pool or perms.get("can_use_accounts") or perms.get("can_execute")) else []
                 usable_safe = [
                     {
                         "id": a["id"],
@@ -437,7 +477,7 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                 ]
 
                 manageable_safe = []
-                if is_dev or perms.get("can_add_accounts") or perms.get("can_delete_accounts"):
+                if cap_pool or perms.get("can_add_accounts") or perms.get("can_delete_accounts"):
                     for a in hooks["get_manageable_accounts_for_user"](uid):
                         owner_lbl = f"{a.get('owner_name', '')} ({a.get('owner_id', '')})" if a.get("owner_id") else "حساب نظام"
                         manageable_safe.append({
@@ -487,10 +527,17 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                 eco_cfg = eco.load_economy_settings()
                 usable_total = len(usable_safe)
                 manageable_total = len(manageable_safe)
+                active_anns = ann.list_announcements(only_active=True)
                 self._send_json(200, {
                     "authorized": True,
                     "status": "approved",
                     "is_super_admin": is_dev,
+                    "admin_tier": tier,
+                    "admin_tier_label": adm.ADMIN_TIER_LABELS.get(tier, tier),
+                    "admin_restrictions": restr,
+                    "capabilities": caps,
+                    "admin_tier_labels": adm.ADMIN_TIER_LABELS,
+                    "admin_restriction_labels": adm.ADMIN_RESTRICTION_LABELS,
                     "event_seq": get_seq(),
                     "user": {"id": uid, "name": user_rec.get("name", ""), "username": user_rec.get("username", "")},
                     "permissions": perms,
@@ -512,7 +559,31 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                         "codes": list(reversed(eco.list_invite_codes_by_owner(uid)))[-15:] if can_inv else [],
                     },
                     "ledger": list(reversed(eco.load_points_ledger(uid, limit=25))),
-                    "support_tickets": eco.list_support_tickets(uid, is_dev=is_dev, limit=30),
+                    "support_tickets": eco.list_support_tickets(uid, is_dev=cap_pay, limit=30),
+                    "announcements": active_anns,
+                    "all_announcements": ann.list_announcements(only_active=False) if cap_ann else [],
+                    "ann_meta": {
+                        "badges": list(ann.BADGE_OPTIONS),
+                        "styles": ann.STYLE_OPTIONS,
+                        "durations": ann.DURATION_PRESETS,
+                        "repeats": ann.REPEAT_PRESETS,
+                    },
+                })
+                return
+
+            if path == "/api/announcements/list":
+                auth = self._authenticate(touch_login=False)
+                if not auth:
+                    return
+                uid, tg_user, user_rec = auth
+                if not self._require_approved(uid, tg_user, user_rec):
+                    return
+                cap_ann = self._has_cap(uid, "announcements")
+                self._send_json(200, {
+                    "ok": True,
+                    "announcements": ann.list_announcements(only_active=True),
+                    "all_announcements": ann.list_announcements(only_active=False) if cap_ann else [],
+                    "can_manage": cap_ann,
                 })
                 return
 
@@ -523,7 +594,7 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                 uid, _tg_user, user_rec = auth
                 is_dev = hooks["is_super_admin"](uid)
                 perms = {k: True for k in hooks["PERMISSION_LABELS"]} if is_dev else hooks["get_user_permissions"](uid)
-                can_see_shared = is_dev or (user_rec.get("status") == "approved" and bool(perms.get("can_use_accounts")))
+                can_see_shared = is_dev or self._has_cap(uid, "accounts_pool") or (user_rec.get("status") == "approved" and bool(perms.get("can_use_accounts")))
 
                 qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                 try:
@@ -539,7 +610,7 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                 changed, new_seq, scopes = wait_for_relevant_events(
                     since_seq=since,
                     viewer_uid=uid,
-                    is_dev=is_dev,
+                    is_dev=is_dev or adm.is_admin_delegate(uid, include_manager=True),
                     can_see_shared_accounts=can_see_shared,
                     timeout=timeout,
                 )
@@ -555,12 +626,14 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                 if not auth:
                     return
                 uid, tg_user, _ = auth
-                if not hooks["is_super_admin"](uid):
-                    self._deny_perm(uid, tg_user, "محاولة استعلام رادار المطور الأكبر من مستخدم غير مصرح")
+                is_dev = hooks["is_super_admin"](uid)
+                if not self._has_cap(uid, "radar_users"):
+                    self._deny_perm(uid, tg_user, "محاولة استعلام رادار المطور من مستخدم غير مصرح")
                     return
 
+                cap_pool = self._has_cap(uid, "accounts_pool")
                 users_map = hooks["load_users"]()
-                all_accounts = hooks["load_accounts"]()
+                all_accounts = hooks["load_accounts"]() if cap_pool else []
                 accounts_by_owner: dict[int, list[dict[str, Any]]] = {}
                 for acc_item in all_accounts:
                     oid = int(acc_item.get("owner_id") or 0)
@@ -569,7 +642,7 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                 radar_users = []
                 for u_dict in users_map.values():
                     t_uid = int(u_dict.get("id", 0))
-                    if hooks["is_super_admin"](t_uid):
+                    if not self._can_manage(uid, t_uid):
                         continue
                     owned_accs = accounts_by_owner.get(t_uid, [])
                     full_accs = []
@@ -595,11 +668,15 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                     rate_yer = eco_cfg["yer_per_point"]
                     u_perms = u_dict.get("permissions", {})
                     u_pts = adm.safe_nonneg_points(u_dict.get("points", 0))
+                    t_tier = str(u_dict.get("admin_tier") or "none")
                     radar_users.append({
                         "id": t_uid,
                         "name": u_dict.get("name", ""),
                         "username": u_dict.get("username", ""),
                         "status": u_dict.get("status", "pending"),
+                        "admin_tier": t_tier,
+                        "admin_tier_label": adm.ADMIN_TIER_LABELS.get(t_tier, t_tier),
+                        "admin_restrictions": adm.get_admin_restrictions(t_uid),
                         "total_logins": u_dict.get("total_logins", 0),
                         "operations_count": u_dict.get("operations_count", 0),
                         "active_accounts_added": u_dict.get("active_accounts_added", 0),
@@ -613,7 +690,7 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                         "referred_by": int(u_dict.get("referred_by") or 0),
                         "referred_count": int(u_dict.get("referred_count", 0)),
                         "referral_rewarded": bool(u_dict.get("referral_rewarded", False)),
-                        "enabled_perms": sum(1 for v in u_perms.values() if v),
+                        "enabled_perms": len(hooks["PERMISSION_LABELS"]) if t_tier == "super_delegate" else sum(1 for v in u_perms.values() if v),
                         "permissions": u_perms,
                         "active_count": active_c,
                         "inactive_count": inactive_c,
@@ -624,6 +701,10 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                     "perm_labels": hooks["PERMISSION_LABELS"],
                     "economy_settings": eco.load_economy_settings(),
                     "op_cost_labels": eco.OP_COST_LABELS_AR,
+                    "can_edit_tiers": is_dev,
+                    "admin_tier_labels": adm.ADMIN_TIER_LABELS,
+                    "admin_restriction_labels": adm.ADMIN_RESTRICTION_LABELS,
+                    "capabilities": self._get_caps(uid),
                     "users": radar_users,
                 })
                 return
@@ -633,7 +714,7 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                 if not auth:
                     return
                 uid, tg_user, _ = auth
-                if not hooks["is_super_admin"](uid):
+                if not self._has_cap(uid, "audit_logs"):
                     self._deny_perm(uid, tg_user, "محاولة الوصول لسجل الرقابة من مستخدم غير مصرح")
                     return
 
@@ -686,8 +767,9 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                     limit_n = 100
 
                 items: list[dict[str, Any]] = []
+                cap_pool = self._has_cap(uid, "accounts_pool")
                 if kind == "usable":
-                    if is_dev or perms.get("can_use_accounts") or perms.get("can_execute"):
+                    if is_dev or cap_pool or perms.get("can_use_accounts") or perms.get("can_execute"):
                         for a in hooks["get_usable_accounts_for_user"](uid):
                             items.append({
                                 "id": a["id"],
@@ -695,7 +777,7 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                                 "is_active": "نشط" in str(a.get("status", "")),
                             })
                 else:
-                    if is_dev or perms.get("can_add_accounts") or perms.get("can_delete_accounts"):
+                    if is_dev or cap_pool or perms.get("can_add_accounts") or perms.get("can_delete_accounts"):
                         for a in hooks["get_manageable_accounts_for_user"](uid):
                             owner_lbl = f"{a.get('owner_name', '')} ({a.get('owner_id', '')})" if a.get("owner_id") else "حساب نظام"
                             items.append({
@@ -971,7 +1053,8 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                 return
 
             if path == "/api/accounts/delete":
-                if not (is_dev or perms.get("can_delete_accounts")):
+                cap_pool = self._has_cap(uid, "accounts_pool")
+                if not (is_dev or cap_pool or perms.get("can_delete_accounts")):
                     self._deny_perm(uid, tg_user, "محاولة حذف حساب عبر Mini App بدون صلاحية can_delete_accounts", "صلاحية حذف الحسابات غير مفعلة لحسابك.")
                     return
 
@@ -985,7 +1068,7 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                     self._send_json(404, {"error": "الحساب غير موجود."})
                     return
 
-                if not is_dev and acc.get("owner_id") != uid:
+                if not (is_dev or cap_pool) and acc.get("owner_id") != uid:
                     self._deny_perm(uid, tg_user, f"محاولة IDOR حذف حساب لا يملكه ({acc_id})", "لا يمكنك حذف حساب لم تقم أنت بإضافته.")
                     return
 
@@ -998,16 +1081,18 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                 return
 
             if path == "/api/accounts/purge":
-                if not (is_dev or perms.get("can_delete_accounts")):
+                cap_pool = self._has_cap(uid, "accounts_pool")
+                if not (is_dev or cap_pool or perms.get("can_delete_accounts")):
                     self._deny_perm(uid, tg_user, "محاولة تنظيف الحسابات التالفة بدون صلاحية can_delete_accounts")
                     return
-                removed, _removed_names = hooks["purge_broken_accounts"](owner_id=None if is_dev else uid)
+                removed, _removed_names = hooks["purge_broken_accounts"](owner_id=None if (is_dev or cap_pool) else uid)
                 hooks["record_audit_log"](uid, user_label, "PURGE_BROKEN_ACCOUNTS", f"تم تنظيف {removed} حساب عبر Mini App")
                 self._send_json(200, {"ok": True, "message": f"تم تنظيف وحذف {removed} حساب تالف في نطاقك."})
                 return
 
             if path == "/api/accounts/check":
-                if not (is_dev or perms.get("can_add_accounts") or perms.get("can_use_accounts")):
+                cap_pool = self._has_cap(uid, "accounts_pool")
+                if not (is_dev or cap_pool or perms.get("can_add_accounts") or perms.get("can_use_accounts")):
                     self._deny_perm(uid, tg_user, "محاولة فحص الجلسات عبر Mini App بدون صلاحية")
                     return
                 hooks["record_audit_log"](uid, user_label, "CHECK_SESSIONS", "تشغيل فحص الجلسات من Mini App")
@@ -1015,9 +1100,141 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                 self._send_json(200, {"ok": True, "message": "بدأ فحص حالة الجلسات في المتصفح الخلفي!"})
                 return
 
+            if path == "/api/announcements/manage":
+                if not self._has_cap(uid, "announcements"):
+                    self._deny_perm(uid, tg_user, "محاولة إدارة الإعلانات العائمة بدون صلاحية")
+                    return
+                act = str(body.get("action") or "").strip().lower()
+                if act == "create":
+                    title_a = str(body.get("title") or "").strip()
+                    body_a = str(body.get("body") or "").strip()
+                    if not title_a or not body_a:
+                        self._send_json(400, {"error": "عنوان ونص الإعلان مطلوبان."})
+                        return
+                    try:
+                        dur_s = max(0, int(body.get("duration_sec", 86400) or 0))
+                    except Exception:
+                        dur_s = 86400
+                    try:
+                        rep_s = max(0, int(body.get("repeat_interval_sec", 3600) or 0))
+                    except Exception:
+                        rep_s = 3600
+                    item = ann.create_announcement(
+                        title=title_a,
+                        body=body_a,
+                        created_by=uid,
+                        badge=str(body.get("badge") or "ميزة جديدة"),
+                        display_style=str(body.get("display_style") or "floating_card"),
+                        cta_label=str(body.get("cta_label") or "استعراض الميزة الآن"),
+                        cta_tab=str(body.get("cta_tab") or ""),
+                        duration_sec=dur_s,
+                        repeat_interval_sec=rep_s,
+                        repeat_on_open=bool(body.get("repeat_on_open", True)),
+                        pin_in_chat=bool(body.get("pin_in_chat", True)),
+                    )
+                    b_res = {"sent": 0, "pinned": 0}
+                    if body.get("push_telegram", True) and callable(hooks.get("broadcast_announcement")):
+                        try:
+                            b_res = hooks["broadcast_announcement"](item, is_repeat=False)
+                        except Exception:
+                            pass
+                    hooks["record_audit_log"](uid, user_label, "ANNOUNCEMENT_CREATED", f"إنشاء إعلان عائم: {item['title']}")
+                    self._send_json(200, {
+                        "ok": True,
+                        "announcement": item,
+                        "all_announcements": ann.list_announcements(only_active=False),
+                        "announcements": ann.list_announcements(only_active=True),
+                        "message": f"✅ تم نشر الإعلان العائم فوراً (تثبيت تلقائي لـ {b_res.get('sent', 0)} محادثة).",
+                    })
+                    return
+
+                ann_id = str(body.get("ann_id") or "").strip()
+                if not ann_id:
+                    self._send_json(400, {"error": "معرّف الإعلان مطلوب."})
+                    return
+
+                if act == "toggle":
+                    upd = ann.toggle_announcement_active(ann_id)
+                    if not upd:
+                        self._send_json(404, {"error": "الإعلان غير موجود."})
+                        return
+                    if not upd.get("active") and callable(hooks.get("unpin_announcement_chats")):
+                        try:
+                            hooks["unpin_announcement_chats"](upd)
+                        except Exception:
+                            pass
+                    self._send_json(200, {
+                        "ok": True,
+                        "announcement": upd,
+                        "all_announcements": ann.list_announcements(only_active=False),
+                        "announcements": ann.list_announcements(only_active=True),
+                        "message": "▶️ تم تفعيل الإعلان العائم." if upd.get("active") else "⏸️ تم إيقاف الإعلان وفك تثبيته.",
+                    })
+                    return
+
+                if act == "update_timing":
+                    dur_v = int(body["duration_sec"]) if "duration_sec" in body and body["duration_sec"] is not None else None
+                    rep_v = int(body["repeat_interval_sec"]) if "repeat_interval_sec" in body and body["repeat_interval_sec"] is not None else None
+                    rop_v = bool(body["repeat_on_open"]) if "repeat_on_open" in body and body["repeat_on_open"] is not None else None
+                    upd = ann.update_announcement_timing(ann_id, duration_sec=dur_v, repeat_interval_sec=rep_v, repeat_on_open=rop_v)
+                    if not upd:
+                        self._send_json(404, {"error": "الإعلان غير موجود."})
+                        return
+                    self._send_json(200, {
+                        "ok": True,
+                        "announcement": upd,
+                        "all_announcements": ann.list_announcements(only_active=False),
+                        "announcements": ann.list_announcements(only_active=True),
+                        "message": "✅ تم تحديث مدة وتكرار الإعلان.",
+                    })
+                    return
+
+                if act == "push_now":
+                    item = ann.get_announcement_by_id(ann_id)
+                    if not item:
+                        self._send_json(404, {"error": "الإعلان غير موجود."})
+                        return
+                    b_res = {"sent": 0}
+                    if callable(hooks.get("broadcast_announcement")):
+                        try:
+                            b_res = hooks["broadcast_announcement"](item, is_repeat=True)
+                        except Exception:
+                            pass
+                    ann.mark_announcement_repushed(ann_id)
+                    self._send_json(200, {
+                        "ok": True,
+                        "all_announcements": ann.list_announcements(only_active=False),
+                        "announcements": ann.list_announcements(only_active=True),
+                        "message": f"🚀 تم إعادة البث العائم لـ {b_res.get('sent', 0)} مستخدم واللوحات المفتوحة!",
+                    })
+                    return
+
+                if act == "delete":
+                    removed = ann.delete_announcement(ann_id)
+                    if not removed:
+                        self._send_json(404, {"error": "الإعلان غير موجود."})
+                        return
+                    unpinned = 0
+                    if callable(hooks.get("unpin_announcement_chats")):
+                        try:
+                            unpinned = int(hooks["unpin_announcement_chats"](removed) or 0)
+                        except Exception:
+                            pass
+                    hooks["record_audit_log"](uid, user_label, "ANNOUNCEMENT_DELETED", f"حذف إعلان {ann_id} وفك تثبيت {unpinned} محادثة")
+                    self._send_json(200, {
+                        "ok": True,
+                        "all_announcements": ann.list_announcements(only_active=False),
+                        "announcements": ann.list_announcements(only_active=True),
+                        "message": f"🗑️ تم حذف الإعلان وإزالته فوراً (فك تثبيت {unpinned} محادثة).",
+                    })
+                    return
+
+                self._send_json(400, {"error": "إجراء إعلان غير معروف."})
+                return
+
             if path == "/api/admin/user/perm":
-                if not is_dev:
-                    self._deny_perm(uid, tg_user, "محاولة تعديل صلاحيات مستخدم عبر API من غير المطور")
+                if not self._has_cap(uid, "radar_users"):
+                    self._deny_perm(uid, tg_user, "محاولة تعديل صلاحيات مستخدم عبر API من غير مصرح")
                     return
                 try:
                     target_id = int(body.get("target_id"))
@@ -1025,8 +1242,8 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                     self._send_json(400, {"error": "معرف المستخدم غير صالح."})
                     return
 
-                if hooks["is_super_admin"](target_id):
-                    self._send_json(403, {"error": "محظور برمجياً تعديل صلاحيات المطور الرئيسي."})
+                if hooks["is_super_admin"](target_id) or not self._can_manage(uid, target_id):
+                    self._deny_perm(uid, tg_user, f"محاولة تعديل صلاحية خارج النطاق للهدف {target_id}", "محظور برمجياً تعديل صلاحيات المطور الرئيسي أو هذه الرتبة.")
                     return
 
                 perm_key = str(body.get("permission") or "").strip()
@@ -1040,8 +1257,8 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                 return
 
             if path == "/api/admin/user/action":
-                if not is_dev:
-                    self._deny_perm(uid, tg_user, "محاولة تنفيذ قرار إداري على مستخدم من غير المطور")
+                if not self._has_cap(uid, "radar_users"):
+                    self._deny_perm(uid, tg_user, "محاولة تنفيذ قرار إداري على مستخدم من غير مصرح")
                     return
                 try:
                     target_id = int(body.get("target_id"))
@@ -1060,6 +1277,49 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
 
                 act = str(body.get("action") or "").strip()
                 bot_inst = hooks.get("bot")
+
+                if act == "set_tier":
+                    if not is_dev:
+                        self._deny_perm(uid, tg_user, f"محاولة تغيير رتبة إدارية بدون سلطة المطور الأكبر ({target_id})", "تعيين الرتب والمدراء حصري للمطور الرئيسي فقط.")
+                        return
+                    tier_val = str(body.get("tier") or "none").strip()
+                    fn_tier = hooks.get("set_admin_tier") or adm.set_admin_tier
+                    if not fn_tier(target_id, tier_val, uid):
+                        self._send_json(400, {"error": "قيمة الرتبة غير صالحة."})
+                        return
+                    update_menu_button_for_user(bot_inst, target_id, is_allowed=True)
+                    t_lbl = adm.ADMIN_TIER_LABELS.get(tier_val, tier_val)
+                    hooks["safe_send"](target_id, f"🎖️ <b>تحديث رتبتك الإدارية:</b> تم تعيينك كـ <b>{html.escape(t_lbl, quote=True)}</b>.")
+                    self._send_json(200, {"ok": True, "tier": tier_val, "message": f"✅ تم تعيين الرتبة: {t_lbl}"})
+                    return
+
+                if act == "toggle_restriction":
+                    if not is_dev:
+                        self._deny_perm(uid, tg_user, f"محاولة فك أو فرض قيود رتبة بدون سلطة المطور الأكبر ({target_id})", "التحكم بقيود المدراء وحجب الإشعارات حصري للمطور الرئيسي فقط.")
+                        return
+                    rkey = str(body.get("restriction_key") or "").strip()
+                    fn_restr = hooks.get("toggle_admin_restriction") or adm.toggle_admin_restriction
+                    res_b = fn_restr(target_id, rkey, uid)
+                    if res_b is None:
+                        self._send_json(400, {"error": "اسم القيد غير معروف."})
+                        return
+                    r_lbl = adm.ADMIN_RESTRICTION_LABELS.get(rkey, rkey)
+                    self._send_json(200, {"ok": True, "value": res_b, "message": f"{'🔒 تم الحجب:' if res_b else '✅ تم الإتاحة:'} {r_lbl}"})
+                    return
+
+                if not self._can_manage(uid, target_id):
+                    self._deny_perm(uid, tg_user, f"محاولة تجاوز الهرمية الإدارية ضد {target_id}", "لا تملك صلاحية تعديل هذه الرتبة الإدارية.")
+                    return
+
+                if act == "grant_all":
+                    fn_grant = hooks.get("grant_all_user_permissions") or adm.grant_all_user_permissions
+                    if not fn_grant(target_id, uid):
+                        self._send_json(403, {"error": "تعذر منح الصلاحيات الكاملة لهذا المستخدم."})
+                        return
+                    update_menu_button_for_user(bot_inst, target_id, is_allowed=True)
+                    hooks["safe_send"](target_id, "🌟 <b>تهانينا! تم تفعيل كافة أدوات ومميزات النظام لحسابك بالكامل.</b>")
+                    self._send_json(200, {"ok": True, "message": "🌟 تم منح كافة المميزات الـ 11 للمستخدم بضغطة واحدة!"})
+                    return
 
                 if act == "approve":
                     hooks["approve_user"](target_id)
@@ -1124,7 +1384,7 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                 if not code:
                     self._send_json(400, {"error": "كود الإحالة مطلوب."})
                     return
-                if not eco.revoke_invite_code(uid, code, is_dev=is_dev):
+                if not eco.revoke_invite_code(uid, code, is_dev=self._has_cap(uid, "points_economy")):
                     self._send_json(403, {"error": "الكود غير موجود أو لا يخصك."})
                     return
                 self._send_json(200, {"ok": True, "message": "تم إلغاء كود الدعوة بنجاح."})
@@ -1139,7 +1399,6 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                     return
                 tkt = res["ticket"]
                 snap = tkt["snapshot"]
-                super_id = int(hooks["SUPER_ADMIN_ID"])
                 u_tag = f"@{html.escape(username, quote=True)}" if username else "بدون معرف"
                 title = "💵 طلب موافقة على بيع الحسابات والمحاسبة" if tkt["kind"] == "sell_accounts" else "💬 رسالة جديدة للدعم والمطور"
                 mk = types.InlineKeyboardMarkup(row_width=1)
@@ -1150,8 +1409,7 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                         callback_data=f"tkt_settle_{tkt['id']}"
                     ))
                 mk.add(types.InlineKeyboardButton("🛰️ فتح بطاقة المستخدم بالرادار", callback_data=f"surv_user_{uid}"))
-                hooks["safe_send"](
-                    super_id,
+                tkt_html = (
                     f"📬 <b>{title}</b>\n"
                     "━━━━━━━━━━━━━━━━━━━━\n"
                     f"🎫 <b>رقم التذكرة:</b> <code>{tkt['id']}</code>\n"
@@ -1161,9 +1419,10 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                     f"💰 <b>رصيد النقاط:</b> {snap['points']} نقطة = <b>{snap['yer_value']:,} ريال يمني</b>\n"
                     f"🧾 <b>تمت محاسبته سابقاً:</b> {snap['total_yer_settled']:,} ريال يمني\n"
                     "━━━━━━━━━━━━━━━━━━━━\n"
-                    f"📝 <b>رسالته:</b>\n{html.escape(msg_txt, quote=True)}",
-                    reply_markup=mk,
+                    f"📝 <b>رسالته:</b>\n{html.escape(msg_txt, quote=True)}"
                 )
+                for rec_uid in self._get_recipients("payment_notices"):
+                    hooks["safe_send"](rec_uid, tkt_html, reply_markup=mk)
                 self._send_json(200, {"ok": True, "ticket": tkt, "message": "✅ تم إرسال رسالتك إلى المطور مع كامل تفاصيل حساباتك ونقاطك!"})
                 return
 
@@ -1173,19 +1432,20 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                 if not ticket_id:
                     self._send_json(400, {"error": "رقم التذكرة مطلوب."})
                     return
-                res = eco.reply_support_ticket(ticket_id, uid, msg_txt, is_dev=is_dev)
+                is_pay_dev = self._has_cap(uid, "payment_notices")
+                res = eco.reply_support_ticket(ticket_id, uid, msg_txt, is_dev=is_pay_dev)
                 if not res.get("ok"):
                     code_http = 403 if res.get("error") == "forbidden" else 400
                     self._send_json(code_http, {"error": "لا يمكنك الرد على هذه التذكرة." if code_http == 403 else res.get("error", "خطأ.")})
                     return
                 tkt = res["ticket"]
                 snap = tkt.get("snapshot", {})
-                if is_dev:
+                if is_pay_dev and int(tkt.get("user_id", 0)) != int(uid):
                     mk_u = types.InlineKeyboardMarkup(row_width=1)
                     mk_u.add(types.InlineKeyboardButton("↩️ الرد على المطور / الدعم", callback_data=f"user_reply_tkt_{tkt['id']}"))
                     hooks["safe_send"](
                         tkt["user_id"],
-                        f"📩 <b>رد جديد من المطور / الدعم</b> (<code>{tkt['id']}</code>)\n"
+                        f"📩 <b>رد جديد من الإدارة / الدعم</b> (<code>{tkt['id']}</code>)\n"
                         "━━━━━━━━━━━━━━━━━━━━\n"
                         f"💬 {html.escape(msg_txt, quote=True)}\n"
                         "━━━━━━━━━━━━━━━━━━━━\n"
@@ -1193,7 +1453,6 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                         reply_markup=mk_u,
                     )
                 else:
-                    super_id = int(hooks["SUPER_ADMIN_ID"])
                     mk_d = types.InlineKeyboardMarkup(row_width=1)
                     mk_d.add(types.InlineKeyboardButton("↩️ الرد على المستخدم", callback_data=f"tkt_reply_{tkt['id']}"))
                     if snap.get("points", 0) > 0:
@@ -1201,27 +1460,33 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                             f"💸 تسوية الرصيد ({snap['points']} نقطة = {snap['yer_value']:,} ريال)",
                             callback_data=f"tkt_settle_{tkt['id']}"
                         ))
-                    hooks["safe_send"](
-                        super_id,
+                    reply_html = (
                         f"💬 <b>رد جديد من المستخدم</b> {html.escape(user_label, quote=True)} (<code>{uid}</code>)\n"
                         f"🎫 <b>تذكرة:</b> <code>{tkt['id']}</code> | 💰 <b>الرصيد:</b> {snap.get('points', 0)} نقطة ({snap.get('yer_value', 0):,} ريال)\n"
-                        f"📝 {html.escape(msg_txt, quote=True)}",
-                        reply_markup=mk_d,
+                        f"📝 {html.escape(msg_txt, quote=True)}"
                     )
+                    for rec_uid in self._get_recipients("payment_notices"):
+                        hooks["safe_send"](rec_uid, reply_html, reply_markup=mk_d)
                 self._send_json(200, {"ok": True, "ticket": tkt, "message": "✅ تم إرسال الرد بنجاح."})
                 return
 
             if path == "/api/admin/points":
-                if not is_dev:
-                    self._deny_perm(uid, tg_user, "محاولة التلاعب بالنقاط من غير المطور الرئيسي")
+                if not (self._has_cap(uid, "points_economy") and self._has_cap(uid, "radar_users")):
+                    self._deny_perm(uid, tg_user, "محاولة التلاعب بالنقاط من غير مصرح")
                     return
                 try:
                     target_id = int(body.get("target_id"))
                 except Exception:
                     self._send_json(400, {"error": "معرف المستخدم غير صالح."})
                     return
+                if not self._can_manage(uid, target_id):
+                    self._deny_perm(uid, tg_user, f"محاولة تعديل نقاط خارج النطاق ({target_id})", "لا تملك صلاحية تعديل نقاط هذه الرتبة.")
+                    return
 
                 act = str(body.get("action") or "").strip()
+                if act == "settle" and not self._has_cap(uid, "payment_notices"):
+                    self._deny_perm(uid, tg_user, f"محاولة تسوية مالية رغم حجب إشعارات الدفع ({target_id})", "التسويات المالية محجوبة عن صلاحيتك حالياً.")
+                    return
                 reason = str(body.get("reason") or "تعديل يدوي من المطور").strip()[:240]
                 ticket_id = str(body.get("ticket_id") or "").strip() or None
 
@@ -1274,8 +1539,8 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                 return
 
             if path == "/api/admin/economy":
-                if not is_dev:
-                    self._deny_perm(uid, tg_user, "محاولة تعديل تسعيرة النقاط والوضع العام من غير المطور")
+                if not self._has_cap(uid, "points_economy"):
+                    self._deny_perm(uid, tg_user, "محاولة تعديل تسعيرة النقاط والوضع العام من غير مصرح")
                     return
                 updated = eco.update_economy_settings(body, actor_uid=uid)
                 self._send_json(200, {"ok": True, "economy_settings": updated, "message": "✅ تم حفظ إعدادات النقاط والتسعيرة والوضع العام بنجاح."})

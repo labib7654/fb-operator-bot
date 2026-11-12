@@ -271,6 +271,216 @@ def get_miniapp_html() -> str:
             overscroll-behavior: contain;
             background: rgba(0, 0, 0, 0.72);
         }
+
+        /* ===== الإعلانات العائمة (Popover & Top-Layer Dialog) ===== */
+        #promoToastRegion {
+            position: fixed;
+            inset-block-start: 12px;
+            inset-inline: 12px;
+            z-index: 980;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 8px;
+            pointer-events: none;
+        }
+        .promo-toast-card {
+            pointer-events: auto;
+            width: min(460px, 100%);
+            margin: 0;
+            inset: auto;
+            position: relative;
+            background: #141b25;
+            color: var(--text);
+            border: 1px solid rgba(43, 125, 233, 0.55);
+            border-radius: 10px;
+            padding: 12px 14px;
+            box-shadow: 0 14px 36px rgba(0, 0, 0, 0.55);
+            display: none;
+            opacity: 0;
+            transition-property: opacity, transform, display, overlay;
+            transition-duration: 240ms;
+            transition-timing-function: cubic-bezier(0.2, 0.8, 0.2, 1);
+            transition-behavior: allow-discrete;
+        }
+        .promo-toast-card.style-urgent {
+            border-color: rgba(248, 81, 73, 0.7);
+            background: #1c1519;
+        }
+        .promo-toast-card.style-ribbon {
+            border-color: rgba(46, 160, 67, 0.65);
+            background: #111c17;
+        }
+        .promo-toast-card.style-glow {
+            border-color: rgba(210, 153, 34, 0.7);
+            background: #1b1812;
+        }
+        .promo-toast-card:is(:popover-open, .\:popover-open) {
+            display: block;
+            opacity: 1;
+        }
+        @starting-style {
+            .promo-toast-card:is(:popover-open, .\:popover-open) {
+                opacity: 0;
+            }
+        }
+        @media (prefers-reduced-motion: no-preference) {
+            .promo-toast-card {
+                transform: translateY(-10px) scale(0.98);
+            }
+            .promo-toast-card:is(:popover-open, .\:popover-open) {
+                transform: translateY(0) scale(1);
+            }
+            @starting-style {
+                .promo-toast-card:is(:popover-open, .\:popover-open) {
+                    transform: translateY(-10px) scale(0.98);
+                }
+            }
+        }
+        @media (prefers-reduced-motion: reduce) {
+            .promo-toast-card {
+                transition-duration: 120ms;
+                transform: none;
+            }
+        }
+        .promo-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            margin-bottom: 6px;
+        }
+        .promo-badge {
+            font-size: 11px;
+            font-weight: 700;
+            padding: 2px 8px;
+            border-radius: 5px;
+            background: rgba(43, 125, 233, 0.18);
+            color: #7ab8ff;
+            border: 1px solid rgba(43, 125, 233, 0.35);
+        }
+        .style-urgent .promo-badge {
+            background: rgba(248, 81, 73, 0.18);
+            color: #ff9492;
+            border-color: rgba(248, 81, 73, 0.35);
+        }
+        .style-glow .promo-badge {
+            background: rgba(210, 153, 34, 0.18);
+            color: #f3c86a;
+            border-color: rgba(210, 153, 34, 0.35);
+        }
+        .style-ribbon .promo-badge {
+            background: rgba(46, 160, 67, 0.18);
+            color: #7ee787;
+            border-color: rgba(46, 160, 67, 0.35);
+        }
+        .promo-title {
+            font-size: 14px;
+            font-weight: 700;
+            margin-bottom: 4px;
+            color: var(--text);
+        }
+        .promo-body {
+            font-size: 12.5px;
+            color: var(--muted);
+            white-space: pre-wrap;
+            line-height: 1.5;
+            margin-bottom: 10px;
+        }
+        .promo-actions {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        dialog.promo-dialog {
+            padding: 0;
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            background: #131922;
+            color: var(--text);
+            width: min(460px, 94vw);
+            max-width: 94vw;
+            margin: auto;
+            box-shadow: 0 24px 60px rgba(0, 0, 0, 0.7);
+            opacity: 0;
+            transition-property: opacity, transform, display, overlay;
+            transition-duration: 240ms;
+            transition-timing-function: cubic-bezier(0.2, 0.8, 0.2, 1);
+            transition-behavior: allow-discrete;
+        }
+        dialog.promo-dialog[open] {
+            opacity: 1;
+        }
+        dialog.promo-dialog[data-closing] {
+            opacity: 0;
+        }
+        @starting-style {
+            dialog.promo-dialog[open] {
+                opacity: 0;
+            }
+        }
+        dialog.promo-dialog:modal {
+            overscroll-behavior: contain;
+        }
+        dialog.promo-dialog::backdrop {
+            overflow: hidden;
+            overscroll-behavior: contain;
+            background: rgba(0, 0, 0, 0.72);
+            opacity: 0;
+            transition-property: opacity, display, overlay;
+            transition-duration: 240ms;
+            transition-timing-function: ease-out;
+            transition-behavior: allow-discrete;
+        }
+        dialog.promo-dialog[open]::backdrop {
+            opacity: 1;
+        }
+        dialog.promo-dialog[data-closing]::backdrop {
+            opacity: 0;
+        }
+        @starting-style {
+            dialog.promo-dialog[open]::backdrop {
+                opacity: 0;
+            }
+        }
+        @media (prefers-reduced-motion: no-preference) {
+            dialog.promo-dialog {
+                transform: translateY(14px) scale(0.97);
+            }
+            dialog.promo-dialog[open] {
+                transform: translateY(0) scale(1);
+            }
+            dialog.promo-dialog[data-closing] {
+                transform: translateY(10px) scale(0.97);
+            }
+            @starting-style {
+                dialog.promo-dialog[open] {
+                    transform: translateY(14px) scale(0.97);
+                }
+            }
+        }
+        @media (prefers-reduced-motion: reduce) {
+            dialog.promo-dialog,
+            dialog.promo-dialog::backdrop {
+                transition-duration: 120ms;
+                transform: none;
+            }
+        }
+        .promo-modal-inner {
+            padding: 16px;
+        }
+        .promo-modal-footer {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            flex-wrap: wrap;
+            margin-top: 12px;
+            padding-top: 10px;
+            border-top: 1px solid var(--border);
+        }
         .hitl-head {
             display: flex;
             align-items: center;
@@ -651,7 +861,7 @@ def get_miniapp_html() -> str:
             </div>
         </div>
 
-        <!-- تبويب تسعيرة النقاط والوضع العام (للمطور الرئيسي فقط) -->
+        <!-- تبويب تسعيرة النقاط والوضع العام -->
         <div id="tab-economy" class="tab-view hidden">
             <div class="panel">
                 <div class="panel-title">
@@ -661,10 +871,115 @@ def get_miniapp_html() -> str:
                 <div id="economySettingsContainer"></div>
             </div>
         </div>
+
+        <!-- تبويب الإعلانات العائمة التفاعلية -->
+        <div id="tab-announcements" class="tab-view hidden">
+            <div class="panel">
+                <div class="panel-title">
+                    <span>إعلانات المميزات العائمة والمثبتة</span>
+                    <div style="display:flex;gap:6px;">
+                        <button type="button" class="btn btn-muted btn-sm" onclick="loadAnnouncementsTab()">تحديث</button>
+                        <button type="button" class="btn btn-muted btn-sm" onclick="goHomeTab()">رجوع</button>
+                    </div>
+                </div>
+                <div class="field">
+                    <label for="annTitle">عنوان الإعلان العائم</label>
+                    <input type="text" id="annTitle" placeholder="مثال: ميزة البروكسي الذكي وفحص الحسابات التلقائي">
+                </div>
+                <div class="field">
+                    <label for="annBody">تفاصيل العرض أو الميزة</label>
+                    <textarea id="annBody" placeholder="اكتب شرحاً مختصراً وواضحاً يظهر في البطاقة العائمة داخل تلغرام والتطبيق..."></textarea>
+                </div>
+                <div class="row-2">
+                    <div class="field">
+                        <label for="annBadge">الشارة</label>
+                        <select id="annBadge"></select>
+                    </div>
+                    <div class="field">
+                        <label for="annStyle">نمط العرض العائم</label>
+                        <select id="annStyle"></select>
+                    </div>
+                </div>
+                <div class="row-2">
+                    <div class="field">
+                        <label for="annDuration">مدة البقاء (إلغاء تلقائي عند الانتهاء)</label>
+                        <select id="annDuration"></select>
+                    </div>
+                    <div class="field">
+                        <label for="annRepeat">إعادة الإرسال والتكرار</label>
+                        <select id="annRepeat"></select>
+                    </div>
+                </div>
+                <div class="row-2">
+                    <div class="field">
+                        <label for="annCtaLabel">نص زر الإجراء</label>
+                        <input type="text" id="annCtaLabel" value="فتح الميزة الآن">
+                    </div>
+                    <div class="field">
+                        <label for="annCtaTab">التبويب المستهدف عند النقر</label>
+                        <select id="annCtaTab">
+                            <option value="mission">العمليات</option>
+                            <option value="accounts">الحسابات</option>
+                            <option value="wallet">المحفظة والإحالة</option>
+                            <option value="support">الدعم والمحاسبة</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="item-row" style="margin-bottom:10px;">
+                    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:6px;text-transform:none;color:var(--text);">
+                        <input type="checkbox" id="annPinChat" checked style="width:auto;">
+                        <span>تثبيت كبطاقة عائمة أعلى محادثات المستخدمين في تلغرام</span>
+                    </label>
+                    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:6px;text-transform:none;color:var(--text);">
+                        <input type="checkbox" id="annPushNow" checked style="width:auto;">
+                        <span>بث فوري وإيقاظ اللوحة لدى جميع المستخدمين</span>
+                    </label>
+                    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin:0;text-transform:none;color:var(--text);">
+                        <input type="checkbox" id="annRepeatOnOpen" checked style="width:auto;">
+                        <span>إبراز البطاقة العائمة تلقائياً عند فتح لوحة التحكم</span>
+                    </label>
+                </div>
+                <button type="button" class="btn btn-primary" id="btnCreateAnn" onclick="createAnnouncementSubmit()">نشر وتثبيت الإعلان العائم الآن</button>
+            </div>
+            <div class="panel">
+                <div class="panel-title">الإعلانات المنشورة</div>
+                <div id="announcementsAdminList"></div>
+            </div>
+        </div>
     </div>
 </div>
 
 <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+<div id="promoToastRegion" role="region" aria-label="تنبيهات المميزات العائمة">
+    <div id="promoToastCard" class="promo-toast-card" popover="manual">
+        <div class="promo-head">
+            <span id="promoToastBadge" class="promo-badge">ميزة جديدة</span>
+            <button type="button" id="promoToastCloseBtn" class="btn btn-muted btn-sm" popovertarget="promoToastCard" popovertargetaction="hide">إغلاق</button>
+        </div>
+        <div id="promoToastTitle" class="promo-title"></div>
+        <div id="promoToastBody" class="promo-body"></div>
+        <div class="promo-actions">
+            <button type="button" id="promoToastOpenBtn" class="btn btn-primary btn-sm">معاينة البطاقة</button>
+            <button type="button" id="promoToastAckBtn" class="btn btn-ok btn-sm">فتح الميزة</button>
+        </div>
+    </div>
+</div>
+
+<dialog id="promoModal" class="promo-dialog" closedby="any" aria-labelledby="promoModalTitle">
+    <div class="promo-modal-inner" id="promoModalInner">
+        <div class="promo-head">
+            <span id="promoModalBadge" class="promo-badge">ميزة جديدة</span>
+            <span id="promoModalTtl" class="mono"></span>
+        </div>
+        <div id="promoModalTitle" class="promo-title" style="font-size:16px;margin-bottom:8px;"></div>
+        <div id="promoModalBody" class="promo-body" style="color:var(--text);font-size:13px;"></div>
+        <div class="promo-modal-footer">
+            <button type="button" id="promoModalCtaBtn" class="btn btn-ok btn-sm">الانتقال الآن</button>
+            <button type="button" id="promoModalCloseBtn" class="btn btn-muted btn-sm">تم الاطلاع وإغلاق</button>
+        </div>
+    </div>
+</dialog>
 
 <dialog id="hitlDialog" class="hitl-dialog" aria-labelledby="hitlDialogTitle" closedby="closerequest">
     <div class="hitl-head">
@@ -724,6 +1039,15 @@ let lastEventSeq = 0;
 let syncRunning = false;
 let syncAbortCtrl = null;
 let lastRadarData = null;
+let activePromoAnn = null;
+let queuedPromoAnn = null;
+let promoToastTimer = null;
+let promoToastPaused = false;
+let promoTickerInterval = null;
+let promoShownOnOpen = {};
+let promoLastRepopAt = {};
+let promoDialogWired = false;
+let _canTransDisplayCached = null;
 
 if (tg && tg.BackButton) {
     tg.BackButton.onClick(() => handleNativeBack());
@@ -848,11 +1172,18 @@ async function applyLiveSyncUpdate(scopes) {
 
     const wasLocked = !appState || !appState.authorized;
     const prevPerms = JSON.stringify(appState && appState.permissions ? appState.permissions : {});
+    const prevCaps = JSON.stringify(appState && appState.capabilities ? appState.capabilities : {});
+    const prevTier = (appState && appState.admin_tier) || "";
+    const prevAnnIds = new Set((appState && appState.announcements ? appState.announcements : []).map(a => a.id));
+
     const nextPerms = JSON.stringify(fresh.permissions || {});
+    const nextCaps = JSON.stringify(fresh.capabilities || {});
+    const nextTier = fresh.admin_tier || "";
     appState = fresh;
     document.getElementById("appShell").classList.remove("hidden");
 
-    if (wasLocked || prevPerms !== nextPerms) {
+    const scList = scopes || [];
+    if (wasLocked || prevPerms !== nextPerms || prevCaps !== nextCaps || prevTier !== nextTier) {
         renderApp();
     } else {
         updateWalletTopbar();
@@ -861,20 +1192,31 @@ async function applyLiveSyncUpdate(scopes) {
         refreshUsableSelect();
         renderAccountsList();
         renderWalletTab();
+        renderSupportComposer();
         renderSupportTickets();
     }
 
-    if (fresh.is_super_admin) {
-        const scList = scopes || [];
-        const activeTab = document.getElementById("tabsBar")?.dataset.activeTab || "";
-        if ((scList.includes("users") || scList.includes("accounts") || scList.includes("economy") || scList.includes("support")) && activeTab === "radar") {
-            await loadAdminRadar();
-        }
-        if ((scList.includes("audit") || scList.includes("users") || scList.includes("accounts")) && activeTab === "audit") {
-            await loadAuditLogs();
-        }
-        if (scList.includes("economy") && activeTab === "economy") {
-            renderEconomyTab();
+    const caps = fresh.capabilities || {};
+    const activeTab = document.getElementById("tabsBar")?.dataset.activeTab || "";
+    if ((fresh.is_super_admin || caps.radar_users) && (scList.includes("users") || scList.includes("accounts") || scList.includes("economy") || scList.includes("support")) && activeTab === "radar") {
+        await loadAdminRadar();
+    }
+    if ((fresh.is_super_admin || caps.audit_logs) && (scList.includes("audit") || scList.includes("users") || scList.includes("accounts")) && activeTab === "audit") {
+        await loadAuditLogs();
+    }
+    if ((fresh.is_super_admin || caps.points_economy) && scList.includes("economy") && activeTab === "economy") {
+        renderEconomyTab();
+    }
+    if ((fresh.is_super_admin || caps.announcements) && scList.includes("announcements") && activeTab === "announcements") {
+        renderAnnouncementsList();
+    }
+    if (scList.includes("announcements")) {
+        const latestAnns = fresh.announcements || [];
+        const newItem = latestAnns.find(a => !prevAnnIds.has(a.id)) || latestAnns[0];
+        if (newItem) {
+            presentFloatingAnnouncement(newItem, newItem.display_style === "full_spotlight");
+        } else if (activePromoAnn) {
+            hidePromoToast();
         }
     }
 }
@@ -917,7 +1259,7 @@ document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "hidden" && syncAbortCtrl) {
         try { syncAbortCtrl.abort(); } catch (_) {}
     } else if (document.visibilityState === "visible" && syncRunning) {
-        applyLiveSyncUpdate(["users", "accounts", "audit", "mission", "economy", "support"]).catch(() => {});
+        applyLiveSyncUpdate(["users", "accounts", "audit", "mission", "economy", "support", "announcements"]).catch(() => {});
     }
 });
 
@@ -938,6 +1280,7 @@ async function redeemInviteCode() {
 
 async function bootstrap() {
     try {
+        wirePromoControls();
         const data = await apiCall("/api/bootstrap");
         document.getElementById("loadingBox").classList.add("hidden");
         if (data.event_seq) lastEventSeq = data.event_seq;
@@ -960,9 +1303,15 @@ async function bootstrap() {
         startEventSyncLoop();
         const urlParams = new URLSearchParams(window.location.search);
         const deepHitl = (urlParams.get("hitl") || "").trim();
+        const deepPromo = (urlParams.get("promo") || "").trim();
         if (deepHitl) {
             if (currentTabs.some(t => t.id === "accounts")) switchTab("accounts", false);
             openHitlLive(deepHitl);
+        } else if (deepPromo) {
+            const targetAnn = (appState.announcements || []).find(a => a.id === deepPromo) || (appState.announcements || [])[0];
+            if (targetAnn) openPromoModal(targetAnn);
+        } else {
+            triggerOpenPromoIfNeeded();
         }
     } catch (err) {
         document.getElementById("loadingBox").classList.add("hidden");
@@ -984,35 +1333,42 @@ function updateWalletTopbar() {
 function renderApp() {
     document.getElementById("lockedBox").classList.add("hidden");
     const u = appState.user;
-    const p = appState.permissions;
-    const isDev = appState.is_super_admin;
+    const p = appState.permissions || {};
+    const caps = appState.capabilities || {};
+    const isDev = !!appState.is_super_admin;
 
     document.getElementById("userNameLbl").textContent = u.name || "FB Operator";
-    document.getElementById("rolePill").textContent = isDev ? "المطور الرئيسي" : "عضو معتمد";
+    document.getElementById("rolePill").textContent = appState.admin_tier_label || (isDev ? "المطور الرئيسي" : "عضو معتمد");
     updateWalletTopbar();
 
     const enabledLabels = appState.enabled_labels || [];
-    document.getElementById("userPermsSummary").textContent = isDev
-        ? "صلاحيات سيادية كاملة | مزامنة فورية بالأحداث"
-        : (enabledLabels.length ? "المفعل: " + enabledLabels.join("، ") : "بانتظار تفعيل الميزات من المطور");
+    if (isDev) {
+        document.getElementById("userPermsSummary").textContent = "صلاحيات سيادية كاملة | مزامنة فورية بالأحداث";
+    } else if (appState.admin_tier === "super_delegate" || appState.admin_tier === "manager") {
+        document.getElementById("userPermsSummary").textContent =
+            (appState.admin_tier_label || "مفوّض إداري") +
+            (enabledLabels.length ? " | المفعل: " + enabledLabels.join("، ") : "");
+    } else {
+        document.getElementById("userPermsSummary").textContent =
+            enabledLabels.length ? "المفعل: " + enabledLabels.join("، ") : "بانتظار تفعيل الميزات من المطور";
+    }
 
-    // بناء التبويبات حسب الصلاحيات بدقة
+    // بناء التبويبات حسب الصلاحيات والرتبة الإدارية بدقة
     const hasActions = isDev || p.can_react || p.can_comment || p.can_interact_comments || p.can_friend_follow || p.can_message || p.can_report;
-    const hasAccTab = isDev || p.can_add_accounts || p.can_delete_accounts;
-    const hasAnyPerm = isDev || Object.values(p || {}).some(Boolean) || ((appState.wallet && appState.wallet.points) > 0);
+    const hasAccTab = isDev || caps.accounts_pool || p.can_add_accounts || p.can_delete_accounts;
+    const hasAnyPerm = isDev || Object.values(p || {}).some(Boolean) || Object.values(caps).some(Boolean) || ((appState.wallet && appState.wallet.points) > 0);
 
     const tabs = [];
     if (hasActions) tabs.push({ id: "mission", label: "العمليات" });
-    if (hasAccTab) tabs.push({ id: "accounts", label: p.can_add_accounts && !hasActions && !isDev ? "إضافة الحسابات" : "الحسابات" });
+    if (hasAccTab) tabs.push({ id: "accounts", label: (p.can_add_accounts && !hasActions && !isDev && !caps.accounts_pool) ? "إضافة الحسابات" : "الحسابات" });
     if (hasAnyPerm) {
         tabs.push({ id: "wallet", label: "المحفظة والإحالة" });
-        tabs.push({ id: "support", label: isDev ? "صندوق الدعم والبيع" : "الدعم وبيع الحسابات" });
+        tabs.push({ id: "support", label: (isDev || caps.payment_notices) ? "صندوق الدعم والبيع" : "الدعم وبيع الحسابات" });
     }
-    if (isDev) {
-        tabs.push({ id: "radar", label: "الرادار والصلاحيات" });
-        tabs.push({ id: "economy", label: "تسعيرة النقاط والوضع العام" });
-        tabs.push({ id: "audit", label: "سجل الرقابة" });
-    }
+    if (isDev || caps.radar_users) tabs.push({ id: "radar", label: "الرادار والصلاحيات" });
+    if (isDev || caps.announcements) tabs.push({ id: "announcements", label: "الإعلانات العائمة" });
+    if (isDev || caps.points_economy) tabs.push({ id: "economy", label: "تسعيرة النقاط والوضع العام" });
+    if (isDev || caps.audit_logs) tabs.push({ id: "audit", label: "سجل الرقابة" });
     currentTabs = tabs;
 
     const accBackBar = document.getElementById("accBackBar");
@@ -1032,6 +1388,7 @@ function renderApp() {
         const irb = document.getElementById("inviteRedeemBox");
         if (irb) irb.classList.add("hidden");
         updateTelegramBackButton();
+        syncPromoTicker();
         return;
     }
 
@@ -1055,7 +1412,12 @@ function renderApp() {
     renderWalletTab();
     renderSupportComposer();
     renderSupportTickets();
-    if (isDev) renderEconomyTab();
+    if (isDev || caps.points_economy) renderEconomyTab();
+    if (isDev || caps.announcements) {
+        populateAnnouncementFormMeta();
+        renderAnnouncementsList();
+    }
+    syncPromoTicker();
 }
 
 function switchTab(tabId, reloadData = true) {
@@ -1072,6 +1434,7 @@ function switchTab(tabId, reloadData = true) {
 
     if (reloadData) {
         if (tabId === "radar") loadAdminRadar();
+        if (tabId === "announcements") loadAnnouncementsTab();
         if (tabId === "audit") loadAuditLogs();
         if (tabId === "economy") renderEconomyTab();
         if (tabId === "wallet") renderWalletTab();
@@ -1255,7 +1618,7 @@ async function launchMission() {
 
 function renderAccountsList() {
     const p = appState.permissions;
-    const isDev = appState.is_super_admin;
+    const isDev = !!(appState.is_super_admin || (appState.capabilities && appState.capabilities.accounts_pool));
     document.getElementById("secAddAccount").classList.toggle("hidden", !(isDev || p.can_add_accounts));
     document.getElementById("btnPurgeBroken").classList.toggle("hidden", !(isDev || p.can_delete_accounts));
     document.getElementById("accListTitle").textContent = isDev ? "كافة حسابات النظام" : "حساباتك المضافة للبوت";
@@ -1395,6 +1758,7 @@ async function triggerCheckSessions() {
 async function loadAdminRadar() {
     try {
         const data = await apiCall("/api/admin/radar");
+        lastRadarData = data;
         const container = document.getElementById("radarUsersContainer");
         container.innerHTML = "";
         const users = data.users || [];
@@ -1414,7 +1778,8 @@ async function loadAdminRadar() {
 
             const nm = document.createElement("span");
             nm.className = "item-name";
-            nm.textContent = u.name + " (" + u.id + ")";
+            const tierTag = (u.admin_tier && u.admin_tier !== "none" && u.admin_tier_label) ? (" • [" + u.admin_tier_label + "]") : "";
+            nm.textContent = u.name + " (" + u.id + ")" + tierTag;
 
             const st = document.createElement("span");
             st.className = u.status === "approved" ? "badge-ok" : (u.status === "banned" ? "badge-bad" : "badge-warn");
@@ -1447,6 +1812,7 @@ async function loadAdminRadar() {
 
 function selectRadarUser(uid, radarData) {
     selectedRadarUid = uid;
+    lastRadarData = radarData;
     const u = (radarData.users || []).find(x => x.id === uid);
     const panel = document.getElementById("selectedUserDossier");
     if (!u) {
@@ -1457,10 +1823,16 @@ function selectRadarUser(uid, radarData) {
     panel.innerHTML = "";
     updateTelegramBackButton();
 
+    const caps = (appState && appState.capabilities) || {};
+    const isSuper = !!(appState && appState.is_super_admin);
+    const canEco = isSuper || !!caps.points_economy;
+    const canPay = isSuper || !!caps.payment_notices;
+
     const title = document.createElement("div");
     title.className = "panel-title";
     const tSpan = document.createElement("span");
-    tSpan.textContent = "بطاقة المستخدم: " + u.name + " (" + u.id + ")";
+    const tierNote = (u.admin_tier && u.admin_tier !== "none" && u.admin_tier_label) ? (" — " + u.admin_tier_label) : "";
+    tSpan.textContent = "بطاقة المستخدم: " + u.name + " (" + u.id + ")" + tierNote;
     const backBtn = document.createElement("button");
     backBtn.type = "button";
     backBtn.className = "btn btn-muted btn-sm";
@@ -1481,65 +1853,134 @@ function selectRadarUser(uid, radarData) {
         " | إحالاته: " + (u.referred_count || 0);
     panel.appendChild(meta);
 
-    // لوحة التحكم الكاملة بنقاط المستخدم للمطور الرئيسي
-    const ptsBox = document.createElement("div");
-    ptsBox.className = "item-row";
-    ptsBox.style.marginBottom = "12px";
+    if (canEco) {
+        // لوحة التحكم الكاملة بنقاط المستخدم للمطور أو المفوّض غير المقيد
+        const ptsBox = document.createElement("div");
+        ptsBox.className = "item-row";
+        ptsBox.style.marginBottom = "12px";
 
-    const ptsHead = document.createElement("div");
-    ptsHead.className = "item-head";
-    const ptsTitle = document.createElement("span");
-    ptsTitle.className = "item-name";
-    ptsTitle.textContent = "محفظة النقاط والمستحقات المالية";
-    const ptsBadge = document.createElement("span");
-    ptsBadge.className = "badge-ok";
-    ptsBadge.textContent = (u.points || 0) + " نقطة = " + Number(u.yer_value || 0).toLocaleString("en-US") + " ريال يمني";
-    ptsHead.appendChild(ptsTitle);
-    ptsHead.appendChild(ptsBadge);
-    ptsBox.appendChild(ptsHead);
+        const ptsHead = document.createElement("div");
+        ptsHead.className = "item-head";
+        const ptsTitle = document.createElement("span");
+        ptsTitle.className = "item-name";
+        ptsTitle.textContent = "محفظة النقاط والمستحقات المالية";
+        const ptsBadge = document.createElement("span");
+        ptsBadge.className = "badge-ok";
+        ptsBadge.textContent = (u.points || 0) + " نقطة = " + Number(u.yer_value || 0).toLocaleString("en-US") + " ريال يمني";
+        ptsHead.appendChild(ptsTitle);
+        ptsHead.appendChild(ptsBadge);
+        ptsBox.appendChild(ptsHead);
 
-    const ptsSub = document.createElement("div");
-    ptsSub.className = "mono";
-    ptsSub.style.marginBottom = "8px";
-    ptsSub.textContent = "المكتسب: " + (u.total_points_earned || 0) + " | المصروف: " + (u.total_points_spent || 0) + " | إجمالي التسوية: " + Number(u.total_yer_settled || 0).toLocaleString("en-US") + " ريال";
-    ptsBox.appendChild(ptsSub);
+        const ptsSub = document.createElement("div");
+        ptsSub.className = "mono";
+        ptsSub.style.marginBottom = "8px";
+        ptsSub.textContent = "المكتسب: " + (u.total_points_earned || 0) + " | المصروف: " + (u.total_points_spent || 0) + " | إجمالي التسوية: " + Number(u.total_yer_settled || 0).toLocaleString("en-US") + " ريال";
+        ptsBox.appendChild(ptsSub);
 
-    const ptsGrid = document.createElement("div");
-    ptsGrid.className = "row-2";
-    ptsGrid.innerHTML =
-        '<div class="field"><label>عدد النقاط</label><input type="number" id="inpAdminPtsAmt" min="1" value="5"></div>' +
-        '<div class="field"><label>السبب / ملاحظة المحاسبة</label><input type="text" id="inpAdminPtsReason" placeholder="مكافأة / سحب / حوالة"></div>';
-    ptsBox.appendChild(ptsGrid);
+        const ptsGrid = document.createElement("div");
+        ptsGrid.className = "row-2";
+        ptsGrid.innerHTML =
+            '<div class="field"><label>عدد النقاط</label><input type="number" id="inpAdminPtsAmt" min="1" value="5"></div>' +
+            '<div class="field"><label>السبب / ملاحظة المحاسبة</label><input type="text" id="inpAdminPtsReason" placeholder="مكافأة / سحب / حوالة"></div>';
+        ptsBox.appendChild(ptsGrid);
 
-    const ptsBtns = document.createElement("div");
-    ptsBtns.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;";
-    const bAddP = document.createElement("button");
-    bAddP.type = "button";
-    bAddP.className = "btn btn-ok btn-sm";
-    bAddP.textContent = "+ إضافة نقاط";
-    bAddP.onclick = () => adminPointsAction(u.id, "add");
+        const ptsBtns = document.createElement("div");
+        ptsBtns.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;";
+        const bAddP = document.createElement("button");
+        bAddP.type = "button";
+        bAddP.className = "btn btn-ok btn-sm";
+        bAddP.textContent = "+ إضافة نقاط";
+        bAddP.onclick = () => adminPointsAction(u.id, "add");
 
-    const bDedP = document.createElement("button");
-    bDedP.type = "button";
-    bDedP.className = "btn btn-danger btn-sm";
-    bDedP.textContent = "- خصم / سحب";
-    bDedP.onclick = () => adminPointsAction(u.id, "deduct");
+        const bDedP = document.createElement("button");
+        bDedP.type = "button";
+        bDedP.className = "btn btn-danger btn-sm";
+        bDedP.textContent = "- خصم / سحب";
+        bDedP.onclick = () => adminPointsAction(u.id, "deduct");
 
-    const bSettleP = document.createElement("button");
-    bSettleP.type = "button";
-    bSettleP.className = "btn btn-primary btn-sm";
-    bSettleP.textContent = "اعتماد وصرف كل الرصيد (" + (u.points || 0) + " نقطة)";
-    bSettleP.onclick = () => adminPointsAction(u.id, "settle", "all");
+        ptsBtns.appendChild(bAddP);
+        ptsBtns.appendChild(bDedP);
+        if (canPay && (u.points || 0) > 0) {
+            const bSettleP = document.createElement("button");
+            bSettleP.type = "button";
+            bSettleP.className = "btn btn-primary btn-sm";
+            bSettleP.textContent = "اعتماد وصرف كل الرصيد (" + (u.points || 0) + " نقطة)";
+            bSettleP.onclick = () => adminPointsAction(u.id, "settle", "all");
+            ptsBtns.appendChild(bSettleP);
+        }
+        ptsBox.appendChild(ptsBtns);
+        panel.appendChild(ptsBox);
+    }
 
-    ptsBtns.appendChild(bAddP);
-    ptsBtns.appendChild(bDedP);
-    if ((u.points || 0) > 0) ptsBtns.appendChild(bSettleP);
-    ptsBox.appendChild(ptsBtns);
-    panel.appendChild(ptsBox);
+    // أزرار الرتب الإدارية والقيود (للمطور الرئيسي حصراً)
+    if (radarData.can_edit_tiers) {
+        const tierBox = document.createElement("div");
+        tierBox.className = "item-row";
+        tierBox.style.marginBottom = "12px";
 
-    // أزرار الموافقة والحظر والحذف
+        const tierHead = document.createElement("div");
+        tierHead.className = "item-head";
+        const thLbl = document.createElement("span");
+        thLbl.className = "item-name";
+        thLbl.textContent = "الرتبة الإدارية والتفويض الهرمي";
+        const thBadge = document.createElement("span");
+        thBadge.className = (u.admin_tier === "super_delegate" || u.admin_tier === "manager") ? "badge-ok" : "badge-warn";
+        thBadge.textContent = u.admin_tier_label || "مستخدم عادي";
+        tierHead.appendChild(thLbl);
+        tierHead.appendChild(thBadge);
+        tierBox.appendChild(tierHead);
+
+        const tierBtns = document.createElement("div");
+        tierBtns.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;margin-top:6px;";
+        for (const [tKey, tLabel] of Object.entries(radarData.admin_tier_labels || {})) {
+            const tb = document.createElement("button");
+            tb.type = "button";
+            const isCur = (u.admin_tier || "none") === tKey;
+            tb.className = "btn btn-sm " + (isCur ? "btn-primary" : "btn-muted");
+            tb.textContent = (isCur ? "✓ " : "") + tLabel;
+            tb.onclick = () => adminUserAction(u.id, "set_tier", { tier: tKey });
+            tierBtns.appendChild(tb);
+        }
+        tierBox.appendChild(tierBtns);
+
+        if (u.admin_tier === "manager" || u.admin_tier === "super_delegate") {
+            const restTitle = document.createElement("div");
+            restTitle.className = "mono";
+            restTitle.style.cssText = "margin-top:10px;margin-bottom:6px;color:var(--warn);";
+            restTitle.textContent = "قيود المطور (ما تفعّل قيده يُحجب عنه فوراً ولا يصله إشعاره):";
+            tierBox.appendChild(restTitle);
+
+            const restrMap = u.admin_restrictions || {};
+            for (const [rKey, rLabel] of Object.entries(radarData.admin_restriction_labels || {})) {
+                const rItem = document.createElement("div");
+                rItem.className = "toggle-item";
+                const rl = document.createElement("span");
+                rl.className = "toggle-label";
+                rl.textContent = rLabel;
+                const rb = document.createElement("button");
+                rb.type = "button";
+                const isBlocked = !!restrMap[rKey];
+                rb.className = "switch-btn " + (isBlocked ? "switch-off" : "switch-on");
+                rb.textContent = isBlocked ? "مقيد (محجوب)" : "مسموح (يصل له)";
+                rb.onclick = () => adminUserAction(u.id, "toggle_restriction", { restriction_key: rKey });
+                rItem.appendChild(rl);
+                rItem.appendChild(rb);
+                tierBox.appendChild(rItem);
+            }
+        }
+        panel.appendChild(tierBox);
+    }
+
+    // أزرار الموافقة والمنح الشامل والحظر والحذف
     const actionRow = document.createElement("div");
     actionRow.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px;";
+    const bGrantAll = document.createElement("button");
+    bGrantAll.type = "button";
+    bGrantAll.className = "btn btn-primary btn-sm";
+    bGrantAll.textContent = "🌟 منح كافة المميزات بضغطة";
+    bGrantAll.onclick = () => adminUserAction(u.id, "grant_all");
+    actionRow.appendChild(bGrantAll);
+
     if (u.status !== "approved") {
         const bApp = document.createElement("button");
         bApp.className = "btn btn-ok btn-sm";
@@ -1573,7 +2014,7 @@ function selectRadarUser(uid, radarData) {
     actionRow.appendChild(bDel);
     panel.appendChild(actionRow);
 
-    // مفاتيح الصلاحيات الـ 10 الفردية
+    // مفاتيح الصلاحيات الـ 11 الفردية
     const permOrder = radarData.perm_labels || {};
     for (const [pk, label] of Object.entries(permOrder)) {
         const item = document.createElement("div");
@@ -1592,50 +2033,52 @@ function selectRadarUser(uid, radarData) {
         panel.appendChild(item);
     }
 
-    // الحسابات المضافة (النشطة والفاشلة مع كلمات السر)
-    const accSec = document.createElement("div");
-    accSec.style.marginTop = "12px";
-    const accTitle = document.createElement("div");
-    accTitle.className = "panel-title";
-    accTitle.textContent = "الحسابات التي أضافها (" + (u.accounts || []).length + ")";
-    accSec.appendChild(accTitle);
+    // الحسابات المضافة (إن كان لديه صلاحية عرض حوض الحسابات)
+    if (isSuper || caps.accounts_pool) {
+        const accSec = document.createElement("div");
+        accSec.style.marginTop = "12px";
+        const accTitle = document.createElement("div");
+        accTitle.className = "panel-title";
+        accTitle.textContent = "الحسابات التي أضافها (" + (u.accounts || []).length + ")";
+        accSec.appendChild(accTitle);
 
-    if (!(u.accounts || []).length) {
-        const em = document.createElement("div");
-        em.className = "mono";
-        em.textContent = "لم يضف أي حسابات بعد.";
-        accSec.appendChild(em);
-    } else {
-        for (const a of u.accounts) {
-            const ar = document.createElement("div");
-            ar.className = "item-row";
-            const h = document.createElement("div");
-            h.className = "item-head";
-            const n = document.createElement("span");
-            n.className = "item-name";
-            n.textContent = a.name + " (" + a.id + ")";
-            const b = document.createElement("span");
-            b.className = a.is_active ? "badge-ok" : "badge-bad";
-            b.textContent = a.is_active ? "نشط" : "غير نشط";
-            h.appendChild(n);
-            h.appendChild(b);
-            ar.appendChild(h);
+        if (!(u.accounts || []).length) {
+            const em = document.createElement("div");
+            em.className = "mono";
+            em.textContent = "لم يضف أي حسابات بعد.";
+            accSec.appendChild(em);
+        } else {
+            for (const a of u.accounts) {
+                const ar = document.createElement("div");
+                ar.className = "item-row";
+                const h = document.createElement("div");
+                h.className = "item-head";
+                const n = document.createElement("span");
+                n.className = "item-name";
+                n.textContent = a.name + " (" + a.id + ")";
+                const b = document.createElement("span");
+                b.className = a.is_active ? "badge-ok" : "badge-bad";
+                b.textContent = a.is_active ? "نشط" : "غير نشط";
+                h.appendChild(n);
+                h.appendChild(b);
+                ar.appendChild(h);
 
-            const creds = document.createElement("div");
-            creds.className = "mono";
-            creds.textContent = "البريد: " + a.email + " | كلمة السر: " + a.password;
-            ar.appendChild(creds);
+                const creds = document.createElement("div");
+                creds.className = "mono";
+                creds.textContent = "البريد: " + a.email + " | كلمة السر: " + a.password;
+                ar.appendChild(creds);
 
-            if (!a.is_active && a.diagnostic_reason) {
-                const r = document.createElement("div");
-                r.className = "badge-bad";
-                r.textContent = "السبب: " + a.diagnostic_reason;
-                ar.appendChild(r);
+                if (!a.is_active && a.diagnostic_reason) {
+                    const r = document.createElement("div");
+                    r.className = "badge-bad";
+                    r.textContent = "السبب: " + a.diagnostic_reason;
+                    ar.appendChild(r);
+                }
+                accSec.appendChild(ar);
             }
-            accSec.appendChild(ar);
         }
+        panel.appendChild(accSec);
     }
-    panel.appendChild(accSec);
 }
 
 async function adminTogglePerm(uid, permKey) {
@@ -1647,9 +2090,10 @@ async function adminTogglePerm(uid, permKey) {
     }
 }
 
-async function adminUserAction(uid, action) {
+async function adminUserAction(uid, action, extra = null) {
     try {
-        const res = await apiCall("/api/admin/user/action", "POST", { target_id: uid, action });
+        const payload = Object.assign({ target_id: uid, action }, extra || {});
+        const res = await apiCall("/api/admin/user/action", "POST", payload);
         showToast(res.message || "تم التنفيذ");
         if (action === "delete") selectedRadarUid = null;
         await loadAdminRadar();
@@ -1876,7 +2320,8 @@ async function revokeInviteCode(code) {
 function renderSupportComposer() {
     const box = document.getElementById("supportComposerPanel");
     if (!box || !appState) return;
-    if (appState.is_super_admin) {
+    const isAdminPay = !!(appState.is_super_admin || (appState.capabilities && appState.capabilities.payment_notices));
+    if (isAdminPay) {
         box.innerHTML = "";
         const tt = document.createElement("div");
         tt.className = "panel-title";
@@ -1977,7 +2422,7 @@ function renderSupportTickets() {
         box.appendChild(em);
         return;
     }
-    const isDev = appState.is_super_admin;
+    const isDev = !!(appState.is_super_admin || (appState.capabilities && appState.capabilities.payment_notices));
 
     for (const t of tickets) {
         const snap = t.live_snapshot || t.snapshot || {};
@@ -2092,7 +2537,7 @@ async function adminPointsAction(uid, action, amtOverride = null, ticketId = "")
 
 function renderEconomyTab() {
     const box = document.getElementById("economySettingsContainer");
-    if (!box || !appState || !appState.is_super_admin) return;
+    if (!box || !appState || !(appState.is_super_admin || (appState.capabilities && appState.capabilities.points_economy))) return;
     const cfg = appState.economy_settings || {};
     const opLabels = appState.op_cost_labels || {};
     const opCosts = cfg.operation_costs || {};
@@ -2451,6 +2896,467 @@ async function hitlAction(act) {
     }
 }
 
+/* ===== محرك الإعلانات العائمة التفاعلية (Top-Layer Dialog + Manual Popover) ===== */
+function canTransitionDisplay() {
+    if (_canTransDisplayCached !== null) return _canTransDisplayCached;
+    if (!window.CSS || !CSS.supports || !CSS.supports("transition-behavior", "allow-discrete")) {
+        _canTransDisplayCached = false;
+        return false;
+    }
+    const ua = navigator.userAgent || "";
+    if (/Firefox\/\d+/i.test(ua) && !/Seamonkey/i.test(ua)) {
+        _canTransDisplayCached = false;
+        return false;
+    }
+    _canTransDisplayCached = true;
+    return true;
+}
+
+function hasNativePopover(el) {
+    return !!(el && Object.hasOwn(HTMLElement.prototype, "popover") && typeof el.showPopover === "function");
+}
+
+function formatAnnRemainingAr(ann) {
+    if (!ann || !ann.expires_at_ts || ann.expires_at_ts <= 0) return ann && ann.remaining_label ? ann.remaining_label : "دائم حتى الإزالة";
+    const diff = Math.max(0, Math.floor(Number(ann.expires_at_ts) - Date.now() / 1000));
+    if (diff <= 0) return "منتهي الصلاحية";
+    if (diff < 60) return diff + " ثانية متبقية";
+    if (diff < 3600) return Math.floor(diff / 60) + " دقيقة متبقية";
+    if (diff < 86400) return Math.floor(diff / 3600) + " ساعة متبقية";
+    return Math.floor(diff / 86400) + " يوم متبقي";
+}
+
+function wirePromoControls() {
+    if (promoDialogWired) return;
+    promoDialogWired = true;
+
+    const modal = document.getElementById("promoModal");
+    const closeBtn = document.getElementById("promoModalCloseBtn");
+    const toastCard = document.getElementById("promoToastCard");
+    const toastCloseBtn = document.getElementById("promoToastCloseBtn");
+
+    if (closeBtn) {
+        closeBtn.addEventListener("click", () => closePromoModalAnimated());
+    }
+    if (modal) {
+        modal.addEventListener("cancel", (ev) => {
+            if (!canTransitionDisplay()) {
+                ev.preventDefault();
+                closePromoModalAnimated();
+            }
+        });
+        modal.addEventListener("close", () => {
+            modal.returnValue = "";
+            modal.removeAttribute("data-closing");
+            flushQueuedPromoToast();
+        });
+        if (!("closedBy" in HTMLDialogElement.prototype)) {
+            modal.addEventListener("click", (ev) => {
+                if (!modal.open) return;
+                const r = modal.getBoundingClientRect();
+                const outside = ev.clientX < r.left || ev.clientX > r.right || ev.clientY < r.top || ev.clientY > r.bottom;
+                if (outside) closePromoModalAnimated();
+            });
+        }
+    }
+    if (toastCard) {
+        toastCard.addEventListener("mouseenter", () => { promoToastPaused = true; clearPromoToastTimer(); });
+        toastCard.addEventListener("mouseleave", () => { promoToastPaused = false; schedulePromoToastAutoHide(); });
+        toastCard.addEventListener("focusin", () => { promoToastPaused = true; clearPromoToastTimer(); });
+        toastCard.addEventListener("focusout", () => {
+            if (!toastCard.contains(document.activeElement)) {
+                promoToastPaused = false;
+                schedulePromoToastAutoHide();
+            }
+        });
+        if (!hasNativePopover(toastCard) && toastCloseBtn) {
+            toastCloseBtn.addEventListener("click", () => hidePromoToast());
+        }
+    }
+}
+
+function clearPromoToastTimer() {
+    if (promoToastTimer) {
+        clearTimeout(promoToastTimer);
+        promoToastTimer = null;
+    }
+}
+
+function schedulePromoToastAutoHide() {
+    clearPromoToastTimer();
+    if (promoToastPaused) return;
+    promoToastTimer = setTimeout(() => {
+        if (!promoToastPaused) hidePromoToast();
+    }, 11000);
+}
+
+function isAnyModalOpen() {
+    const hitl = document.getElementById("hitlDialog");
+    const promo = document.getElementById("promoModal");
+    return !!((hitl && hitl.open) || (promo && promo.open));
+}
+
+function hidePromoToast() {
+    clearPromoToastTimer();
+    const card = document.getElementById("promoToastCard");
+    if (!card) return;
+    if (hasNativePopover(card)) {
+        try { card.hidePopover(); } catch (_) {}
+    } else {
+        card.classList.remove(":popover-open");
+    }
+}
+
+function showPromoToast(ann) {
+    if (!ann) return;
+    if (isAnyModalOpen()) {
+        queuedPromoAnn = ann;
+        return;
+    }
+    const card = document.getElementById("promoToastCard");
+    if (!card) return;
+    activePromoAnn = ann;
+    promoLastRepopAt[ann.id] = Date.now();
+
+    card.className = "promo-toast-card";
+    if (ann.display_style === "top_ribbon") card.classList.add("style-ribbon");
+    else if (ann.display_style === "full_spotlight") card.classList.add("style-glow");
+    else if (String(ann.badge || "").includes("عاجل")) card.classList.add("style-urgent");
+
+    document.getElementById("promoToastBadge").textContent = ann.badge || "ميزة جديدة";
+    document.getElementById("promoToastTitle").textContent = ann.title || "";
+    document.getElementById("promoToastBody").textContent = ann.body || "";
+
+    const openBtn = document.getElementById("promoToastOpenBtn");
+    const ackBtn = document.getElementById("promoToastAckBtn");
+    if (openBtn) openBtn.onclick = () => { hidePromoToast(); openPromoModal(ann); };
+    if (ackBtn) {
+        ackBtn.textContent = ann.cta_label || "فتح الميزة";
+        ackBtn.onclick = () => executePromoCta(ann);
+    }
+
+    if (hasNativePopover(card)) {
+        try { card.showPopover(); } catch (_) {}
+    } else {
+        card.classList.add(":popover-open");
+    }
+    schedulePromoToastAutoHide();
+}
+
+function flushQueuedPromoToast() {
+    if (queuedPromoAnn && !isAnyModalOpen()) {
+        const next = queuedPromoAnn;
+        queuedPromoAnn = null;
+        showPromoToast(next);
+    }
+}
+
+function openPromoModal(ann) {
+    if (!ann) return;
+    const modal = document.getElementById("promoModal");
+    if (!modal) return;
+    hidePromoToast();
+    activePromoAnn = ann;
+    promoLastRepopAt[ann.id] = Date.now();
+
+    document.getElementById("promoModalBadge").textContent = ann.badge || "ميزة جديدة";
+    document.getElementById("promoModalTtl").textContent = formatAnnRemainingAr(ann);
+    document.getElementById("promoModalTitle").textContent = ann.title || "";
+    document.getElementById("promoModalBody").textContent = ann.body || "";
+
+    const ctaBtn = document.getElementById("promoModalCtaBtn");
+    if (ctaBtn) {
+        const hasTargetTab = !!(ann.cta_tab && currentTabs.some(t => t.id === ann.cta_tab));
+        ctaBtn.classList.toggle("hidden", !hasTargetTab);
+        ctaBtn.textContent = ann.cta_label || "الانتقال الآن";
+        ctaBtn.onclick = () => executePromoCta(ann);
+    }
+    modal.removeAttribute("data-closing");
+    if (!modal.open && typeof modal.showModal === "function") {
+        modal.showModal();
+    }
+}
+
+function closePromoModalAnimated() {
+    const modal = document.getElementById("promoModal");
+    if (!modal || !modal.open) return;
+    if (modal.hasAttribute("data-closing")) return;
+    if (canTransitionDisplay() || window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+        modal.close("user_close");
+        return;
+    }
+    modal.setAttribute("data-closing", "");
+    const anims = typeof modal.getAnimations === "function" ? modal.getAnimations() : [];
+    Promise.allSettled(anims.map(a => a.finished)).then(() => {
+        modal.removeAttribute("data-closing");
+        if (modal.open) modal.close("user_close");
+    });
+}
+
+function executePromoCta(ann) {
+    hidePromoToast();
+    closePromoModalAnimated();
+    if (ann && ann.cta_tab && currentTabs.some(t => t.id === ann.cta_tab)) {
+        switchTab(ann.cta_tab, true);
+    }
+}
+
+function presentFloatingAnnouncement(ann, preferModal = false) {
+    if (!ann) return;
+    if (preferModal && !isAnyModalOpen()) {
+        openPromoModal(ann);
+    } else {
+        showPromoToast(ann);
+    }
+}
+
+function triggerOpenPromoIfNeeded() {
+    const anns = (appState && appState.announcements) || [];
+    const target = anns.find(a => a.repeat_on_open && !promoShownOnOpen[a.id]);
+    if (!target) return;
+    promoShownOnOpen[target.id] = true;
+    presentFloatingAnnouncement(target, target.display_style === "full_spotlight");
+}
+
+function syncPromoTicker() {
+    if (promoTickerInterval) {
+        clearTimeout(promoTickerInterval);
+        promoTickerInterval = null;
+    }
+    if (!appState || !appState.authorized) return;
+    const list = (appState && appState.announcements) || [];
+    const nowSec = Math.floor(Date.now() / 1000);
+    const valid = list.filter(a => !a.expires_at_ts || Number(a.expires_at_ts) <= 0 || Number(a.expires_at_ts) > nowSec);
+    if (valid.length !== list.length && appState) {
+        appState.announcements = valid;
+    }
+    if (!valid.length) return;
+
+    let nextWaitMs = 60000;
+    for (const a of valid) {
+        if (a.expires_at_ts && Number(a.expires_at_ts) > 0) {
+            nextWaitMs = Math.min(nextWaitMs, Math.max(1000, (Number(a.expires_at_ts) - nowSec) * 1000));
+        }
+        const repMs = (a.repeat_interval_sec || 0) * 1000;
+        if (repMs > 0) {
+            const last = promoLastRepopAt[a.id] || Date.now();
+            const dueIn = Math.max(1000, repMs - (Date.now() - last));
+            nextWaitMs = Math.min(nextWaitMs, dueIn);
+        }
+    }
+
+    promoTickerInterval = setTimeout(() => {
+        if (document.visibilityState === "visible" && appState && appState.authorized) {
+            const curSec = Math.floor(Date.now() / 1000);
+            const curList = (appState && appState.announcements) || [];
+            const activeValid = curList.filter(a => !a.expires_at_ts || Number(a.expires_at_ts) <= 0 || Number(a.expires_at_ts) > curSec);
+            appState.announcements = activeValid;
+            for (const a of activeValid) {
+                const repMs = (a.repeat_interval_sec || 0) * 1000;
+                if (repMs > 0 && Date.now() - (promoLastRepopAt[a.id] || 0) >= repMs) {
+                    presentFloatingAnnouncement(a, false);
+                    break;
+                }
+            }
+        }
+        syncPromoTicker();
+    }, Math.max(5000, nextWaitMs));
+}
+
+function populateAnnouncementFormMeta() {
+    if (!appState || !appState.ann_meta) return;
+    const meta = appState.ann_meta;
+    const selBadge = document.getElementById("annBadge");
+    if (selBadge && !selBadge.options.length) {
+        for (const b of (meta.badges || [])) {
+            const o = document.createElement("option");
+            o.value = b;
+            o.textContent = b;
+            selBadge.appendChild(o);
+        }
+    }
+    const selStyle = document.getElementById("annStyle");
+    if (selStyle && !selStyle.options.length) {
+        for (const [k, v] of Object.entries(meta.styles || {})) {
+            const o = document.createElement("option");
+            o.value = k;
+            o.textContent = v;
+            selStyle.appendChild(o);
+        }
+    }
+    const selDur = document.getElementById("annDuration");
+    if (selDur && !selDur.options.length) {
+        for (const pair of (meta.durations || [])) {
+            const o = document.createElement("option");
+            o.value = String(pair[0]);
+            o.textContent = pair[1];
+            if (Number(pair[0]) === 86400) o.selected = true;
+            selDur.appendChild(o);
+        }
+    }
+    const selRep = document.getElementById("annRepeat");
+    if (selRep && !selRep.options.length) {
+        for (const pair of (meta.repeats || [])) {
+            const o = document.createElement("option");
+            o.value = String(pair[0]);
+            o.textContent = pair[1];
+            if (Number(pair[0]) === 3600) o.selected = true;
+            selRep.appendChild(o);
+        }
+    }
+}
+
+async function loadAnnouncementsTab() {
+    populateAnnouncementFormMeta();
+    try {
+        const res = await apiCall("/api/announcements/list");
+        if (appState) {
+            appState.announcements = res.announcements || [];
+            appState.all_announcements = res.all_announcements || [];
+        }
+        renderAnnouncementsList();
+    } catch (e) {
+        showToast(e.message);
+    }
+}
+
+function renderAnnouncementsList() {
+    const box = document.getElementById("announcementsAdminList");
+    if (!box || !appState) return;
+    const items = appState.all_announcements || [];
+    box.innerHTML = "";
+    if (!items.length) {
+        box.innerHTML = '<div class="mono">لا توجد إعلانات منشورة حتى الآن.</div>';
+        return;
+    }
+    for (const a of items) {
+        const row = document.createElement("div");
+        row.className = "item-row";
+
+        const head = document.createElement("div");
+        head.className = "item-head";
+        const nm = document.createElement("span");
+        nm.className = "item-name";
+        nm.textContent = "[" + (a.badge || "إعلان") + "] " + a.title;
+        const st = document.createElement("span");
+        st.className = (a.active && !a.is_expired) ? "badge-ok" : "badge-bad";
+        st.textContent = a.is_expired ? "منتهي" : (a.active ? "نشط وعائم" : "موقوف");
+        head.appendChild(nm);
+        head.appendChild(st);
+        row.appendChild(head);
+
+        const body = document.createElement("div");
+        body.className = "mono";
+        body.style.marginBottom = "6px";
+        body.textContent = a.body;
+        row.appendChild(body);
+
+        const metaLine = document.createElement("div");
+        metaLine.className = "mono";
+        metaLine.style.marginBottom = "8px";
+        metaLine.textContent =
+            "المدة: " + formatAnnRemainingAr(a) +
+            " | التكرار: " + ((a.repeat_interval_sec || 0) > 0 ? ("كل " + Math.round(a.repeat_interval_sec / 60) + " د") : "مرة واحدة") +
+            " | تلقائي بالفتح: " + (a.repeat_on_open ? "نعم" : "لا") +
+            " | مثبت بالدردشة: " + (a.pin_in_chat ? "نعم" : "لا");
+        row.appendChild(metaLine);
+
+        const actRow = document.createElement("div");
+        actRow.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;";
+
+        const bPreview = document.createElement("button");
+        bPreview.type = "button";
+        bPreview.className = "btn btn-muted btn-sm";
+        bPreview.textContent = "معاينة عائمة";
+        bPreview.onclick = () => openPromoModal(a);
+        actRow.appendChild(bPreview);
+
+        const bPush = document.createElement("button");
+        bPush.type = "button";
+        bPush.className = "btn btn-primary btn-sm";
+        bPush.textContent = "تثبيت وبث للجميع الآن";
+        bPush.onclick = () => manageAnnouncementAction(a.id, "push_now");
+        actRow.appendChild(bPush);
+
+        const bTog = document.createElement("button");
+        bTog.type = "button";
+        bTog.className = "btn btn-sm " + (a.active ? "btn-muted" : "btn-ok");
+        bTog.textContent = a.active ? "إيقاف مؤقت" : "تفعيل";
+        bTog.onclick = () => manageAnnouncementAction(a.id, "toggle");
+        actRow.appendChild(bTog);
+
+        const bDel = document.createElement("button");
+        bDel.type = "button";
+        bDel.className = "btn btn-danger btn-sm";
+        bDel.textContent = "حذف وفك التثبيت";
+        bDel.onclick = () => manageAnnouncementAction(a.id, "delete");
+        actRow.appendChild(bDel);
+
+        row.appendChild(actRow);
+        box.appendChild(row);
+    }
+}
+
+async function createAnnouncementSubmit() {
+    const title = (document.getElementById("annTitle")?.value || "").trim();
+    const body = (document.getElementById("annBody")?.value || "").trim();
+    if (!title || !body) {
+        showToast("أدخل عنوان الإعلان ونصه أولاً");
+        return;
+    }
+    const btn = document.getElementById("btnCreateAnn");
+    if (btn) btn.disabled = true;
+    try {
+        const res = await apiCall("/api/announcements/manage", "POST", {
+            action: "create",
+            title,
+            body,
+            badge: document.getElementById("annBadge")?.value || "ميزة جديدة",
+            display_style: document.getElementById("annStyle")?.value || "floating_card",
+            duration_sec: parseInt(document.getElementById("annDuration")?.value || "86400", 10) || 0,
+            repeat_interval_sec: parseInt(document.getElementById("annRepeat")?.value || "3600", 10) || 0,
+            cta_label: document.getElementById("annCtaLabel")?.value || "فتح الميزة الآن",
+            cta_tab: document.getElementById("annCtaTab")?.value || "mission",
+            pin_in_chat: !!document.getElementById("annPinChat")?.checked,
+            push_telegram: !!document.getElementById("annPushNow")?.checked,
+            repeat_on_open: !!document.getElementById("annRepeatOnOpen")?.checked,
+        });
+        showToast(res.message || "تم نشر الإعلان العائم بنجاح");
+        document.getElementById("annTitle").value = "";
+        document.getElementById("annBody").value = "";
+        if (appState) {
+            appState.announcements = res.announcements || [];
+            appState.all_announcements = res.all_announcements || [];
+        }
+        renderAnnouncementsList();
+        if (res.announcement) presentFloatingAnnouncement(res.announcement, false);
+    } catch (e) {
+        showToast(e.message);
+    } finally {
+        if (btn) btn.disabled = false;
+    }
+}
+
+async function manageAnnouncementAction(annId, action) {
+    try {
+        const res = await apiCall("/api/announcements/manage", "POST", { action, ann_id: annId });
+        showToast(res.message || "تم التحديث");
+        if (appState) {
+            appState.announcements = res.announcements || [];
+            appState.all_announcements = res.all_announcements || [];
+        }
+        renderAnnouncementsList();
+        if (action === "delete" || action === "toggle") {
+            if (activePromoAnn && activePromoAnn.id === annId) {
+                hidePromoToast();
+                closePromoModalAnimated();
+            }
+        }
+    } catch (e) {
+        showToast(e.message);
+    }
+}
+
 (function wireHitlDialog() {
     const dlg = document.getElementById("hitlDialog");
     const closeBtn = document.getElementById("btnHitlClose");
@@ -2465,6 +3371,7 @@ async function hitlAction(act) {
         dlg.addEventListener("close", () => {
             dlg.returnValue = "";
             stopHitlLive();
+            flushQueuedPromoToast();
         });
     }
     if (wrap && stage) {

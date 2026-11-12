@@ -49,10 +49,22 @@ from fb_operator.account_manager import (
 from fb_operator.admin_manager import (
     is_super_admin, is_authorized_user, has_permission, get_user_permissions,
     register_or_update_user, approve_user, ban_user, unban_user,
-    toggle_user_permission, revoke_all_permissions, delete_user_and_data,
-    load_users, record_user_operation, record_account_result_for_user,
+    toggle_user_permission, revoke_all_permissions, grant_all_user_permissions,
+    delete_user_and_data, load_users, record_user_operation, record_account_result_for_user,
     record_audit_log, load_audit_logs, reset_user_profile_warnings,
-    safe_nonneg_points, SUPER_ADMIN_ID, PERMISSION_LABELS
+    safe_nonneg_points, SUPER_ADMIN_ID, PERMISSION_LABELS,
+    ADMIN_TIERS, ADMIN_TIER_LABELS, ADMIN_RESTRICTION_LABELS,
+    get_admin_tier, get_admin_restrictions, is_admin_delegate,
+    has_admin_capability, get_user_admin_capabilities, can_manage_target_user,
+    get_admin_notification_recipients, set_admin_tier, toggle_admin_restriction,
+)
+from fb_operator.announcement_manager import (
+    BADGE_OPTIONS, STYLE_OPTIONS, DURATION_PRESETS, REPEAT_PRESETS,
+    create_announcement, list_announcements, get_announcement_by_id,
+    toggle_announcement_active, update_announcement_timing, delete_announcement,
+    record_announcement_sent_chats, mark_announcement_repushed,
+    pop_expired_pinned_announcements, get_announcements_due_for_repeat,
+    format_announcement_telegram_html, format_duration_ar,
 )
 from fb_operator.browser_manager import (
     sync_playwright, USING_PATCHRIGHT,
@@ -487,20 +499,19 @@ def _has_any_enabled_mission_action(user_id: int, st: dict) -> tuple[bool, str]:
 def get_usable_accounts_for_user(user_id: int) -> list[dict]:
     """
     حسابات التنفيذ المصرح بها للمستخدم بدقة أمنية:
-    - المطور الأكبر يرى كل الحسابات.
+    - المطور الأكبر (أو النائب غير المقيد على الحسابات) يرى كل الحسابات.
     - من يملك صلاحية 'can_use_accounts' يستخدم كافة حسابات البوت.
-    - من لا يملك 'can_use_accounts' لا يمكنه المساس بحسابات البوت المشتركة نهائياً
-      (يُحصر فقط في حساباته التي أضافها هو إن فُعّلت له ميزة التنفيذ).
+    - من لا يملك 'can_use_accounts' يقتصر فقط على حساباته التي أضافها هو.
     """
     accs = load_accounts()
-    if is_super_admin(user_id) or has_permission(user_id, "can_use_accounts"):
+    if has_admin_capability(user_id, "accounts_pool") or has_permission(user_id, "can_use_accounts"):
         return accs
     return [a for a in accs if a.get("owner_id") == int(user_id)]
 
 
 def get_manageable_accounts_for_user(user_id: int) -> list[dict]:
-    """قائمة الحسابات الظاهرة في إدارة الحسابات: المطور يرى الكل، والمستخدم يرى ما أضافه فقط"""
-    if is_super_admin(user_id):
+    """قائمة الحسابات الظاهرة في إدارة الحسابات: المطور/النائب المصرح يرى الكل، والمستخدم يرى ما أضافه فقط"""
+    if has_admin_capability(user_id, "accounts_pool"):
         return load_accounts()
     return get_accounts_by_owner(user_id)
 
@@ -520,7 +531,7 @@ def require_perm_or_deny(call: types.CallbackQuery, perm_key: str, error_msg: st
 # ----------------- بوابة التحقق الصارمة من الوصول (Strict Access Gate) -----------------
 
 def notify_new_pending_user(user_id: int, full_name: str, username: str = "") -> None:
-    """إرسال تنبيه فوري للمطور الرئيسي عند دخول مستخدم جديد مع أزرار الموافقة أو الحظر"""
+    """إرسال تنبيه فوري للمطور والمدراء/النواب غير المقيدين عند دخول مستخدم جديد مع أزرار الموافقة أو الحظر"""
     if is_super_admin(user_id):
         return
     markup = types.InlineKeyboardMarkup(row_width=2)
@@ -542,14 +553,15 @@ def notify_new_pending_user(user_id: int, full_name: str, username: str = "") ->
         "━━━━━━━━━━━━━━━━━━━━\n"
         "⚠️ <b>الحالة الآن:</b> محجوب بالكامل. عند القبول تبقى كل الميزات مغلقة حتى تحددها بنفسك:"
     )
-    safe_send(SUPER_ADMIN_ID, alert_text, reply_markup=markup)
+    for rec_uid in get_admin_notification_recipients("new_user_notices"):
+        safe_send(rec_uid, alert_text, reply_markup=markup)
 
 
 def check_user_access_gate(user, chat_id: int, notify_blocked: bool = True) -> bool:
     """
     بوابة الأمان والتحقق الصارمة:
     1. المطور الأكبر يمر فوراً بصلاحيات مطلقة لا تمس.
-    2. أي مستخدم جديد يُسجل كـ 'pending' وكافة الأدوات مغلقة (False)، ويُرسل إشعار فوري للمطور.
+    2. أي مستخدم جديد يُسجل كـ 'pending' وكافة الأدوات مغلقة (False)، ويُرسل إشعار فوري للمطور والمدراء.
     3. يمنع أي مستخدم غير معتمد أو محظور من لمس أي زر أو نص.
     """
     user_id = user.id
@@ -574,11 +586,12 @@ def check_user_access_gate(user, chat_id: int, notify_blocked: bool = True) -> b
     if status == "pending" and ensure_public_access_if_enabled(user_id):
         update_menu_button_for_user(bot, user_id, is_allowed=True)
         if is_new:
-            safe_send(
-                SUPER_ADMIN_ID,
-                f"🌐 <b>وضع العامة | مستخدم جديد دخل تلقائياً:</b> {esc(full_name)} (<code>{user_id}</code>)\n"
-                "🔐 الصلاحية الابتدائية: إضافة حسابات فيسبوك فقط (+ نظام النقاط)."
-            )
+            for rec_uid in get_admin_notification_recipients("new_user_notices"):
+                safe_send(
+                    rec_uid,
+                    f"🌐 <b>وضع العامة | مستخدم جديد دخل تلقائياً:</b> {esc(full_name)} (<code>{user_id}</code>)\n"
+                    "🔐 الصلاحية الابتدائية: إضافة حسابات فيسبوك فقط (+ نظام النقاط)."
+                )
         return True
 
     inv_markup = types.InlineKeyboardMarkup()
@@ -642,12 +655,186 @@ REPORT_VICTIMS_AR = {
 }
 
 
+def _build_announcement_markup(ann: dict, include_ack: bool = True) -> types.InlineKeyboardMarkup:
+    mk = types.InlineKeyboardMarkup(row_width=2)
+    ann_id = str(ann.get("id") or "")
+    cta_lbl = str(ann.get("cta_label") or "استعراض الميزة الآن").strip()[:36]
+    w_url = get_public_webapp_url()
+    row_top = [types.InlineKeyboardButton("✨ عرض البطاقة العائمة", callback_data=f"promo_view_{ann_id}")]
+    if w_url:
+        sep = "&" if "?" in w_url else "?"
+        tab_arg = f"&tab={ann.get('cta_tab')}" if ann.get("cta_tab") else ""
+        row_top.append(
+            types.InlineKeyboardButton(
+                f"🚀 {cta_lbl[:22]}",
+                web_app=types.WebAppInfo(url=f"{w_url}{sep}promo={ann_id}{tab_arg}")
+            )
+        )
+    mk.row(*row_top)
+    if include_ack:
+        mk.row(
+            types.InlineKeyboardButton("✅ تم الاطلاع", callback_data=f"promo_ack_{ann_id}"),
+            types.InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="back_to_main")
+        )
+    return mk
+
+
+def _unpin_announcement_chats(ann: dict) -> int:
+    """إزالة تثبيت الإعلان العائم من دردشات جميع المستخدمين فوراً عند انتهاء مدته أو حذفه"""
+    if not isinstance(ann, dict):
+        return 0
+    sent_chats = ann.get("sent_chats") or {}
+    unpinned = 0
+    for cid_s, mid in sent_chats.items():
+        try:
+            bot.unpin_chat_message(chat_id=int(cid_s), message_id=int(mid))
+            unpinned += 1
+        except Exception:
+            pass
+    return unpinned
+
+
+def _broadcast_announcement_to_users(ann: dict, is_repeat: bool = False) -> dict:
+    """دفع الإعلان العائم وتثبيته أعلى المحادثة لجميع المستخدمين المعتمدين والمطور"""
+    if not isinstance(ann, dict) or not ann.get("id"):
+        return {"sent": 0, "pinned": 0}
+    users = load_users()
+    targets: set[int] = {SUPER_ADMIN_ID}
+    for uid_s, u in users.items():
+        if isinstance(u, dict) and u.get("status") == "approved":
+            try:
+                targets.add(int(u.get("id") or uid_s))
+            except Exception:
+                pass
+    html_txt = format_announcement_telegram_html(ann, esc_fn=esc, is_repeat=is_repeat)
+    markup = _build_announcement_markup(ann, include_ack=True)
+    sent_map: dict[int, int] = {}
+    pinned = 0
+    old_chats = ann.get("sent_chats") or {}
+    if is_repeat and ann.get("pin_in_chat") and old_chats:
+        _unpin_announcement_chats(ann)
+    for cid in targets:
+        try:
+            msg = safe_send(cid, html_txt, reply_markup=markup)
+            if msg and hasattr(msg, "message_id"):
+                sent_map[int(cid)] = int(msg.message_id)
+                if ann.get("pin_in_chat"):
+                    try:
+                        bot.pin_chat_message(cid, msg.message_id, disable_notification=bool(is_repeat))
+                        pinned += 1
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    if sent_map:
+        record_announcement_sent_chats(ann["id"], sent_map)
+    return {"sent": len(sent_map), "pinned": pinned}
+
+
+def _render_announcements_view() -> tuple[str, types.InlineKeyboardMarkup]:
+    items = list_announcements(only_active=False)
+    active_cnt = sum(1 for a in items if a.get("is_effectively_active"))
+    lines = [
+        "📢 <b>مركز الإعلانات العائمة والمنبثقة للمميزات</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"✨ <b>النشطة حالياً:</b> {active_cnt} | <b>الإجمالي المحفوظ:</b> {len(items)}",
+        "💡 <i>تظهر هذه الإعلانات كبطاقة عائمة متحركة في اللوحة المصغرة ومثبّتة أعلى دردشات المستخدمين مع خيار التكرار والمدة المحددة.</i>",
+        "━━━━━━━━━━━━━━━━━━━━",
+    ]
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.row(types.InlineKeyboardButton("➕ إنشاء إعلان عائم جديد", callback_data="ann_new"))
+    if not items:
+        lines.append("<i>لا توجد إعلانات مسجلة حتى الآن. اضغط إنشاء إعلان عائم جديد.</i>")
+    else:
+        for a in items[:10]:
+            st_ico = "🟢" if a.get("is_effectively_active") else ("⌛" if a.get("is_expired") else "⏸️")
+            lines.append(
+                f"{st_ico} <b>[{esc(a.get('badge'))}] {esc(a.get('title'))}</b>\n"
+                f"   ⏳ {esc(a.get('remaining_label'))} | 🔄 {esc(a.get('repeat_label'))} | 📣 دفع: {a.get('push_count', 1)}x"
+            )
+            markup.row(
+                types.InlineKeyboardButton(
+                    f"{st_ico} {str(a.get('title') or '')[:24]}",
+                    callback_data=f"ann_view_{a['id']}"
+                )
+            )
+    markup.row(
+        types.InlineKeyboardButton("🔄 تحديث", callback_data="menu_announcements"),
+        types.InlineKeyboardButton("🔙 الرئيسية", callback_data="back_to_main")
+    )
+    txt = "\n".join(lines)
+    if len(txt) > 3950:
+        txt = txt[:3920] + "\n..."
+    return txt, markup
+
+
+def _render_announcement_detail_view(ann_id: str) -> tuple[str, types.InlineKeyboardMarkup]:
+    a = get_announcement_by_id(ann_id)
+    if not a:
+        return "⚠️ الإعلان غير موجود أو تم حذفه.", _back_home_markup("menu_announcements")
+    st_lbl = "🟢 نشط وعائم الآن" if a.get("is_effectively_active") else ("⌛ منتهي المدة" if a.get("is_expired") else "⏸️ متوقف مؤقتاً")
+    style_lbl = STYLE_OPTIONS.get(a.get("display_style"), a.get("display_style"))
+    rop_lbl = "✅ نعم عند كل فتح" if a.get("repeat_on_open") else "❌ لا"
+    pin_lbl = "📌 نعم" if a.get("pin_in_chat") else "لا"
+    txt = (
+        f"📢 <b>إدارة الإعلان العائم: {esc(a.get('title'))}</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"🏷️ <b>الوسم:</b> {esc(a.get('badge'))} | <b>الحالة:</b> {st_lbl}\n"
+        f"🪟 <b>النمط:</b> {esc(style_lbl)}\n"
+        f"⏳ <b>الصلاحية المتبقية:</b> {esc(a.get('remaining_label'))}\n"
+        f"🔄 <b>التكرار التلقائي:</b> {esc(a.get('repeat_label'))} | <b>عند الفتح:</b> {rop_lbl}\n"
+        f"📌 <b>التثبيت بالدردشة:</b> {pin_lbl} ({len(a.get('sent_chats') or {})} محادثة)\n"
+        f"📣 <b>مرات البث:</b> {a.get('push_count', 1)}\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"📝 <b>النص:</b>\n{esc(a.get('body'))}"
+    )
+    if len(txt) > 3950:
+        txt = txt[:3920] + "\n..."
+    mk = types.InlineKeyboardMarkup(row_width=2)
+    tog_lbl = "⏸️ إيقاف مؤقت" if a.get("active") else "▶️ إعادة تفعيل"
+    mk.row(
+        types.InlineKeyboardButton(tog_lbl, callback_data=f"ann_tog_{ann_id}"),
+        types.InlineKeyboardButton("🚀 بث وتثبيت للجميع الآن", callback_data=f"ann_push_{ann_id}")
+    )
+    mk.row(
+        types.InlineKeyboardButton("⏱️ مدة: 1 ساعة", callback_data=f"ann_dur_{ann_id}_3600"),
+        types.InlineKeyboardButton("⏱️ مدة: 24 ساعة", callback_data=f"ann_dur_{ann_id}_86400")
+    )
+    mk.row(
+        types.InlineKeyboardButton("⏱️ مدة: 7 أيام", callback_data=f"ann_dur_{ann_id}_604800"),
+        types.InlineKeyboardButton("♾️ دائم حتى الإزالة", callback_data=f"ann_dur_{ann_id}_0")
+    )
+    mk.row(
+        types.InlineKeyboardButton("🔁 تكرار: كل 30د", callback_data=f"ann_rep_{ann_id}_1800"),
+        types.InlineKeyboardButton("🔁 تكرار: كل ساعة", callback_data=f"ann_rep_{ann_id}_3600")
+    )
+    mk.row(
+        types.InlineKeyboardButton("1️⃣ مرة واحدة", callback_data=f"ann_rep_{ann_id}_0"),
+        types.InlineKeyboardButton(f"🚪 عند الفتح: {'✅' if a.get('repeat_on_open') else '❌'}", callback_data=f"ann_rop_{ann_id}")
+    )
+    mk.row(
+        types.InlineKeyboardButton("🗑️ حذف وفك التثبيت للجميع", callback_data=f"ann_del_{ann_id}"),
+        types.InlineKeyboardButton("🔙 الإعلانات", callback_data="menu_announcements")
+    )
+    return txt, mk
+
+
 def get_main_dashboard_markup(user_id: int) -> types.InlineKeyboardMarkup:
     markup = types.InlineKeyboardMarkup(row_width=2)
     st = get_user_state(user_id)
 
     is_dev = is_super_admin(user_id)
-    p_use = is_dev or has_permission(user_id, "can_use_accounts")
+    cap_radar = has_admin_capability(user_id, "radar_users")
+    cap_eco = has_admin_capability(user_id, "points_economy")
+    cap_audit = has_admin_capability(user_id, "audit_logs")
+    cap_pay = has_admin_capability(user_id, "payment_notices")
+    cap_prox = has_admin_capability(user_id, "proxies")
+    cap_bkp = has_admin_capability(user_id, "backups")
+    cap_ann = has_admin_capability(user_id, "announcements")
+    cap_pool = has_admin_capability(user_id, "accounts_pool")
+    is_admin_any = is_dev or cap_radar or cap_eco or cap_audit or cap_pay or cap_prox or cap_bkp or cap_ann or cap_pool
+
+    p_use = is_dev or cap_pool or has_permission(user_id, "can_use_accounts")
     p_add = is_dev or has_permission(user_id, "can_add_accounts")
     p_react = is_dev or has_permission(user_id, "can_react")
     p_cmt = is_dev or has_permission(user_id, "can_comment")
@@ -659,9 +846,19 @@ def get_main_dashboard_markup(user_id: int) -> types.InlineKeyboardMarkup:
     p_exec = is_dev or has_permission(user_id, "can_execute")
     p_inv = can_user_invite(user_id)
 
+    active_anns = list_announcements(only_active=True)
+    if active_anns:
+        top_ann = active_anns[0]
+        markup.row(
+            types.InlineKeyboardButton(
+                f"✨ [{top_ann.get('badge', 'إعلان')}] {str(top_ann.get('title') or '')[:30]}",
+                callback_data=f"promo_view_{top_ann['id']}"
+            )
+        )
+
     wallet = get_user_wallet(user_id)
     has_any_action = any((p_react, p_cmt, p_int, p_fr, p_msg, p_rep))
-    has_any_feature = any((is_dev, p_use, p_add, p_del, p_exec, has_any_action, p_inv))
+    has_any_feature = any((is_admin_any, p_use, p_add, p_del, p_exec, has_any_action, p_inv))
     usable_accs = get_usable_accounts_for_user(user_id) if (p_use or p_exec) else []
     manageable_accs = get_manageable_accounts_for_user(user_id)
 
@@ -752,8 +949,8 @@ def get_main_dashboard_markup(user_id: int) -> types.InlineKeyboardMarkup:
         )
 
     # 8. إدارة وإضافة الحسابات (معزولة حسب الصلاحية)
-    if is_dev or p_add or p_del:
-        if p_add and not has_any_action and not p_use and not is_dev:
+    if is_dev or cap_pool or p_add or p_del:
+        if p_add and not has_any_action and not p_use and not is_dev and not cap_pool:
             # واجهة نظيفة لوضع "إضافة حسابات للبوت فقط"
             markup.row(
                 types.InlineKeyboardButton("➕ إضافة حساب", callback_data="act_add_acc"),
@@ -771,31 +968,53 @@ def get_main_dashboard_markup(user_id: int) -> types.InlineKeyboardMarkup:
             sub_acc_row = []
             if p_add:
                 sub_acc_row.append(types.InlineKeyboardButton("🍪 استيراد جلسة/كوكيز", callback_data="act_import_cookies"))
-            if is_dev or len(manageable_accs) > 0:
+            if is_dev or cap_pool or len(manageable_accs) > 0:
                 sub_acc_row.append(types.InlineKeyboardButton("🔄 فحص الجلسات", callback_data="act_check_sessions"))
             if sub_acc_row:
                 markup.row(*sub_acc_row)
 
-    # 9. قسم المحفظة والإحالات والدعم/البيع (يظهر عند امتلاك أي صلاحية أو رصيد)
-    if is_dev:
-        all_users = load_users()
-        user_count = max(0, len(all_users) - 1)
-        markup.row(
-            types.InlineKeyboardButton(f"🛰️ رادار المستخدمين ({user_count})", callback_data="menu_surveillance_radar"),
-            types.InlineKeyboardButton("⚙️ إعدادات النقاط والعامة", callback_data="menu_admin_economy")
-        )
-        markup.row(
-            types.InlineKeyboardButton("📜 سجل الرقابة والأحداث", callback_data="menu_audit_logs"),
-            types.InlineKeyboardButton("📩 تذاكر البيع والدعم", callback_data="menu_support")
-        )
-        markup.row(
-            types.InlineKeyboardButton("💰 محفظتي وسجلي", callback_data="menu_wallet"),
-            types.InlineKeyboardButton("🔗 روابط وأكواد الدعوة", callback_data="menu_referral")
-        )
-        markup.row(
-            types.InlineKeyboardButton("🌐 البروكسيات ونفق 4G", callback_data="menu_proxies"),
-            types.InlineKeyboardButton("💾 الحفظ الدائم والنسخ الاحتياطي", callback_data="menu_backup_vault"),
-        )
+    # 9. قسم المحفظة والإحالات والدعم/البيع + صلاحيات الإدارة المفوضة والمطور
+    if is_admin_any:
+        row_a = []
+        if cap_radar:
+            all_users = load_users()
+            user_count = sum(1 for u in all_users.values() if can_manage_target_user(user_id, u.get("id", 0)))
+            row_a.append(types.InlineKeyboardButton(f"🛰️ رادار المستخدمين ({user_count})", callback_data="menu_surveillance_radar"))
+        if cap_eco:
+            row_a.append(types.InlineKeyboardButton("⚙️ إعدادات النقاط والعامة", callback_data="menu_admin_economy"))
+        if row_a:
+            markup.row(*row_a)
+
+        row_b = []
+        if cap_audit:
+            row_b.append(types.InlineKeyboardButton("📜 سجل الرقابة والأحداث", callback_data="menu_audit_logs"))
+        if cap_pay:
+            row_b.append(types.InlineKeyboardButton("📩 تذاكر البيع والدعم", callback_data="menu_support"))
+        else:
+            row_b.append(types.InlineKeyboardButton("💵 طلب بيع الحسابات / مراسلة المطور", callback_data="menu_support"))
+        if row_b:
+            markup.row(*row_b)
+
+        row_c = [types.InlineKeyboardButton("💰 محفظتي وسجلي", callback_data="menu_wallet")]
+        if p_inv:
+            row_c.append(types.InlineKeyboardButton("🔗 روابط وأكواد الدعوة", callback_data="menu_referral"))
+        markup.row(*row_c)
+
+        row_d = []
+        if cap_prox:
+            row_d.append(types.InlineKeyboardButton("🌐 البروكسيات ونفق 4G", callback_data="menu_proxies"))
+        if cap_bkp:
+            row_d.append(types.InlineKeyboardButton("💾 الحفظ الدائم والنسخ الاحتياطي", callback_data="menu_backup_vault"))
+        if row_d:
+            markup.row(*row_d)
+
+        if cap_ann:
+            markup.row(
+                types.InlineKeyboardButton(
+                    f"📢 الإعلانات العائمة ({len(active_anns)} نشط)",
+                    callback_data="menu_announcements"
+                )
+            )
     elif has_any_feature or wallet["points"] > 0:
         eco_row = [types.InlineKeyboardButton(f"🪙 نقاطي ({wallet['points']} = {wallet['yer_value']:,} ر.ي)", callback_data="menu_wallet")]
         if p_inv:
@@ -827,9 +1046,11 @@ def get_main_dashboard_markup(user_id: int) -> types.InlineKeyboardMarkup:
 
 def get_dashboard_text(user_id: int) -> str:
     is_dev = is_super_admin(user_id)
+    tier = get_admin_tier(user_id)
+    cap_pool = has_admin_capability(user_id, "accounts_pool")
     st = get_user_state(user_id)
 
-    p_use = is_dev or has_permission(user_id, "can_use_accounts")
+    p_use = is_dev or cap_pool or has_permission(user_id, "can_use_accounts")
     p_add = is_dev or has_permission(user_id, "can_add_accounts")
     p_react = is_dev or has_permission(user_id, "can_react")
     p_cmt = is_dev or has_permission(user_id, "can_comment")
@@ -841,23 +1062,24 @@ def get_dashboard_text(user_id: int) -> str:
     p_exec = is_dev or has_permission(user_id, "can_execute")
     p_inv = can_user_invite(user_id)
 
+    has_admin_any = is_dev or is_admin_delegate(user_id, include_manager=True)
     has_any_action = any((p_react, p_cmt, p_int, p_fr, p_msg, p_rep))
-    has_any_feature = any((is_dev, p_use, p_add, p_del, p_exec, has_any_action, p_inv))
+    has_any_feature = any((has_admin_any, p_use, p_add, p_del, p_exec, has_any_action, p_inv))
     wallet = get_user_wallet(user_id)
     eco_cfg = load_economy_settings()
 
-    if is_dev:
+    if is_dev or cap_pool:
         all_accs = load_accounts()
         active_count = sum(1 for a in all_accs if "نشط" in a.get("status", ""))
         inactive_count = len(all_accs) - active_count
-        role_title = "👑 المطور الرئيسي (Super Admin)"
+        role_title = "👑 المطور الرئيسي (Super Admin)" if is_dev else ADMIN_TIER_LABELS.get(tier, "👑 نائب المطور")
         mode_tag = "🌐 مفتوح للعامة" if eco_cfg.get("public_mode") else "🔒 بموافقة / دعوة"
         acc_summary = (
             f"📊 <b>إجمالي حسابات النظام:</b> {len(all_accs)} ({active_count} نشط | {inactive_count} غير نشط)\n"
             f"⚙️ <b>وضع البوت:</b> {mode_tag} | <b>القيمة:</b> 1 نقطة = {wallet['yer_per_point']} ر.ي"
         )
     else:
-        role_title = "🛡️ حساب معتمد بصلاحيات مخصصة"
+        role_title = ADMIN_TIER_LABELS.get(tier, "🛡️ حساب معتمد بصلاحيات مخصصة") if tier in ("manager", "super_delegate") else "🛡️ حساب معتمد بصلاحيات مخصصة"
         parts = []
         if p_use:
             pool_accs = load_accounts()
@@ -876,11 +1098,20 @@ def get_dashboard_text(user_id: int) -> str:
             )
         acc_summary = "\n".join(parts)
 
-    if not is_dev:
+    if is_dev:
+        perms_line = "🔐 <b>صلاحياتك الحالية:</b> تحكم سيادي كامل 100%"
+    elif tier == "super_delegate":
+        restr = get_admin_restrictions(user_id)
+        blocked_cnt = sum(1 for v in restr.values() if v)
+        perms_line = (
+            "🔐 <b>صلاحياتك الحالية:</b> تفويض كامل على النظام"
+            + (f" (مقيد عن {blocked_cnt} بنود)" if blocked_cnt else " (بلا قيود)")
+        )
+    elif tier == "manager":
+        perms_line = "🔐 <b>صلاحياتك الحالية:</b> إدارة المستخدمين والطلبات + صلاحياتك الممنوحة"
+    else:
         granted_list = [label for key, label in PERMISSION_LABELS.items() if has_permission(user_id, key)]
         perms_line = f"🔐 <b>صلاحياتك الحالية:</b> {', '.join(granted_list)}" if granted_list else "🔒 <b>صلاحياتك الحالية:</b> لا توجد ميزات مفعلة بعد"
-    else:
-        perms_line = "🔐 <b>صلاحياتك الحالية:</b> تحكم سيادي كامل 100%"
 
     lines = [
         "⚡ <b>منظومة FB Operator | لوحة التحكم السحابية</b>",
@@ -888,6 +1119,13 @@ def get_dashboard_text(user_id: int) -> str:
         f"👤 <b>الرتبة:</b> {role_title}",
         perms_line
     ]
+    active_anns = list_announcements(only_active=True)
+    if active_anns:
+        a0 = active_anns[0]
+        lines.append(
+            f"📌 <b>إعلان عائم [{esc(a0.get('badge'))}]:</b> {esc(a0.get('title'))} "
+            f"<i>({esc(a0.get('remaining_label'))})</i>"
+        )
     if acc_summary:
         lines.append(acc_summary)
 
@@ -921,14 +1159,23 @@ def get_dashboard_text(user_id: int) -> str:
 
 # ----------------- عرض بطاقة المراقبة وسجل الرقابة للمطور -----------------
 
-def render_surveillance_radar_text_and_markup():
+def render_surveillance_radar_text_and_markup(viewer_id: int = SUPER_ADMIN_ID):
     users = load_users()
     accs = load_accounts()
     markup = types.InlineKeyboardMarkup(row_width=1)
 
-    pending_users = [u for u in users.values() if u.get("status") == "pending"]
-    approved_users = [u for u in users.values() if u.get("status") == "approved" and not is_super_admin(u.get("id"))]
-    banned_users = [u for u in users.values() if u.get("status") == "banned"]
+    pending_users = [
+        u for u in users.values()
+        if u.get("status") == "pending" and can_manage_target_user(viewer_id, u.get("id", 0))
+    ]
+    approved_users = [
+        u for u in users.values()
+        if u.get("status") == "approved" and not is_super_admin(u.get("id")) and can_manage_target_user(viewer_id, u.get("id", 0))
+    ]
+    banned_users = [
+        u for u in users.values()
+        if u.get("status") == "banned" and can_manage_target_user(viewer_id, u.get("id", 0))
+    ]
 
     if pending_users:
         markup.add(types.InlineKeyboardButton("⏳ --- طلبات انضمام قيد الانتظار ---", callback_data="noop"))
@@ -942,7 +1189,7 @@ def render_surveillance_radar_text_and_markup():
 
     markup.add(types.InlineKeyboardButton("👥 --- المستخدمون المعتمدون وسجلاتهم ---", callback_data="noop"))
     if not approved_users:
-        markup.add(types.InlineKeyboardButton("لا يوجد مستخدمون معتمدون غير المطور حالياً", callback_data="noop"))
+        markup.add(types.InlineKeyboardButton("لا يوجد مستخدمون متاحون في نطاق رتبتك حالياً", callback_data="noop"))
     eco_cfg = load_economy_settings()
     rate = int(eco_cfg.get("yer_per_point", 10) or 10)
     total_perms = max(1, len(PERMISSION_LABELS))
@@ -951,12 +1198,14 @@ def render_surveillance_radar_text_and_markup():
         u_name = u.get("name", f"مستخدم_{u['id']}")
         active_n = len(bd["active"])
         inactive_n = len(bd["inactive"])
-        enabled_perms = sum(1 for v in u.get("permissions", {}).values() if v)
+        t_val = str(u.get("admin_tier") or "none")
+        tier_ico = "👑" if t_val == "super_delegate" else ("🛡️" if t_val == "manager" else "👤")
+        enabled_perms = len(PERMISSION_LABELS) if t_val == "super_delegate" else sum(1 for v in u.get("permissions", {}).values() if v)
         pts = safe_nonneg_points(u.get("points", 0) or 0)
         yer_btn = int(round(float(pts) * rate))
         markup.add(
             types.InlineKeyboardButton(
-                f"👤 {u_name} | 🪙{pts}ن ({yer_btn:,}ر.ي) | 🟢{active_n} 🔴{inactive_n} | {enabled_perms}/{total_perms}",
+                f"{tier_ico} {u_name} | 🪙{pts}ن ({yer_btn:,}ر.ي) | 🟢{active_n} 🔴{inactive_n} | {enabled_perms}/{total_perms}",
                 callback_data=f"surv_user_{u['id']}"
             )
         )
@@ -966,11 +1215,17 @@ def render_surveillance_radar_text_and_markup():
         for bu in banned_users:
             markup.add(types.InlineKeyboardButton(f"🚫 {bu['name']} (محظور)", callback_data=f"surv_user_{bu['id']}"))
 
-    markup.add(types.InlineKeyboardButton("📜 عرض سجل الرقابة والأحداث الكامل", callback_data="menu_audit_logs"))
+    if has_admin_capability(viewer_id, "audit_logs"):
+        markup.add(types.InlineKeyboardButton("📜 عرض سجل الرقابة والأحداث الكامل", callback_data="menu_audit_logs"))
     markup.add(types.InlineKeyboardButton("🔙 العودة للوحة الرئيسية", callback_data="back_to_main"))
 
     active_total = sum(1 for a in accs if "نشط" in a.get("status", ""))
     inactive_total = len(accs) - active_total
+    pool_line = (
+        f"📊 <b>الحسابات بالنظام:</b> {len(accs)} (🟢 {active_total} نشط | 🔴 {inactive_total} غير نشط)\n"
+        if has_admin_capability(viewer_id, "accounts_pool")
+        else ""
+    )
 
     txt = (
         "🛰️ <b>رادار المراقبة الشامل والتحكم بالصلاحيات:</b>\n"
@@ -978,24 +1233,52 @@ def render_surveillance_radar_text_and_markup():
         f"👑 <b>المطور الرئيسي الحصين:</b> <code>{SUPER_ADMIN_ID}</code>\n"
         f"👥 <b>إجمالي المسجلين بالرادار:</b> {max(0, len(users) - 1)}\n"
         f"🟢 <b>المعتمدون:</b> {len(approved_users)} | ⏳ <b>المعلقون:</b> {len(pending_users)} | 🚫 <b>المحظورون:</b> {len(banned_users)}\n"
-        f"📊 <b>الحسابات بالنظام:</b> {len(accs)} (🟢 {active_total} نشط | 🔴 {inactive_total} غير نشط)\n"
+        f"{pool_line}"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "👇 <b>اختر أي مستخدم لعرض حساباته (النشطة والفاشلة + كلمات السر) وتحديد صلاحياته بدقة:</b>"
+        "👇 <b>اختر أي مستخدم لعرض حساباته (النشطة والفاشلة + كلمات السر) وتحديد صلاحياته أو رتبته بدقة:</b>"
     )
     return txt, markup
 
 
-def render_user_dossier(t_id: int):
+def _render_user_restrictions_view(t_id: int) -> tuple[str | None, types.InlineKeyboardMarkup | None]:
     users = load_users()
     u = users.get(str(t_id))
     if not u or is_super_admin(t_id):
+        return None, None
+    t_val = str(u.get("admin_tier") or "none")
+    restr = get_admin_restrictions(t_id)
+    mk = types.InlineKeyboardMarkup(row_width=1)
+    for rkey, rlabel in ADMIN_RESTRICTION_LABELS.items():
+        blocked = bool(restr.get(rkey, False))
+        badge = "🔒 محجوب عنه" if blocked else "✅ مسموح له"
+        mk.add(types.InlineKeyboardButton(f"{badge} | {rlabel}", callback_data=f"surv_restr_{t_id}_{rkey}"))
+    mk.add(types.InlineKeyboardButton("🔙 العودة لبطاقة المستخدم", callback_data=f"surv_user_{t_id}"))
+    txt = (
+        f"🚧 <b>تقييد صلاحيات وإشعارات الرتبة الإدارية: {esc(u.get('name'))}</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"🎖️ <b>الرتبة الحالية:</b> {esc(ADMIN_TIER_LABELS.get(t_val, t_val))}\n"
+        "💡 <i>اضغط على أي بند لحجبه (🔒) أو إتاحته (✅) لهذا الأدمن فوراً — مثلاً حجب رسائل الدفع والمحاسبة مع إبقاء بقية صلاحيات النظام مفتوحة له.</i>"
+    )
+    return txt, mk
+
+
+def render_user_dossier(t_id: int, viewer_id: int = SUPER_ADMIN_ID):
+    users = load_users()
+    u = users.get(str(t_id))
+    if not u or not can_manage_target_user(viewer_id, t_id):
         return None, None
 
     bd = get_accounts_breakdown_by_owner(t_id)
     p = u.get("permissions", {})
     wallet = get_user_wallet(t_id)
+    u_tier = str(u.get("admin_tier") or "none")
+    can_tiers = is_super_admin(viewer_id)
+    cap_pts = has_admin_capability(viewer_id, "points_economy")
+    cap_pay = has_admin_capability(viewer_id, "payment_notices")
 
     markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.row(types.InlineKeyboardButton("🌟 منح كافة المميزات (تشغيل كامل بضغطة)", callback_data=f"surv_grant_all_{t_id}"))
+
     # 11 زر تحكم دقيق لكل ميزة بشكل منفصل تماماً
     perm_pairs = [
         ("can_use_accounts", "🔑 استخدام حسابات البوت", "can_add_accounts", "➕ إضافة حسابات فقط/جديدة"),
@@ -1017,16 +1300,35 @@ def render_user_dossier(t_id: int):
         types.InlineKeyboardButton(f"🔗 روابط وأكواد الإحالة: {s_inv}", callback_data=f"surv_perm_{t_id}_can_invite")
     )
 
-    markup.row(
-        types.InlineKeyboardButton("➕ إضافة +5 نقاط", callback_data=f"surv_pts_add5_{t_id}"),
-        types.InlineKeyboardButton("➖ خصم -5 نقاط", callback_data=f"surv_pts_sub5_{t_id}"),
-        types.InlineKeyboardButton("✏️ تعديل/خصم رقم", callback_data=f"surv_pts_custom_{t_id}")
-    )
-    markup.row(
-        types.InlineKeyboardButton("💸 تسوية ودفع كل المستحقات", callback_data=f"surv_pts_settle_{t_id}"),
-        types.InlineKeyboardButton("🔄 تصفير إنذارات البروفايل", callback_data=f"surv_rst_warn_{t_id}"),
-        types.InlineKeyboardButton("📩 التذاكر والمحادثة", callback_data="menu_support")
-    )
+    if can_tiers:
+        markup.row(
+            types.InlineKeyboardButton(f"{'🔘 ' if u_tier == 'none' else ''}👤 عادي", callback_data=f"surv_tier_{t_id}_none"),
+            types.InlineKeyboardButton(f"{'🔘 ' if u_tier == 'manager' else ''}🛡️ مدير", callback_data=f"surv_tier_{t_id}_manager"),
+            types.InlineKeyboardButton(f"{'🔘 ' if u_tier == 'super_delegate' else ''}👑 فوق الأدمن", callback_data=f"surv_tier_{t_id}_super_delegate"),
+        )
+        if u_tier in ("manager", "super_delegate"):
+            restr = get_admin_restrictions(t_id)
+            blk_n = sum(1 for v in restr.values() if v)
+            markup.row(
+                types.InlineKeyboardButton(
+                    f"🚧 قيود الرتبة وحجب الإشعارات ({blk_n} محجوب)",
+                    callback_data=f"surv_restr_menu_{t_id}"
+                )
+            )
+
+    if cap_pts:
+        markup.row(
+            types.InlineKeyboardButton("➕ إضافة +5 نقاط", callback_data=f"surv_pts_add5_{t_id}"),
+            types.InlineKeyboardButton("➖ خصم -5 نقاط", callback_data=f"surv_pts_sub5_{t_id}"),
+            types.InlineKeyboardButton("✏️ تعديل/خصم رقم", callback_data=f"surv_pts_custom_{t_id}")
+        )
+    row_tools = []
+    if cap_pay and cap_pts:
+        row_tools.append(types.InlineKeyboardButton("💸 تسوية ودفع المستحقات", callback_data=f"surv_pts_settle_{t_id}"))
+    row_tools.append(types.InlineKeyboardButton("🔄 تصفير الإنذارات", callback_data=f"surv_rst_warn_{t_id}"))
+    if cap_pay:
+        row_tools.append(types.InlineKeyboardButton("📩 التذاكر", callback_data="menu_support"))
+    markup.row(*row_tools)
     markup.row(types.InlineKeyboardButton("🔒 تصفير وإغلاق كافة الصلاحيات", callback_data=f"surv_revoke_all_{t_id}"))
 
     if u.get("status") == "banned":
@@ -1047,10 +1349,12 @@ def render_user_dossier(t_id: int):
     st_map = {"approved": "معتمد ومصرح ✅", "pending": "قيد الانتظار ⏳", "banned": "محظور نهائياً 🚫"}
     uname = f"@{esc(u.get('username'))}" if u.get("username") else "بدون معرف"
     ref_line = f" | مدعو من: <code>{wallet['referred_by']}</code>" if wallet.get("referred_by") else ""
+    tier_lbl = ADMIN_TIER_LABELS.get(u_tier, "👤 مستخدم عادي")
     header = (
         f"👤 <b>بطاقة المراقبة الشاملة: {esc(u.get('name'))}</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"🆔 <b>الآيدي:</b> <code>{t_id}</code> | <b>المعرف:</b> {uname}\n"
+        f"🎖️ <b>الرتبة الإدارية:</b> {esc(tier_lbl)}\n"
         f"🛡️ <b>الحالة:</b> {st_map.get(u.get('status'), esc(u.get('status')))}\n"
         f"🪙 <b>الرصيد المالي:</b> {wallet['points']} نقطة = <b>{wallet['yer_value']:,} ريال يمني</b>\n"
         f"⚠️ <b>إنذارات جودة البروفايل:</b> <b>{wallet.get('profile_warnings_used', 0)}/{wallet.get('profile_warning_limit', 5)}</b>\n"
@@ -1134,7 +1438,7 @@ def _render_audit_logs_view() -> tuple[str, types.InlineKeyboardMarkup]:
 
 
 def _render_manage_accs_view(user_id: int) -> tuple[str, types.InlineKeyboardMarkup]:
-    is_dev = is_super_admin(user_id)
+    is_dev = has_admin_capability(user_id, "accounts_pool")
     accs = get_manageable_accounts_for_user(user_id)
     can_del = is_dev or has_permission(user_id, "can_delete_accounts")
     can_add = is_dev or has_permission(user_id, "can_add_accounts")
@@ -1230,7 +1534,7 @@ def _extract_backup_channel_target(message) -> tuple[int | str | None, str, str]
 
 def _handle_backup_channel_binding(message, user_id: int) -> None:
     st = get_user_state(user_id)
-    if not is_super_admin(user_id):
+    if not has_admin_capability(user_id, "backups"):
         st["input_mode"] = None
         return
     target_ch, title_hint, err = _extract_backup_channel_target(message)
@@ -1792,7 +2096,7 @@ def _render_referral_view(uid: int) -> tuple[str, types.InlineKeyboardMarkup]:
 
 
 def _render_support_view(uid: int) -> tuple[str, types.InlineKeyboardMarkup]:
-    is_dev = is_super_admin(uid)
+    is_dev = has_admin_capability(uid, "payment_notices")
     snap = build_user_settlement_snapshot(uid)
     tickets = list_support_tickets(uid, is_dev=is_dev, limit=12)
     lines = [
@@ -1842,7 +2146,7 @@ def _render_ticket_detail_view(viewer_uid: int, ticket_id: str) -> tuple[str, ty
     t = get_ticket_by_id(ticket_id)
     if not t:
         return "⚠️ التذكرة غير موجودة.", _back_home_markup("menu_support")
-    is_dev = is_super_admin(viewer_uid)
+    is_dev = has_admin_capability(viewer_uid, "payment_notices")
     if not is_dev and int(t.get("user_id", 0)) != int(viewer_uid):
         return "⛔ غير مصرح لك بعرض هذه التذكرة.", _back_home_markup("back_to_main")
 
@@ -1966,13 +2270,13 @@ def _refresh_tracked_inline_view(uid: int) -> None:
     if view == "main":
         txt = get_dashboard_text(uid)
         markup = get_main_dashboard_markup(uid)
-    elif view == "radar" and is_super_admin(uid):
-        txt, markup = render_surveillance_radar_text_and_markup()
-    elif view == "dossier" and is_super_admin(uid) and target_id:
-        txt, markup = render_user_dossier(target_id)
+    elif view == "radar" and has_admin_capability(uid, "radar_users"):
+        txt, markup = render_surveillance_radar_text_and_markup(viewer_id=uid)
+    elif view == "dossier" and has_admin_capability(uid, "radar_users") and target_id:
+        txt, markup = render_user_dossier(target_id, viewer_id=uid)
         if not txt:
-            txt, markup = render_surveillance_radar_text_and_markup()
-    elif view == "audit" and is_super_admin(uid):
+            txt, markup = render_surveillance_radar_text_and_markup(viewer_id=uid)
+    elif view == "audit" and has_admin_capability(uid, "audit_logs"):
         txt, markup = _render_audit_logs_view()
     elif view == "manage_accs":
         txt, markup = _render_manage_accs_view(uid)
@@ -1984,14 +2288,16 @@ def _refresh_tracked_inline_view(uid: int) -> None:
         txt, markup = _render_support_view(uid)
     elif view == "ticket" and entry.get("ticket_id"):
         txt, markup = _render_ticket_detail_view(uid, str(entry.get("ticket_id")))
-    elif view == "economy" and is_super_admin(uid):
+    elif view == "economy" and has_admin_capability(uid, "points_economy"):
         txt, markup = _render_admin_economy_view()
-    elif view == "backup_vault" and is_super_admin(uid):
+    elif view == "backup_vault" and has_admin_capability(uid, "backups"):
         txt, markup = _render_backup_vault_view()
-    elif view == "proxies" and is_super_admin(uid):
+    elif view == "proxies" and has_admin_capability(uid, "proxies"):
         txt, markup = _render_proxies_view()
-    elif view == "proxies_4g" and is_super_admin(uid):
+    elif view == "proxies_4g" and has_admin_capability(uid, "proxies"):
         txt, markup = _render_4g_bridge_view()
+    elif view == "announcements" and has_admin_capability(uid, "announcements"):
+        txt, markup = _render_announcements_view()
     else:
         return
 
@@ -2025,9 +2331,9 @@ def _on_state_event(scope: str, target_uid: int, reason: str) -> None:
 
     to_wake: list[int] = []
     for uid in tracked_uids:
-        if is_super_admin(uid):
+        if is_super_admin(uid) or is_admin_delegate(uid, include_manager=True):
             to_wake.append(uid)
-        elif target_uid == uid or (target_uid == 0 and scope in ("economy", "system")) or (scope == "accounts" and has_permission(uid, "can_use_accounts")):
+        elif target_uid == uid or (target_uid == 0 and scope in ("economy", "system", "announcements")) or (scope == "accounts" and has_permission(uid, "can_use_accounts")):
             to_wake.append(uid)
 
     if to_wake:
@@ -2042,16 +2348,20 @@ def _persistent_bottom_keyboard(user_id: int) -> types.ReplyKeyboardMarkup:
     """كيبورد اختصار دائم أسفل صندوق الكتابة يفتح البوت بضغطة واحدة بدون كتابة /start"""
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True, is_persistent=True)
     is_dev = is_super_admin(user_id)
+    cap_prox = has_admin_capability(user_id, "proxies")
+    cap_radar = has_admin_capability(user_id, "radar_users")
     can_add = is_dev or has_permission(user_id, "can_add_accounts")
     row1 = [types.KeyboardButton("🏠 القائمة الرئيسية")]
     if can_add:
         row1.append(types.KeyboardButton("➕ إضافة حساب"))
     kb.row(*row1)
-    if is_dev:
-        kb.row(
-            types.KeyboardButton("🌐 البروكسيات"),
-            types.KeyboardButton("🛰️ رادار المستخدمين"),
-        )
+    if cap_prox or cap_radar:
+        row2 = []
+        if cap_prox:
+            row2.append(types.KeyboardButton("🌐 البروكسيات"))
+        if cap_radar:
+            row2.append(types.KeyboardButton("🛰️ رادار المستخدمين"))
+        kb.row(*row2)
     else:
         kb.row(types.KeyboardButton("💰 نقاطي"))
     return kb
@@ -2123,6 +2433,24 @@ def cmd_start(message: types.Message):
     )
     if sent and hasattr(sent, "message_id"):
         _track_view(uid, message.chat.id, sent.message_id, "main")
+    try:
+        open_anns = [a for a in list_announcements(only_active=True) if a.get("repeat_on_open")]
+        if open_anns:
+            top_a = open_anns[0]
+            promo_msg = safe_send(
+                message.chat.id,
+                format_announcement_telegram_html(top_a, esc_fn=esc, is_repeat=False),
+                reply_markup=_build_announcement_markup(top_a, include_ack=True),
+            )
+            if promo_msg and hasattr(promo_msg, "message_id"):
+                record_announcement_sent_chats(top_a["id"], {message.chat.id: promo_msg.message_id})
+                if top_a.get("pin_in_chat"):
+                    try:
+                        bot.pin_chat_message(message.chat.id, promo_msg.message_id, disable_notification=True)
+                    except Exception:
+                        pass
+    except Exception:
+        pass
 
 
 @bot.callback_query_handler(func=lambda call: True)
@@ -2173,7 +2501,8 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
             "back_to_main", "menu_wizard_react", "menu_wizard_comment", "menu_cmt_interact",
             "menu_wizard_message", "menu_manage_accs", "menu_wallet", "menu_referral",
             "menu_support", "menu_admin_economy", "menu_surveillance_radar", "menu_backup_vault",
-            "menu_bkp_schedule", "menu_proxies", "prx_4g_menu"
+            "menu_bkp_schedule", "menu_proxies", "menu_cloud_db", "menu_announcements",
+            "prx_4g_menu",
         }
         if dest not in allowed_dests:
             dest = "back_to_main"
@@ -2185,11 +2514,11 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         _handle_callbacks_impl(call)
         return
 
-    # 1. بوابة موافقة / حظر المطور الأكبر (حصرياً لـ SUPER_ADMIN_ID)
+    # 1. بوابة موافقة / حظر المطور الأكبر (أو المفوض المخوّل بالرادار دون مساس بالنظراء/المطور)
     if data.startswith("gate_app_"):
-        if not is_super_admin(user_id):
+        if not has_admin_capability(user_id, "radar_users"):
             record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", f"محاولة غير مصرحة لتنفيذ {data}")
-            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+            safe_answer(call.id, "⛔ خاص بالمطور والأدمن المخوّل فقط.", show_alert=True)
             return
         try:
             target_uid = int(data.replace("gate_app_", ""))
@@ -2197,6 +2526,9 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
             return
         if is_super_admin(target_uid):
             safe_answer(call.id, "👑 المطور الأكبر معتمد تلقائياً دوماً.")
+            return
+        if not can_manage_target_user(user_id, target_uid):
+            safe_answer(call.id, "⛔ لا تملك صلاحية تعديل هذا الحساب أو هذه الرتبة.", show_alert=True)
             return
         approve_user(target_uid)
         update_menu_button_for_user(bot, target_uid, is_allowed=True)
@@ -2213,15 +2545,15 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         )
         safe_send(
             target_uid,
-            "🎉 <b>تمت الموافقة المبدئية على حسابك من قبل المطور الرئيسي.</b>\n"
-            "🔒 بانتظار قيام المطور بتحديد الميزات المسموحة لك. أرسل /start لعرض لوحتك."
+            "🎉 <b>تمت الموافقة المبدئية على حسابك من قبل الإدارة.</b>\n"
+            "🔒 بانتظار قيام الإدارة بتحديد الميزات المسموحة لك. أرسل /start لعرض لوحتك."
         )
         return
 
     elif data.startswith("gate_ban_"):
-        if not is_super_admin(user_id):
+        if not has_admin_capability(user_id, "radar_users"):
             record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", f"محاولة غير مصرحة لتنفيذ {data}")
-            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+            safe_answer(call.id, "⛔ خاص بالمطور والأدمن المخوّل فقط.", show_alert=True)
             return
         try:
             target_uid = int(data.replace("gate_ban_", ""))
@@ -2229,6 +2561,10 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
             return
         if is_super_admin(target_uid):
             safe_answer(call.id, "🛡️ محظور برمجياً: لا يمكن حظر المطور الأكبر أبداً!", show_alert=True)
+            return
+        if not can_manage_target_user(user_id, target_uid):
+            record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", f"محاولة حظر خارج النطاق: {target_uid}")
+            safe_answer(call.id, "⛔ لا يمكنك حظر هذه الرتبة.", show_alert=True)
             return
         ban_user(target_uid)
         update_menu_button_for_user(bot, target_uid, is_allowed=False)
@@ -2247,21 +2583,236 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
 
     st = get_user_state(user_id)
 
-    # ----------------- رادار المراقبة الشامل وسجل الرقابة للمطور الأكبر فقط -----------------
-    if data == "menu_surveillance_radar":
-        if not is_super_admin(user_id):
-            record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", "محاولة فتح رادار المطور")
-            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+    # 2.5 عرض/إخفاء الإعلانات العائمة التفاعلية (متاحة لجميع المعتمدين)
+    if data.startswith("promo_view_"):
+        ann_id = data[len("promo_view_"):]
+        ann = get_announcement_by_id(ann_id)
+        if not ann:
+            safe_answer(call.id, "⌛ انتهى هذا الإعلان أو تمت إزالته.", show_alert=True)
             return
-        txt, markup = render_surveillance_radar_text_and_markup()
+        popup_txt = f"✨ [{ann.get('badge', 'إعلان')}] {ann.get('title', '')}\n\n{ann.get('body', '')}\n\n⏳ {ann.get('remaining_label', '')}"
+        safe_answer(call.id, popup_txt[:195], show_alert=True)
+        return
+
+    elif data.startswith("promo_ack_"):
+        try:
+            bot.unpin_chat_message(call.message.chat.id, call.message.message_id)
+        except Exception:
+            pass
+        safe_answer(call.id, "✅ تم إخفاء الإعلان المثبّت من محادثتك.")
+        safe_edit_message(
+            get_dashboard_text(user_id),
+            call.message.chat.id, call.message.message_id,
+            reply_markup=get_main_dashboard_markup(user_id)
+        )
+        _track_view(user_id, call.message.chat.id, call.message.message_id, "main")
+        return
+
+    # ----------------- مركز الإعلانات العائمة والمنبثقة للمطور والأدمن غير المقيد -----------------
+    elif data == "menu_announcements":
+        if not has_admin_capability(user_id, "announcements"):
+            record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", "محاولة فتح مركز الإعلانات بدون صلاحية")
+            safe_answer(call.id, "⛔ هذه الصلاحية خاصة بالمطور أو الأدمن غير المقيد.", show_alert=True)
+            return
+        txt, markup = _render_announcements_view()
+        _track_view(user_id, call.message.chat.id, call.message.message_id, "announcements")
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+        return
+
+    elif data == "ann_new":
+        if not has_admin_capability(user_id, "announcements"):
+            safe_answer(call.id, "⛔ غير مصرح لك.", show_alert=True)
+            return
+        st["temp_ann_data"] = {
+            "badge": "ميزة جديدة",
+            "display_style": "floating_card",
+            "duration_sec": 86400,
+            "repeat_interval_sec": 3600,
+            "repeat_on_open": True,
+            "pin_in_chat": True,
+        }
+        st["input_mode"] = "waiting_ann_title"
+        safe_answer(call.id)
+        safe_send(
+            call.message.chat.id,
+            "📢 <b>إنشاء إعلان عائم ومنبثق جديد (الخطوة 1/3)</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "✍️ أرسل <b>عنوان الإعلان</b> الآن (مثال: <i>تحديث محرك البروفايلات الذكي + ميزة جديدة!</i>):",
+            reply_markup=_prompt_back_markup("menu_announcements"),
+        )
+        return
+
+    elif data.startswith("ann_c_dur_"):
+        if not has_admin_capability(user_id, "announcements"):
+            return
+        try:
+            d_sec = int(data[len("ann_c_dur_"):])
+        except ValueError:
+            d_sec = 86400
+        draft = st.setdefault("temp_ann_data", {})
+        draft["duration_sec"] = d_sec
+        mk = types.InlineKeyboardMarkup(row_width=2)
+        for rsec, rlbl in REPEAT_PRESETS:
+            mk.add(types.InlineKeyboardButton(f"🔁 {rlbl}", callback_data=f"ann_c_rep_{rsec}"))
+        safe_answer(call.id, f"⏱️ المدة: {format_duration_ar(d_sec)}")
+        safe_edit_message(
+            f"📢 <b>اختر نظام التكرار والظهور المتكرر للإعلان:</b>\n"
+            f"• <b>العنوان:</b> {esc(draft.get('title'))}\n"
+            f"• <b>المدة المحددة:</b> {esc(format_duration_ar(d_sec))}",
+            call.message.chat.id, call.message.message_id,
+            reply_markup=mk,
+        )
+        return
+
+    elif data.startswith("ann_c_rep_"):
+        if not has_admin_capability(user_id, "announcements"):
+            return
+        try:
+            r_sec = int(data[len("ann_c_rep_"):])
+        except ValueError:
+            r_sec = 3600
+        draft = st.get("temp_ann_data") or {}
+        if not (draft.get("title") and draft.get("body")):
+            safe_answer(call.id, "⚠️ انتهت المسودة؛ ابدأ إنشاء الإعلان من جديد.", show_alert=True)
+            return
+        ann = create_announcement(
+            title=draft["title"],
+            body=draft["body"],
+            created_by=user_id,
+            badge=draft.get("badge", "ميزة جديدة"),
+            display_style=draft.get("display_style", "floating_card"),
+            duration_sec=int(draft.get("duration_sec", 86400)),
+            repeat_interval_sec=r_sec,
+            repeat_on_open=bool(draft.get("repeat_on_open", True)),
+            pin_in_chat=bool(draft.get("pin_in_chat", True)),
+        )
+        st["temp_ann_data"] = {}
+        st["input_mode"] = None
+        safe_answer(call.id, "🚀 جاري بث وتثبيت الإعلان العائم للجميع...")
+        b_res = _broadcast_announcement_to_users(ann, is_repeat=False)
+        record_audit_log(user_id, call.from_user.first_name or "", "ANNOUNCEMENT_CREATED", f"إعلان عائم: {ann['title']} | مستلمون: {b_res['sent']}")
+        txt, mk = _render_announcement_detail_view(ann["id"])
+        safe_edit_message(
+            txt + f"\n\n✅ <b>تم البث الفوري إلى {b_res['sent']} محادثة وتثبيته أعلى الدردشة ({b_res['pinned']} مثبّت)!</b>",
+            call.message.chat.id, call.message.message_id,
+            reply_markup=mk,
+        )
+        return
+
+    elif data.startswith("ann_view_"):
+        if not has_admin_capability(user_id, "announcements"):
+            safe_answer(call.id, "⛔ غير مصرح لك.", show_alert=True)
+            return
+        ann_id = data[len("ann_view_"):]
+        txt, mk = _render_announcement_detail_view(ann_id)
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
+        return
+
+    elif data.startswith("ann_tog_"):
+        if not has_admin_capability(user_id, "announcements"):
+            safe_answer(call.id, "⛔ غير مصرح لك.", show_alert=True)
+            return
+        ann_id = data[len("ann_tog_"):]
+        upd = toggle_announcement_active(ann_id)
+        if not upd:
+            safe_answer(call.id, "⚠️ الإعلان غير موجود.", show_alert=True)
+            return
+        if not upd.get("active"):
+            _unpin_announcement_chats(upd)
+            safe_answer(call.id, "⏸️ تم إيقاف الإعلان وفك تثبيته من الدردشات.", show_alert=True)
+        else:
+            safe_answer(call.id, "▶️ تم إعادة تفعيل الإعلان!", show_alert=True)
+        txt, mk = _render_announcement_detail_view(ann_id)
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
+        return
+
+    elif data.startswith("ann_push_"):
+        if not has_admin_capability(user_id, "announcements"):
+            safe_answer(call.id, "⛔ غير مصرح لك.", show_alert=True)
+            return
+        ann_id = data[len("ann_push_"):]
+        ann = get_announcement_by_id(ann_id)
+        if not ann:
+            safe_answer(call.id, "⚠️ الإعلان غير موجود.", show_alert=True)
+            return
+        b_res = _broadcast_announcement_to_users(ann, is_repeat=True)
+        mark_announcement_repushed(ann_id)
+        safe_answer(call.id, f"🚀 تم البث والتثبيت لـ {b_res['sent']} مستخدم!", show_alert=True)
+        txt, mk = _render_announcement_detail_view(ann_id)
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
+        return
+
+    elif data.startswith("ann_rop_"):
+        if not has_admin_capability(user_id, "announcements"):
+            return
+        ann_id = data[len("ann_rop_"):]
+        ann = get_announcement_by_id(ann_id)
+        if not ann:
+            return
+        update_announcement_timing(ann_id, repeat_on_open=not bool(ann.get("repeat_on_open")))
+        safe_answer(call.id, "🔄 تم تحديث خيار الظهور عند كل فتح!")
+        txt, mk = _render_announcement_detail_view(ann_id)
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
+        return
+
+    elif data.startswith("ann_dur_"):
+        if not has_admin_capability(user_id, "announcements"):
+            return
+        rest = data[len("ann_dur_"):]
+        ann_id, _, sec_s = rest.rpartition("_")
+        try:
+            sec_v = int(sec_s)
+        except ValueError:
+            return
+        update_announcement_timing(ann_id, duration_sec=sec_v)
+        safe_answer(call.id, f"⏱️ تم ضبط المدة: {format_duration_ar(sec_v)}")
+        txt, mk = _render_announcement_detail_view(ann_id)
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
+        return
+
+    elif data.startswith("ann_rep_"):
+        if not has_admin_capability(user_id, "announcements"):
+            return
+        rest = data[len("ann_rep_"):]
+        ann_id, _, sec_s = rest.rpartition("_")
+        try:
+            sec_v = int(sec_s)
+        except ValueError:
+            return
+        update_announcement_timing(ann_id, repeat_interval_sec=sec_v)
+        safe_answer(call.id, f"🔁 التكرار: {format_duration_ar(sec_v) if sec_v else 'مرة واحدة'}")
+        txt, mk = _render_announcement_detail_view(ann_id)
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
+        return
+
+    elif data.startswith("ann_del_"):
+        if not has_admin_capability(user_id, "announcements"):
+            safe_answer(call.id, "⛔ غير مصرح لك.", show_alert=True)
+            return
+        ann_id = data[len("ann_del_"):]
+        removed = delete_announcement(ann_id)
+        unpinned = _unpin_announcement_chats(removed) if removed else 0
+        record_audit_log(user_id, call.from_user.first_name or "", "ANNOUNCEMENT_DELETED", f"حذف إعلان {ann_id} وفك التثبيت من {unpinned} محادثة")
+        safe_answer(call.id, f"🗑️ تم حذف الإعلان وفك تثبيته من {unpinned} محادثة!", show_alert=True)
+        txt, mk = _render_announcements_view()
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
+        return
+
+    # ----------------- رادار المراقبة الشامل وسجل الرقابة للمطور والأدمن المخوّل -----------------
+    elif data == "menu_surveillance_radar":
+        if not has_admin_capability(user_id, "radar_users"):
+            record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", "محاولة فتح رادار المطور")
+            safe_answer(call.id, "⛔ خاص بالمطور والأدمن المخوّل فقط.", show_alert=True)
+            return
+        txt, markup = render_surveillance_radar_text_and_markup(viewer_id=user_id)
         _track_view(user_id, call.message.chat.id, call.message.message_id, "radar")
         safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
         return
 
     elif data == "menu_audit_logs":
-        if not is_super_admin(user_id):
+        if not has_admin_capability(user_id, "audit_logs"):
             record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", "محاولة فتح سجل الرقابة")
-            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+            safe_answer(call.id, "⛔ خاص بالمطور والأدمن غير المقيد فقط.", show_alert=True)
             return
         txt, markup = _render_audit_logs_view()
         _track_view(user_id, call.message.chat.id, call.message.message_id, "audit")
@@ -2269,34 +2820,117 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         return
 
     elif data.startswith("surv_user_"):
-        if not is_super_admin(user_id):
+        if not has_admin_capability(user_id, "radar_users"):
             record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", f"محاولة وصول {data}")
-            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+            safe_answer(call.id, "⛔ خاص بالمطور والأدمن المخوّل فقط.", show_alert=True)
             return
         try:
             t_id = int(data.replace("surv_user_", ""))
         except ValueError:
             return
-        txt, markup = render_user_dossier(t_id)
+        txt, markup = render_user_dossier(t_id, viewer_id=user_id)
         if not txt:
-            safe_answer(call.id, "المستخدم غير موجود أو هو المطور الرئيسي.", show_alert=True)
+            safe_answer(call.id, "⛔ المستخدم غير موجود أو خارج نطاق رتبتك.", show_alert=True)
             return
         _track_view(user_id, call.message.chat.id, call.message.message_id, "dossier", target_id=t_id)
         safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
         return
 
-    elif data.startswith("surv_rst_warn_"):
+    elif data.startswith("surv_grant_all_"):
+        if not has_admin_capability(user_id, "radar_users"):
+            record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", f"محاولة منح كل المميزات {data}")
+            safe_answer(call.id, "⛔ غير مصرح لك.", show_alert=True)
+            return
+        try:
+            t_id = int(data.replace("surv_grant_all_", ""))
+        except ValueError:
+            return
+        if not grant_all_user_permissions(t_id, user_id):
+            safe_answer(call.id, "⛔ لا يمكنك تعديل هذا المستخدم أو رتبته.", show_alert=True)
+            return
+        update_menu_button_for_user(bot, t_id, is_allowed=True)
+        safe_answer(call.id, "🌟 تم فتح كافة المميزات الـ 11 لهذا المستخدم بضغطة واحدة!", show_alert=True)
+        safe_send(t_id, "🌟 <b>تهانينا! تم تفعيل كافة أدوات ومميزات النظام لحسابك بالكامل.</b>\nأرسل /start لعرض لوحتك الجديدة.")
+        txt, markup = render_user_dossier(t_id, viewer_id=user_id)
+        if txt:
+            safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+        return
+
+    elif data.startswith("surv_tier_"):
         if not is_super_admin(user_id):
+            record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", f"محاولة تغيير رتبة إدارية: {data}")
+            safe_answer(call.id, "⛔ تعيين الرتب والمدراء حصري للمطور الرئيسي فقط!", show_alert=True)
+            return
+        rest = data[len("surv_tier_"):]
+        uid_s, _, tier_val = rest.partition("_")
+        try:
+            t_id = int(uid_s)
+        except ValueError:
+            return
+        if not set_admin_tier(t_id, tier_val, user_id):
+            safe_answer(call.id, "⚠️ تعذر تغيير الرتبة.", show_alert=True)
+            return
+        update_menu_button_for_user(bot, t_id, is_allowed=True)
+        t_lbl = ADMIN_TIER_LABELS.get(tier_val, tier_val)
+        safe_answer(call.id, f"✅ تم تعيين الرتبة: {t_lbl}", show_alert=True)
+        safe_send(t_id, f"🎖️ <b>تحديث من المطور الرئيسي:</b> تم تعيين رتبتك في النظام إلى <b>{esc(t_lbl)}</b>!\nأرسل /start لاستعراض صلاحياتك الجديدة.")
+        txt, markup = render_user_dossier(t_id, viewer_id=user_id)
+        if txt:
+            safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+        return
+
+    elif data.startswith("surv_restr_menu_"):
+        if not is_super_admin(user_id):
+            record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", f"محاولة فتح قيود الأدمن: {data}")
+            safe_answer(call.id, "⛔ حصري للمطور الرئيسي فقط!", show_alert=True)
+            return
+        try:
+            t_id = int(data.replace("surv_restr_menu_", ""))
+        except ValueError:
+            return
+        txt, markup = _render_user_restrictions_view(t_id)
+        if not txt:
+            safe_answer(call.id, "المستخدم غير موجود.", show_alert=True)
+            return
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+        return
+
+    elif data.startswith("surv_restr_"):
+        if not is_super_admin(user_id):
+            record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", f"محاولة تعديل قيد أدمن: {data}")
+            safe_answer(call.id, "⛔ حصري للمطور الرئيسي فقط!", show_alert=True)
+            return
+        rest = data[len("surv_restr_"):]
+        uid_s, _, rkey = rest.partition("_")
+        try:
+            t_id = int(uid_s)
+        except ValueError:
+            return
+        res_b = toggle_admin_restriction(t_id, rkey, user_id)
+        if res_b is None:
+            safe_answer(call.id, "⚠️ تعذر تعديل هذا القيد.", show_alert=True)
+            return
+        safe_answer(call.id, f"{'🔒 تم الحجب' if res_b else '✅ تم الإتاحة'}: {ADMIN_RESTRICTION_LABELS.get(rkey, rkey)}")
+        txt, markup = _render_user_restrictions_view(t_id)
+        if txt:
+            safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+        return
+
+    elif data.startswith("surv_rst_warn_"):
+        if not has_admin_capability(user_id, "radar_users"):
             record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", f"محاولة تصفير إنذارات {data}")
-            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+            safe_answer(call.id, "⛔ خاص بالمطور والأدمن المخوّل فقط.", show_alert=True)
             return
         try:
             t_id = int(data.replace("surv_rst_warn_", ""))
         except ValueError:
             return
+        if not can_manage_target_user(user_id, t_id):
+            safe_answer(call.id, "⛔ خارج نطاق رتبتك.", show_alert=True)
+            return
         if reset_user_profile_warnings(t_id):
             safe_answer(call.id, "✅ تم تصفير إنذارات البروفايل (0/5) للمستخدم.", show_alert=True)
-            txt, markup = render_user_dossier(t_id)
+            txt, markup = render_user_dossier(t_id, viewer_id=user_id)
             if txt:
                 safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
         else:
@@ -2304,96 +2938,102 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         return
 
     elif data.startswith("surv_perm_"):
-        if not is_super_admin(user_id):
+        if not has_admin_capability(user_id, "radar_users"):
             record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", f"محاولة تعديل صلاحية {data}")
-            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+            safe_answer(call.id, "⛔ خاص بالمطور والأدمن المخوّل فقط.", show_alert=True)
             return
         parts = data.split("_")
         try:
             t_id = int(parts[2])
         except (IndexError, ValueError):
             return
-        if is_super_admin(t_id):
-            safe_answer(call.id, "🛡️ صلاحيات المطور الأكبر مطلقة ولا تعدّل.", show_alert=True)
+        if not can_manage_target_user(user_id, t_id):
+            record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", f"محاولة تعديل صلاحية خارج النطاق {data}")
+            safe_answer(call.id, "⛔ لا يمكنك تعديل صلاحيات هذه الرتبة.", show_alert=True)
             return
         perm_key = "_".join(parts[3:])
         new_val = toggle_user_permission(t_id, perm_key)
         perm_ar = PERMISSION_LABELS.get(perm_key, perm_key)
         safe_answer(call.id, f"{'✅ تم تفعيل' if new_val else '❌ تم إغلاق'}: {perm_ar}")
-        txt, markup = render_user_dossier(t_id)
+        txt, markup = render_user_dossier(t_id, viewer_id=user_id)
         if txt:
             safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
         return
 
     elif data.startswith("surv_revoke_all_"):
-        if not is_super_admin(user_id):
+        if not has_admin_capability(user_id, "radar_users"):
             return
         try:
             t_id = int(data.replace("surv_revoke_all_", ""))
         except ValueError:
             return
+        if not can_manage_target_user(user_id, t_id):
+            safe_answer(call.id, "⛔ لا يمكنك تعديل هذه الرتبة.", show_alert=True)
+            return
         revoke_all_permissions(t_id)
         safe_answer(call.id, "🔒 تم سحب وإغلاق كافة الصلاحيات عن هذا المستخدم!", show_alert=True)
-        txt, markup = render_user_dossier(t_id)
+        txt, markup = render_user_dossier(t_id, viewer_id=user_id)
         if txt:
             safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
         return
 
     elif data.startswith("surv_ban_"):
-        if not is_super_admin(user_id):
+        if not has_admin_capability(user_id, "radar_users"):
             return
         try:
             t_id = int(data.replace("surv_ban_", ""))
         except ValueError:
             return
-        if is_super_admin(t_id):
-            safe_answer(call.id, "🛡️ محظور برمجياً: لا يمكن حظر المطور الأكبر!", show_alert=True)
+        if not can_manage_target_user(user_id, t_id):
+            safe_answer(call.id, "🛡️ محظور: لا يمكنك حظر المطور أو هذه الرتبة!", show_alert=True)
             return
         ban_user(t_id)
         update_menu_button_for_user(bot, t_id, is_allowed=False)
         safe_answer(call.id, "🚫 تم حظر المستخدم وتصفير صلاحياته!", show_alert=True)
-        txt, markup = render_user_dossier(t_id)
+        txt, markup = render_user_dossier(t_id, viewer_id=user_id)
         if txt:
             safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
         return
 
     elif data.startswith("surv_unban_"):
-        if not is_super_admin(user_id):
+        if not has_admin_capability(user_id, "radar_users"):
             return
         try:
             t_id = int(data.replace("surv_unban_", ""))
         except ValueError:
             return
+        if not can_manage_target_user(user_id, t_id):
+            return
         unban_user(t_id)
         update_menu_button_for_user(bot, t_id, is_allowed=True)
         safe_answer(call.id, "✅ تم فك الحظر (كافة الصلاحيات مغلقة للأمان)!", show_alert=True)
-        txt, markup = render_user_dossier(t_id)
+        txt, markup = render_user_dossier(t_id, viewer_id=user_id)
         if txt:
             safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
         return
 
     elif data.startswith("surv_del_"):
-        if not is_super_admin(user_id):
+        if not has_admin_capability(user_id, "radar_users"):
             return
         try:
             t_id = int(data.replace("surv_del_", ""))
         except ValueError:
             return
-        if is_super_admin(t_id):
-            safe_answer(call.id, "🛡️ محظور برمجياً: لا يمكن حذف المطور الأكبر!", show_alert=True)
+        if not can_manage_target_user(user_id, t_id):
+            safe_answer(call.id, "🛡️ محظور: لا يمكنك حذف المطور أو هذه الرتبة!", show_alert=True)
             return
         acc_deleted = delete_accounts_by_owner(t_id)
         delete_user_and_data(t_id)
         update_menu_button_for_user(bot, t_id, is_allowed=False)
         safe_answer(call.id, f"🗑️ تم حذف المستخدم ومسح {acc_deleted} حساب تابعة له!", show_alert=True)
-        txt, markup = render_surveillance_radar_text_and_markup()
+        txt, markup = render_surveillance_radar_text_and_markup(viewer_id=user_id)
         safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
         return
 
     elif data.startswith("surv_pts_"):
-        if not is_super_admin(user_id):
+        if not (has_admin_capability(user_id, "radar_users") and has_admin_capability(user_id, "points_economy")):
             record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", f"محاولة تعديل نقاط {data}")
-            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+            safe_answer(call.id, "⛔ خاص بالمطور والأدمن غير المقيد فقط.", show_alert=True)
             return
         rest = data[len("surv_pts_"):]
         action_k, _, uid_s = rest.partition("_")
@@ -2401,14 +3041,20 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
             t_id = int(uid_s)
         except ValueError:
             return
+        if not can_manage_target_user(user_id, t_id):
+            safe_answer(call.id, "⛔ خارج نطاق رتبتك.", show_alert=True)
+            return
+        if action_k == "settle" and not has_admin_capability(user_id, "payment_notices"):
+            safe_answer(call.id, "⛔ التسويات المالية محجوبة عن رتبتك حالياً.", show_alert=True)
+            return
         if action_k == "add5":
-            res = adjust_user_points(t_id, 5, "ADMIN_GRANT", "إضافة +5 نقاط من لوحة المطور", actor_uid=user_id)
+            res = adjust_user_points(t_id, 5, "ADMIN_GRANT", "إضافة +5 نقاط من لوحة الإدارة", actor_uid=user_id)
             safe_answer(call.id, f"✅ تم إضافة +5 نقاط! الرصيد: {res.get('balance', 0)}")
-            safe_send(t_id, f"🎁 <b>منحة نقاط من المطور الرئيسي:</b> +5 نقاط!\n💰 رصيدك الآن: <b>{res.get('balance', 0)}</b> نقطة ({res.get('yer_value', 0):,} ر.ي)")
+            safe_send(t_id, f"🎁 <b>منحة نقاط من الإدارة:</b> +5 نقاط!\n💰 رصيدك الآن: <b>{res.get('balance', 0)}</b> نقطة ({res.get('yer_value', 0):,} ر.ي)")
         elif action_k == "sub5":
-            res = adjust_user_points(t_id, -5, "ADMIN_DEDUCT", "سحب/خصم 5 نقاط من المطور", actor_uid=user_id, allow_partial_zero=True)
+            res = adjust_user_points(t_id, -5, "ADMIN_DEDUCT", "سحب/خصم 5 نقاط من الإدارة", actor_uid=user_id, allow_partial_zero=True)
             safe_answer(call.id, f"✅ تم خصم النقاط! الرصيد: {res.get('balance', 0)}")
-            safe_send(t_id, f"➖ <b>تحديث الرصيد من المطور:</b> تم خصم/سحب {abs(res.get('delta', 0))} نقطة.\n💰 رصيدك الآن: <b>{res.get('balance', 0)}</b> نقطة")
+            safe_send(t_id, f"➖ <b>تحديث الرصيد من الإدارة:</b> تم خصم/سحب {abs(res.get('delta', 0))} نقطة.\n💰 رصيدك الآن: <b>{res.get('balance', 0)}</b> نقطة")
         elif action_k == "settle":
             res = settle_payout(t_id, None, actor_uid=user_id, note="تسوية شاملة من بطاقة المستخدم")
             if res.get("ok"):
@@ -2433,15 +3079,15 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
                 reply_markup=_prompt_back_markup("menu_surveillance_radar")
             )
             return
-        txt, markup = render_user_dossier(t_id)
+        txt, markup = render_user_dossier(t_id, viewer_id=user_id)
         if txt:
             safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
         return
 
     elif data == "menu_admin_economy":
-        if not is_super_admin(user_id):
+        if not has_admin_capability(user_id, "points_economy"):
             record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", "محاولة فتح إعدادات الاقتصاد بدون صلاحية")
-            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+            safe_answer(call.id, "⛔ خاص بالمطور والأدمن غير المقيد فقط.", show_alert=True)
             return
         txt, markup = _render_admin_economy_view()
         _track_view(user_id, call.message.chat.id, call.message.message_id, "economy")
@@ -2537,9 +3183,9 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         return
 
     elif data.startswith("bkp_upload_merge:") or data.startswith("bkp_upload_replace:") or data.startswith("bkp_upload_cancel:"):
-        if not is_super_admin(user_id):
+        if not has_admin_capability(user_id, "backups"):
             record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", f"محاولة التحكم بملف نسخ احتياطي مرفوع {data}")
-            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+            safe_answer(call.id, "⛔ خاص بالمطور والأدمن غير المقيد فقط.", show_alert=True)
             return
         action_bkp, tok = data.split(":", 1)
         staged = _pop_pending_backup(tok, user_id)
@@ -2606,7 +3252,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         if not acc:
             safe_answer(call.id, "الحساب غير موجود.", show_alert=True)
             return
-        can_access = is_super_admin(user_id) or (
+        can_access = has_admin_capability(user_id, "accounts_pool") or (
             int(acc.get("owner_id") or 0) == int(user_id)
             and (has_permission(user_id, "can_add_accounts") or has_permission(user_id, "can_use_accounts"))
         )
@@ -2630,7 +3276,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         if not acc:
             safe_answer(call.id, "الحساب غير موجود.", show_alert=True)
             return
-        can_access = is_super_admin(user_id) or (
+        can_access = has_admin_capability(user_id, "accounts_pool") or (
             int(acc.get("owner_id") or 0) == int(user_id)
             and (has_permission(user_id, "can_add_accounts") or has_permission(user_id, "can_use_accounts"))
         )
@@ -2654,9 +3300,9 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         return
 
     elif data == "menu_proxies" or data.startswith("prx_"):
-        if not is_super_admin(user_id):
+        if not has_admin_capability(user_id, "proxies"):
             record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", f"محاولة الوصول لإدارة البروكسيات بدون صلاحية: {data}")
-            safe_answer(call.id, "⛔ هذه الصلاحية محصورة بالمطور الأكبر فقط.", show_alert=True)
+            safe_answer(call.id, "⛔ هذه الصلاحية محصورة بالمطور والأدمن غير المقيد فقط.", show_alert=True)
             return
         if data == "menu_proxies":
             txt, markup = _render_proxies_view()
@@ -2797,9 +3443,9 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
             return
 
     elif data == "menu_backup_vault":
-        if not is_super_admin(user_id):
+        if not has_admin_capability(user_id, "backups"):
             record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", "محاولة فتح خزنة النسخ الاحتياطي بدون صلاحية")
-            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+            safe_answer(call.id, "⛔ خاص بالمطور والأدمن غير المقيد فقط.", show_alert=True)
             return
         txt, markup = _render_backup_vault_view()
         _track_view(user_id, call.message.chat.id, call.message.message_id, "backup_vault")
@@ -2807,9 +3453,9 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         return
 
     elif data == "act_export_backup":
-        if not is_super_admin(user_id):
+        if not has_admin_capability(user_id, "backups"):
             record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", "محاولة تصدير نسخة احتياطية بدون صلاحية")
-            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+            safe_answer(call.id, "⛔ خاص بالمطور والأدمن غير المقيد فقط.", show_alert=True)
             return
         safe_answer(call.id, "📦 جاري تجهيز حزمة النسخ الاحتياطي...")
         try:
@@ -2834,9 +3480,9 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         return
 
     elif data == "act_hf_sync_now":
-        if not is_super_admin(user_id):
+        if not has_admin_capability(user_id, "backups"):
             record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", "محاولة مزامنة HF بدون صلاحية")
-            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+            safe_answer(call.id, "⛔ خاص بالمطور والأدمن غير المقيد فقط.", show_alert=True)
             return
         res_hf = hf_dataset_sync_upload()
         ok_hf = bool(res_hf.get("ok"))
@@ -2851,9 +3497,9 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         return
 
     elif data == "act_purge_24h":
-        if not is_super_admin(user_id):
+        if not has_admin_capability(user_id, "backups"):
             record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", "محاولة تنظيف التالفة 24س بدون صلاحية")
-            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+            safe_answer(call.id, "⛔ خاص بالمطور والأدمن غير المقيد فقط.", show_alert=True)
             return
         cnt_p, purged_ids = purge_expired_broken_accounts(BROKEN_ACCOUNT_TTL_HOURS)
         if cnt_p > 0:
@@ -2866,9 +3512,9 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         return
 
     elif data == "menu_bkp_schedule":
-        if not is_super_admin(user_id):
+        if not has_admin_capability(user_id, "backups"):
             record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", "محاولة فتح جدولة النسخ الاحتياطي بدون صلاحية")
-            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+            safe_answer(call.id, "⛔ خاص بالمطور والأدمن غير المقيد فقط.", show_alert=True)
             return
         txt, markup = _render_backup_schedule_view()
         _track_view(user_id, call.message.chat.id, call.message.message_id, "backup_schedule")
@@ -2876,9 +3522,9 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         return
 
     elif data == "bkp_set_channel":
-        if not is_super_admin(user_id):
+        if not has_admin_capability(user_id, "backups"):
             record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", "محاولة تغيير قناة النسخ الاحتياطي بدون صلاحية")
-            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+            safe_answer(call.id, "⛔ خاص بالمطور والأدمن غير المقيد فقط.", show_alert=True)
             return
         st["input_mode"] = "waiting_backup_channel"
         safe_answer(call.id)
@@ -2895,9 +3541,9 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         return
 
     elif data == "bkp_clear_channel":
-        if not is_super_admin(user_id):
+        if not has_admin_capability(user_id, "backups"):
             record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", "محاولة فصل قناة النسخ بدون صلاحية")
-            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+            safe_answer(call.id, "⛔ خاص بالمطور والأدمن غير المقيد فقط.", show_alert=True)
             return
         save_backup_settings({"channel_id": None, "channel_title": "", "last_error": ""}, mark_dirty=True)
         record_audit_log(user_id, call.from_user.first_name or "", "BACKUP_CHANNEL_CLEARED", "فصل قناة النسخ الاحتياطي")
@@ -2907,9 +3553,9 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         return
 
     elif data == "bkp_tog_enabled":
-        if not is_super_admin(user_id):
+        if not has_admin_capability(user_id, "backups"):
             record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", "محاولة تبديل جدولة النسخ بدون صلاحية")
-            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+            safe_answer(call.id, "⛔ خاص بالمطور والأدمن غير المقيد فقط.", show_alert=True)
             return
         bkp = load_backup_settings()
         new_val = not bool(bkp.get("enabled", True))
@@ -2920,9 +3566,9 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         return
 
     elif data == "bkp_tog_onchange":
-        if not is_super_admin(user_id):
+        if not has_admin_capability(user_id, "backups"):
             record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", "محاولة تبديل النسخ عند التعديل بدون صلاحية")
-            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+            safe_answer(call.id, "⛔ خاص بالمطور والأدمن غير المقيد فقط.", show_alert=True)
             return
         bkp = load_backup_settings()
         new_val = not bool(bkp.get("on_change", False))
@@ -2933,9 +3579,9 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         return
 
     elif data == "bkp_set_interval_custom":
-        if not is_super_admin(user_id):
+        if not has_admin_capability(user_id, "backups"):
             record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", "محاولة تعديل توقيت النسخ بدون صلاحية")
-            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+            safe_answer(call.id, "⛔ خاص بالمطور والأدمن غير المقيد فقط.", show_alert=True)
             return
         st["input_mode"] = "waiting_backup_interval"
         safe_answer(call.id)
@@ -2953,9 +3599,9 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         return
 
     elif data in ("bkp_iv_10", "bkp_iv_30", "bkp_iv_300", "bkp_iv_3600", "bkp_iv_86400", "bkp_iv_604800", "bkp_iv_2592000", "bkp_iv_31536000") or data.startswith("bkp_iv_"):
-        if not is_super_admin(user_id):
+        if not has_admin_capability(user_id, "backups"):
             record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", f"محاولة ضبط جدولة {data} بدون صلاحية")
-            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+            safe_answer(call.id, "⛔ خاص بالمطور والأدمن غير المقيد فقط.", show_alert=True)
             return
         try:
             sec_val = int(data.replace("bkp_iv_", "", 1))
@@ -2973,9 +3619,9 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         return
 
     elif data == "act_backup_channel_now":
-        if not is_super_admin(user_id):
+        if not has_admin_capability(user_id, "backups"):
             record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", "محاولة إرسال نسخة للقناة بدون صلاحية")
-            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+            safe_answer(call.id, "⛔ خاص بالمطور والأدمن غير المقيد فقط.", show_alert=True)
             return
         safe_answer(call.id, "🚀 جاري تجهيز وإرسال النسخة الشاملة للقناة...")
         res_ch = send_backup_to_channel(bot, trigger_label="إرسال يدوي فوري")
@@ -2998,9 +3644,9 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         return
 
     elif data == "bkp_restore_help":
-        if not is_super_admin(user_id):
+        if not has_admin_capability(user_id, "backups"):
             record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", "محاولة فتح الاستعادة الفورية بدون صلاحية")
-            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+            safe_answer(call.id, "⛔ خاص بالمطور والأدمن غير المقيد فقط.", show_alert=True)
             return
         st["input_mode"] = "waiting_restore_zip"
         safe_answer(call.id)
@@ -3016,9 +3662,9 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         return
 
     elif data.startswith("eco_tog_"):
-        if not is_super_admin(user_id):
+        if not has_admin_capability(user_id, "points_economy"):
             record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", f"محاولة تبديل إعداد اقتصادي {data}")
-            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+            safe_answer(call.id, "⛔ خاص بالمطور والأدمن غير المقيد فقط.", show_alert=True)
             return
         field = data[len("eco_tog_"):]
         cfg = load_economy_settings()
@@ -3036,9 +3682,9 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         return
 
     elif data.startswith("eco_set_"):
-        if not is_super_admin(user_id):
+        if not has_admin_capability(user_id, "points_economy"):
             record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", f"محاولة تعديل تسعيرة {data}")
-            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+            safe_answer(call.id, "⛔ خاص بالمطور والأدمن غير المقيد فقط.", show_alert=True)
             return
         key = data[len("eco_set_"):]
         valid_keys = {"yer_per_point", "active_account_reward", "referral_reward"} | set(OP_COST_LABELS_AR.keys())
@@ -3130,7 +3776,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
     elif data.startswith("sup_view_"):
         tid = data[len("sup_view_"):]
         t = get_ticket_by_id(tid)
-        if not t or (not is_super_admin(user_id) and int(t.get("user_id", 0)) != user_id):
+        if not t or (not has_admin_capability(user_id, "payment_notices") and int(t.get("user_id", 0)) != user_id):
             record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", f"محاولة عرض تذكرة غير مصرحة {tid}")
             safe_answer(call.id, "⛔ غير مصرح لك بعرض هذه التذكرة.", show_alert=True)
             return
@@ -3140,9 +3786,9 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         return
 
     elif data.startswith("tkt_reply_"):
-        if not is_super_admin(user_id):
+        if not has_admin_capability(user_id, "payment_notices"):
             record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", f"محاولة رد مطور مزيف {data}")
-            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+            safe_answer(call.id, "⛔ خاص بالمطور والأدمن غير المقيد فقط.", show_alert=True)
             return
         tid = data[len("tkt_reply_"):]
         st["input_mode"] = f"waiting_tkt_reply_{tid}"
@@ -3158,7 +3804,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
     elif data.startswith("user_reply_tkt_"):
         tid = data[len("user_reply_tkt_"):]
         t = get_ticket_by_id(tid)
-        if not t or (not is_super_admin(user_id) and int(t.get("user_id", 0)) != user_id):
+        if not t or (not has_admin_capability(user_id, "payment_notices") and int(t.get("user_id", 0)) != user_id):
             record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", f"محاولة رد على تذكرة لا تخصه {tid}")
             safe_answer(call.id, "⛔ غير مصرح لك بالرد على هذه التذكرة.", show_alert=True)
             return
@@ -3172,9 +3818,9 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         return
 
     elif data.startswith("tkt_settle_"):
-        if not is_super_admin(user_id):
+        if not has_admin_capability(user_id, "payment_notices"):
             record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", f"محاولة تسوية مالية مزيفة {data}")
-            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+            safe_answer(call.id, "⛔ التسويات المالية محجوبة عن صلاحيتك أو خاصة بالمطور فقط.", show_alert=True)
             return
         tid = data[len("tkt_settle_"):]
         t = get_ticket_by_id(tid)
@@ -3755,9 +4401,9 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         safe_answer(call.id, "تم تحديد الحساب المنفذ بنجاح!")
         safe_edit_message(get_dashboard_text(user_id), call.message.chat.id, call.message.message_id, reply_markup=get_main_dashboard_markup(user_id))
 
-    # H) إدارة الحسابات (معزولة الملكية: المطور يرى الكل، والمستخدم يرى حساباته المضافة فقط)
+    # H) إدارة الحسابات (معزولة الملكية: المطور/النائب غير المقيد يرى الكل، والمستخدم يرى حساباته المضافة فقط)
     elif data == "menu_manage_accs":
-        is_dev = is_super_admin(user_id)
+        is_dev = has_admin_capability(user_id, "accounts_pool")
         if not (is_dev or has_permission(user_id, "can_add_accounts") or has_permission(user_id, "can_delete_accounts")):
             record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", "محاولة فتح إدارة الحسابات بدون صلاحية")
             safe_answer(call.id, "⛔ ليس لديك صلاحية إدارة أو إضافة الحسابات.", show_alert=True)
@@ -3768,7 +4414,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         _track_view(user_id, call.message.chat.id, call.message.message_id, "manage_accs")
 
     elif data.startswith("del_acc_"):
-        if not (is_super_admin(user_id) or has_permission(user_id, "can_delete_accounts")):
+        if not (has_admin_capability(user_id, "accounts_pool") or has_permission(user_id, "can_delete_accounts")):
             record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", f"محاولة حذف حساب بدون صلاحية: {data}")
             safe_answer(call.id, "⛔ ليس لديك صلاحية حذف الحسابات.", show_alert=True)
             return
@@ -3778,7 +4424,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
             safe_answer(call.id, "الحساب غير موجود.", show_alert=True)
             return
         # منع المستخدم الفرعي من حذف حساب المطور أو حساب مستخدم آخر!
-        if not is_super_admin(user_id) and target_acc.get("owner_id") != user_id:
+        if not has_admin_capability(user_id, "accounts_pool") and target_acc.get("owner_id") != user_id:
             record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", f"محاولة تعدٍّ لحذف حساب غير مملوك: {acc_id}")
             safe_answer(call.id, "⛔ لا يمكنك حذف حسابات لا تخصك!", show_alert=True)
             return
@@ -3791,10 +4437,10 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         handle_callbacks(call)
 
     elif data == "act_purge_broken":
-        if not (is_super_admin(user_id) or has_permission(user_id, "can_delete_accounts")):
+        if not (has_admin_capability(user_id, "accounts_pool") or has_permission(user_id, "can_delete_accounts")):
             safe_answer(call.id, "⛔ ليس لديك صلاحية تنظيف/حذف الحسابات.", show_alert=True)
             return
-        scope_owner = None if is_super_admin(user_id) else user_id
+        scope_owner = None if has_admin_capability(user_id, "accounts_pool") else user_id
         count, purged = purge_broken_accounts(owner_id=scope_owner)
         if count > 0:
             record_audit_log(user_id, call.from_user.first_name or "", "ACCOUNT_PURGE", f"تنظيف {count} حساب تالف: {', '.join(purged)}")
@@ -3830,7 +4476,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         )
 
     elif data == "act_check_sessions":
-        if not (is_super_admin(user_id) or has_permission(user_id, "can_add_accounts") or has_permission(user_id, "can_use_accounts")):
+        if not (has_admin_capability(user_id, "accounts_pool") or has_permission(user_id, "can_add_accounts") or has_permission(user_id, "can_use_accounts")):
             safe_answer(call.id, "⛔ ليس لديك صلاحية فحص الجلسات.", show_alert=True)
             return
         safe_answer(call.id, "🔄 جاري فحص وتحديث جلسات الحسابات...")
@@ -4088,21 +4734,21 @@ def _handle_text_inputs_impl(message: types.Message):
         )
         return
     elif text == "🌐 البروكسيات":
-        if not is_super_admin(user_id):
+        if not has_admin_capability(user_id, "proxies"):
             record_audit_log(user_id, full_name, "SECURITY_BLOCK", "محاولة فتح اختصار البروكسيات بدون صلاحية")
-            bot.reply_to(message, "⛔ هذه الصلاحية محصورة بالمطور الأكبر فقط.")
+            bot.reply_to(message, "⛔ هذه الصلاحية محصورة بالمطور والأدمن غير المقيد فقط.")
             return
         st["input_mode"] = None
         txt, markup = _render_proxies_view()
         safe_send(message.chat.id, txt, reply_markup=markup)
         return
     elif text == "🛰️ رادار المستخدمين":
-        if not is_super_admin(user_id):
+        if not has_admin_capability(user_id, "radar_users"):
             record_audit_log(user_id, full_name, "SECURITY_BLOCK", "محاولة فتح اختصار الرادار بدون صلاحية")
-            bot.reply_to(message, "⛔ هذه الصلاحية محصورة بالمطور الأكبر فقط.")
+            bot.reply_to(message, "⛔ هذه الصلاحية محصورة بالمطور والأدمن المخوّل فقط.")
             return
         st["input_mode"] = None
-        txt, markup = render_surveillance_radar_view()
+        txt, markup = render_surveillance_radar_text_and_markup(viewer_id=user_id)
         safe_send(message.chat.id, txt, reply_markup=markup)
         return
     elif text == "💰 نقاطي":
@@ -4111,12 +4757,45 @@ def _handle_text_inputs_impl(message: types.Message):
         safe_send(message.chat.id, txt, reply_markup=markup)
         return
 
+    if mode == "waiting_ann_title":
+        if not has_admin_capability(user_id, "announcements"):
+            st["input_mode"] = None
+            return
+        st.setdefault("temp_ann_data", {})["title"] = text.strip()[:140]
+        st["input_mode"] = "waiting_ann_body"
+        bot.reply_to(
+            message,
+            "📢 <b>إنشاء إعلان عائم ومنبثق (الخطوة 2/3)</b>\n"
+            "✍️ أرسل الآن <b>نص/تفاصيل الإعلان</b> التي ستظهر عائماً للمستخدمين:",
+            reply_markup=_prompt_back_markup("menu_announcements"),
+        )
+        return
+
+    elif mode == "waiting_ann_body":
+        if not has_admin_capability(user_id, "announcements"):
+            st["input_mode"] = None
+            return
+        st.setdefault("temp_ann_data", {})["body"] = text.strip()[:1800]
+        st["input_mode"] = None
+        mk = types.InlineKeyboardMarkup(row_width=2)
+        for dsec, dlbl in DURATION_PRESETS:
+            mk.add(types.InlineKeyboardButton(f"⏱️ {dlbl}", callback_data=f"ann_c_dur_{dsec}"))
+        bot.reply_to(
+            message,
+            "📢 <b>الخطوة 3/3: اختر مدة بقاء الإعلان العائم قبل انتهائه وفك تثبيته تلقائياً:</b>",
+            reply_markup=mk,
+        )
+        return
+
     if mode == "waiting_backup_channel":
+        if not has_admin_capability(user_id, "backups"):
+            st["input_mode"] = None
+            return
         _handle_backup_channel_binding(message, user_id)
         return
 
     elif mode == "waiting_backup_interval":
-        if not is_super_admin(user_id):
+        if not has_admin_capability(user_id, "backups"):
             st["input_mode"] = None
             return
         parsed_iv = parse_backup_interval(text)
@@ -4140,7 +4819,7 @@ def _handle_text_inputs_impl(message: types.Message):
         return
 
     elif mode == "waiting_restore_zip":
-        if not is_super_admin(user_id):
+        if not has_admin_capability(user_id, "backups"):
             st["input_mode"] = None
             return
         bot.reply_to(
@@ -4151,7 +4830,7 @@ def _handle_text_inputs_impl(message: types.Message):
         return
 
     elif mode == "waiting_proxies_bulk":
-        if not is_super_admin(user_id):
+        if not has_admin_capability(user_id, "proxies"):
             st["input_mode"] = None
             return
         res = add_proxies_bulk(text)
@@ -4395,8 +5074,7 @@ def _handle_text_inputs_impl(message: types.Message):
             dev_m.row(types.InlineKeyboardButton("👤 بطاقة المستخدم", callback_data=f"surv_user_{user_id}"))
             uname_t = f"@{esc(snap.get('username'))}" if snap.get("username") else "بدون معرف"
             title_t = "💵 طلب بيع حسابات ومحاسبة مالية" if kind == "sell_accounts" else "💬 رسالة دعم جديدة للمطور"
-            safe_send(
-                SUPER_ADMIN_ID,
+            msg_alert_html = (
                 f"📩 <b>{title_t}</b> (<code>#{esc(tid)}</code>)\n"
                 "━━━━━━━━━━━━━━━━━━━━\n"
                 f"👤 <b>المستخدم:</b> {esc(snap.get('name'))} ({uname_t}) | <code>{user_id}</code>\n"
@@ -4404,13 +5082,14 @@ def _handle_text_inputs_impl(message: types.Message):
                 f"🪙 <b>الرصيد المستحق:</b> {snap.get('points', 0)} نقطة = <b>{snap.get('yer_value', 0):,} ريال يمني</b>\n"
                 f"💵 <b>المُسدد سابقاً:</b> {snap.get('total_yer_settled', 0):,} ر.ي\n"
                 "━━━━━━━━━━━━━━━━━━━━\n"
-                f"📝 <b>رسالة المستخدم:</b>\n{esc(text)}",
-                reply_markup=dev_m
+                f"📝 <b>رسالة المستخدم:</b>\n{esc(text)}"
             )
+            for rec_uid in get_admin_notification_recipients("payment_notices"):
+                safe_send(rec_uid, msg_alert_html, reply_markup=dev_m)
 
     elif mode and mode.startswith("waiting_tkt_reply_"):
         st["input_mode"] = None
-        if not is_super_admin(user_id):
+        if not has_admin_capability(user_id, "payment_notices"):
             record_audit_log(user_id, full_name, "SECURITY_BLOCK", f"محاولة رد مطور عبر النص {mode}")
             return
         tid = mode[len("waiting_tkt_reply_"):]
@@ -4427,7 +5106,7 @@ def _handle_text_inputs_impl(message: types.Message):
         )
         safe_send(
             target_uid,
-            f"👑 <b>رد جديد من المطور الرئيسي على التذكرة <code>#{esc(tid)}</code>:</b>\n"
+            f"👑 <b>رد جديد من الإدارة على التذكرة <code>#{esc(tid)}</code>:</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             f"{esc(text)}",
             reply_markup=u_markup
@@ -4437,7 +5116,8 @@ def _handle_text_inputs_impl(message: types.Message):
     elif mode and mode.startswith("waiting_user_tkt_reply_"):
         st["input_mode"] = None
         tid = mode[len("waiting_user_tkt_reply_"):]
-        res = reply_support_ticket(tid, user_id, text, is_dev=is_super_admin(user_id))
+        is_pay_dev = has_admin_capability(user_id, "payment_notices")
+        res = reply_support_ticket(tid, user_id, text, is_dev=is_pay_dev)
         if not res.get("ok"):
             bot.reply_to(message, f"⚠️ {esc(res.get('error', 'تعذر إرسال الرد أو غير مصرح'))}")
             return
@@ -4448,19 +5128,19 @@ def _handle_text_inputs_impl(message: types.Message):
             types.InlineKeyboardButton("↩️ الرد على المستخدم", callback_data=f"tkt_reply_{tid}"),
             types.InlineKeyboardButton("💸 اعتماد الدفع وتسوية النقاط", callback_data=f"tkt_settle_{tid}")
         )
-        safe_send(
-            SUPER_ADMIN_ID,
+        msg_u_html = (
             f"💬 <b>رد جديد من {esc(snap.get('name', full_name))}</b> (<code>{user_id}</code>) على التذكرة <code>#{esc(tid)}</code>\n"
             f"🪙 الرصيد: {snap.get('points', 0)}ن ({snap.get('yer_value', 0):,} ر.ي)\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
-            f"{esc(text)}",
-            reply_markup=dev_m
+            f"{esc(text)}"
         )
+        for rec_uid in get_admin_notification_recipients("payment_notices"):
+            safe_send(rec_uid, msg_u_html, reply_markup=dev_m)
         bot.reply_to(message, f"✅ تم إرسال ردك للمطور على التذكرة <code>#{esc(tid)}</code> بنجاح.")
 
     elif mode and mode.startswith("waiting_admin_pts_"):
         st["input_mode"] = None
-        if not is_super_admin(user_id):
+        if not (has_admin_capability(user_id, "radar_users") and has_admin_capability(user_id, "points_economy")):
             record_audit_log(user_id, full_name, "SECURITY_BLOCK", f"محاولة تعديل نقاط يدوياً {mode}")
             return
         try:
@@ -4471,8 +5151,11 @@ def _handle_text_inputs_impl(message: types.Message):
         except Exception:
             bot.reply_to(message, "❌ أرسل عدداً صحيحاً غير صفري (مثال: <code>15</code> أو <code>-10</code>).")
             return
+        if not can_manage_target_user(user_id, t_uid):
+            bot.reply_to(message, "⛔ لا تملك صلاحية تعديل هذا المستخدم أو رتبته.")
+            return
         tx_type = "ADMIN_GRANT" if delta_val > 0 else "ADMIN_DEDUCT"
-        reason_t = "إضافة يدوية من المطور" if delta_val > 0 else "سحب/خصم يدوي من المطور"
+        reason_t = "إضافة يدوية من الإدارة" if delta_val > 0 else "سحب/خصم يدوي من الإدارة"
         res = adjust_user_points(t_uid, delta_val, tx_type, reason_t, actor_uid=user_id, allow_partial_zero=True)
         if not res.get("ok"):
             bot.reply_to(message, f"⚠️ تعذر التعديل: {esc(res.get('error', ''))}")
@@ -4484,13 +5167,13 @@ def _handle_text_inputs_impl(message: types.Message):
         )
         safe_send(
             t_uid,
-            f"🔔 <b>تحديث رصيدك من المطور الرئيسي:</b> {res['delta']:+d} نقطة.\n"
+            f"🔔 <b>تحديث رصيدك من الإدارة:</b> {res['delta']:+d} نقطة.\n"
             f"💰 رصيدك الآن: <b>{res['balance']}</b> نقطة (≈ {res['yer_value']:,} ريال يمني)"
         )
 
     elif mode and mode.startswith("waiting_eco_rate_"):
         st["input_mode"] = None
-        if not is_super_admin(user_id):
+        if not has_admin_capability(user_id, "points_economy"):
             record_audit_log(user_id, full_name, "SECURITY_BLOCK", f"محاولة تعديل تسعيرة {mode}")
             return
         key = mode[len("waiting_eco_rate_"):]
@@ -4549,13 +5232,14 @@ def _handle_text_inputs_impl(message: types.Message):
         if "error" in acc:
             record_audit_log(user_id, owner_name, "DUPLICATE_ATTEMPT", f"محاولة إضافة حساب مكرر: {email} (يطابق {acc.get('existing_id')})")
             if not is_super_admin(user_id):
-                safe_send(
-                    SUPER_ADMIN_ID,
+                dup_txt = (
                     "⚠️ <b>رادار المطور | محاولة إضافة حساب مكرر تم صدها</b>\n"
                     f"👤 <b>المستخدم:</b> {esc(owner_name)} (<code>{user_id}</code>)\n"
                     f"📧 <b>البريد:</b> <code>{esc(email)}</code>\n"
                     f"📌 <b>مسجل مسبقاً كـ:</b> {esc(acc.get('existing_name'))} (<code>{esc(acc.get('existing_id'))}</code>)"
                 )
+                for rec_uid in get_admin_notification_recipients("account_notices"):
+                    safe_send(rec_uid, dup_txt)
             bot.reply_to(
                 message,
                 f"⛔ <b>تنبيه:</b> الحساب <code>{esc(email)}</code> مسجل مسبقاً في النظام باسم '{esc(acc.get('existing_name'))}' ({esc(acc.get('existing_id'))}).\nيمنع تكرار الحسابات نهائياً!"
@@ -4624,13 +5308,14 @@ def _process_cookie_import_submission(message: types.Message, raw_payload: str) 
     if "error" in acc:
         record_audit_log(user_id, owner_name, "DUPLICATE_ATTEMPT", f"محاولة استيراد جلسة لحساب مكرر FB={c_user_val} (يطابق {acc.get('existing_id')})")
         if not is_super_admin(user_id):
-            safe_send(
-                SUPER_ADMIN_ID,
+            dup_ck_txt = (
                 "⚠️ <b>رادار المطور | محاولة تكرار حساب عبر استيراد كوكيز تم صدها</b>\n"
                 f"👤 <b>المستخدم:</b> {esc(owner_name)} (<code>{user_id}</code>)\n"
                 f"🆔 <b>FB ID:</b> <code>{esc(c_user_val)}</code>\n"
                 f"📌 <b>مسجل مسبقاً كـ:</b> {esc(acc.get('existing_name'))} (<code>{esc(acc.get('existing_id'))}</code>)"
             )
+            for rec_uid in get_admin_notification_recipients("account_notices"):
+                safe_send(rec_uid, dup_ck_txt)
         bot.reply_to(
             message,
             f"⛔ <b>تنبيه:</b> هذا الحساب (<code>{esc(c_user_val)}</code>) مسجل مسبقاً باسم '{esc(acc.get('existing_name'))}' ({esc(acc.get('existing_id'))}).\nيمنع تكرار الحسابات نهائياً!"
@@ -4661,7 +5346,7 @@ def handle_document_uploads(message: types.Message):
     if not doc:
         return
     st_pre = get_user_state(user_id)
-    if is_super_admin(user_id) and st_pre.get("input_mode") == "waiting_backup_channel":
+    if has_admin_capability(user_id, "backups") and st_pre.get("input_mode") == "waiting_backup_channel":
         if getattr(message, "forward_origin", None) is not None or getattr(message, "forward_from_chat", None) is not None:
             _handle_backup_channel_binding(message, user_id)
             return
@@ -4670,9 +5355,9 @@ def handle_document_uploads(message: types.Message):
     fsize = int(getattr(doc, "file_size", 0) or 0)
 
     if fname.endswith(".zip"):
-        if not is_super_admin(user_id):
+        if not has_admin_capability(user_id, "backups"):
             record_audit_log(user_id, full_name, "SECURITY_BLOCK", f"محاولة استعادة ملف احتياطي غير مصرحة: {fname}")
-            bot.reply_to(message, "⛔ استعادة النسخ الاحتياطية (.zip) متاحة للمطور الرئيسي فقط.")
+            bot.reply_to(message, "⛔ استعادة النسخ الاحتياطية (.zip) متاحة للمطور الرئيسي والأدمن غير المقيد فقط.")
             return
         if fsize > 25 * 1024 * 1024:
             bot.reply_to(message, "⚠️ حجم ملف النسخة الاحتياطية يتجاوز الحد المسموح (25MB).")
@@ -4746,7 +5431,7 @@ def handle_document_uploads(message: types.Message):
             bot.reply_to(message, f"❌ تعذر قراءة ملف الجلسة: <code>{esc(e)}</code>", reply_markup=_prompt_back_markup("menu_manage_accs"))
         return
 
-    if is_super_admin(user_id) and fname.endswith(".json"):
+    if has_admin_capability(user_id, "backups") and fname.endswith(".json"):
         if fsize > 5 * 1024 * 1024:
             bot.reply_to(message, "⚠️ حجم ملف JSON كبير جداً (الحد الأقصى 5MB).")
             return
@@ -4853,18 +5538,20 @@ def _notify_developer_account_result(
             markup.add(types.InlineKeyboardButton("🖥️ فتح الشاشة الحية لهذا الحساب", web_app=types.WebAppInfo(url=f"{w_url}{sep}hitl={acc['id']}")))
         markup.add(types.InlineKeyboardButton("🔐 إرسال رمز 2FA / OTP", callback_data=f"hitl_otp_{acc['id']}"))
         markup.add(types.InlineKeyboardButton("🗑️ حذف هذا الحساب التالف فوراً", callback_data=f"del_acc_{acc['id']}"))
-    safe_send(SUPER_ADMIN_ID, alert_txt, reply_markup=markup)
+    for rec_uid in get_admin_notification_recipients("account_notices"):
+        safe_send(rec_uid, alert_txt, reply_markup=markup)
 
     if shot_path and os.path.exists(shot_path):
-        try:
-            with open(shot_path, "rb") as sf:
-                bot.send_photo(
-                    SUPER_ADMIN_ID,
-                    sf,
-                    caption=f"📸 <b>إثبات دخول [{esc(acc['id'])}]</b> ({'نشط 🟢' if is_active else 'غير نشط 🔴'}) — بواسطة {esc(owner_name)}"
-                )
-        except Exception:
-            pass
+        for rec_uid in get_admin_notification_recipients("account_notices"):
+            try:
+                with open(shot_path, "rb") as sf:
+                    bot.send_photo(
+                        rec_uid,
+                        sf,
+                        caption=f"📸 <b>إثبات دخول [{esc(acc['id'])}]</b> ({'نشط 🟢' if is_active else 'غير نشط 🔴'}) — بواسطة {esc(owner_name)}"
+                    )
+            except Exception:
+                pass
 
 
 def async_login_account_worker(
@@ -5499,7 +6186,21 @@ def _build_webapp_hooks() -> dict:
         "bot": bot,
         "SUPER_ADMIN_ID": SUPER_ADMIN_ID,
         "PERMISSION_LABELS": PERMISSION_LABELS,
+        "ADMIN_TIER_LABELS": ADMIN_TIER_LABELS,
+        "ADMIN_RESTRICTION_LABELS": ADMIN_RESTRICTION_LABELS,
         "is_super_admin": is_super_admin,
+        "get_admin_tier": get_admin_tier,
+        "get_admin_restrictions": get_admin_restrictions,
+        "is_admin_delegate": is_admin_delegate,
+        "has_admin_capability": has_admin_capability,
+        "get_user_admin_capabilities": get_user_admin_capabilities,
+        "can_manage_target_user": can_manage_target_user,
+        "get_admin_notification_recipients": get_admin_notification_recipients,
+        "set_admin_tier": set_admin_tier,
+        "toggle_admin_restriction": toggle_admin_restriction,
+        "grant_all_user_permissions": grant_all_user_permissions,
+        "broadcast_announcement": _broadcast_announcement_to_users,
+        "unpin_announcement_chats": _unpin_announcement_chats,
         "register_or_update_user": register_or_update_user,
         "notify_new_pending_user": notify_new_pending_user,
         "get_user_permissions": get_user_permissions,
@@ -5534,16 +6235,31 @@ def _build_webapp_hooks() -> dict:
 
 
 def _maintenance_sync_worker() -> None:
-    """مراقبة خلفية لجدولة قناة النسخ الاحتياطي (من 10 ثوانٍ حتى سنوات) والمزامنة السحابية وحذف الحسابات التالفة"""
+    """مراقبة خلفية لجدولة قناة النسخ الاحتياطي والإعلانات العائمة المتكررة والمنتهية وحذف الحسابات التالفة"""
     last_purge = time.time()
+    last_ann_check = 0.0
     while True:
         time.sleep(2)
         try:
             flush_cloud_backups(bot, SUPER_ADMIN_ID)
         except Exception:
             pass
-        if time.time() - last_purge >= 1800:
-            last_purge = time.time()
+        now_t = time.time()
+        if now_t - last_ann_check >= 6:
+            last_ann_check = now_t
+            try:
+                for exp_ann in pop_expired_pinned_announcements(now_ts=now_t):
+                    _unpin_announcement_chats(exp_ann)
+            except Exception:
+                pass
+            try:
+                for rep_ann in get_announcements_due_for_repeat(now_ts=now_t):
+                    _broadcast_announcement_to_users(rep_ann, is_repeat=True)
+                    mark_announcement_repushed(rep_ann["id"])
+            except Exception:
+                pass
+        if now_t - last_purge >= 1800:
+            last_purge = now_t
             try:
                 cnt, _ = purge_expired_broken_accounts(BROKEN_ACCOUNT_TTL_HOURS)
                 if cnt > 0:

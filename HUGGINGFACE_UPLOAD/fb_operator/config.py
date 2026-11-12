@@ -67,6 +67,7 @@ BACKUP_META_FILE = DATA_DIR / "backup_meta.json"
 UI_STATES_FILE = DATA_DIR / "ui_states.json"
 CLOUD_DB_CONFIG_FILE = DATA_DIR / "cloud_db_config.json"
 PROXIES_FILE = DATA_DIR / "proxies.json"
+ANNOUNCEMENTS_FILE = DATA_DIR / "announcements.json"
 SQLITE_MIRROR_FILE = DATA_DIR / "fb_operator.db"
 
 # ملف قاعدة البيانات الخارجي المعزول خارج مجلد الأكواد (بجانب HUGGINGFACE_UPLOAD/ في جذر المستودع)
