@@ -13,10 +13,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from playwright.sync_api import sync_playwright
-
 import fb_operator.account_manager as acc_mgr
 from fb_operator.browser_manager import (
+    sync_playwright,
     auto_login_facebook,
     check_facebook_login_cookies,
     diagnose_facebook_challenge,

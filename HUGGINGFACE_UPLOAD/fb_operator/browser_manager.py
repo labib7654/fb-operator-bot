@@ -13,12 +13,18 @@ import random
 import hashlib
 import threading
 from pathlib import Path
-from playwright.sync_api import sync_playwright, BrowserContext, Page
+try:
+    from patchright.sync_api import sync_playwright, BrowserContext, Page
+    USING_PATCHRIGHT = True
+except Exception:
+    from playwright.sync_api import sync_playwright, BrowserContext, Page
+    USING_PATCHRIGHT = False
 from fb_operator.config import DEFAULT_MIN_DELAY, DEFAULT_MAX_DELAY, PROFILES_DIR, SESSIONS_DIR
 
 _LOGIN_ERROR_LOCK = threading.Lock()
 _LOGIN_ERRORS: dict[int, str] = {}
 _CTX_PROFILES: dict[int, Path] = {}
+_CURSOR_POS: dict[int, tuple[float, float]] = {}
 
 _PROFILE_LOCKS_GUARD = threading.Lock()
 _PROFILE_LOCKS: dict[str, threading.RLock] = {}
@@ -298,7 +304,9 @@ def diagnose_facebook_challenge(page: Page) -> dict:
         or any(k in curr_url for k in ("arkoselabs", "funcaptcha", "/challenge"))
         or any(k in snippet for k in (
             "arkose labs", "matchkey", "أكمل تحدي", "تحقق من أنك إنسان",
-            "verify that you're human", "complete a challenge", "confirm you're human", "solve a puzzle"
+            "يرجى تأكيد أنك إنسان", "تأكيد أنك إنسان",
+            "verify that you're human", "complete a challenge", "confirm you're human",
+            "confirm that you're human", "confirm you are human", "solve a puzzle"
         ))
     ):
         return {
@@ -307,7 +315,7 @@ def diagnose_facebook_challenge(page: Page) -> dict:
             "is_challenge": True,
             "can_otp": False,
             "can_hitl": True,
-            "message": "لغز تحقق من الإنسان (Arkose Labs CAPTCHA) — افتح الشاشة الحية لإكماله بنفسك",
+            "message": "تحدي تحقق من الإنسان (يرجى تأكيد أنك إنسان / Arkose CAPTCHA) — افتح الشاشة الحية لإكماله بنفسك",
         }
 
     if any(x in curr_url for x in ("suspended", "disabled", "/account_status")) or any(
@@ -496,10 +504,21 @@ def launch_account_browser(
     else:
         vw, vh = fp["viewport"]
 
+    proxy_srv = (proxy or os.environ.get("FB_PROXY") or "").strip()
+    is_auto_linux_no_proxy = bool(is_linux and not proxy_srv and not os.environ.get("FB_TIMEZONE"))
+    default_locale = (os.environ.get("FB_LOCALE") or ("en-US" if is_auto_linux_no_proxy else "ar-EG")).strip() or "en-US"
+    default_tz = (os.environ.get("FB_TIMEZONE") or ("America/New_York" if is_auto_linux_no_proxy else "Asia/Riyadh")).strip() or "America/New_York"
+    langs_list = (
+        ["en-US", "en", "ar-EG", "ar"]
+        if default_locale.lower().startswith("en")
+        else ["ar-EG", "ar", "en-US", "en"]
+    )
+    use_js_fp_shims = not USING_PATCHRIGHT
+
     args = [
         "--no-first-run",
         "--no-default-browser-check",
-        "--disable-blink-features=AutomationControlled",
+        "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
         "--disable-features=FedCm,CredentialManagement,AutofillServerCommunication,PasswordManager,PasswordGeneration,PasswordImport,OneClickSignin",
         "--disable-save-password-bubble",
         "--password-store=basic",
@@ -511,8 +530,10 @@ def launch_account_browser(
         "--no-sandbox",
         "--disable-setuid-sandbox",
         "--disable-dev-shm-usage",
-        "--lang=ar-EG,ar,en-US,en",
+        f"--lang={default_locale},en-US,en,ar",
     ]
+    if not USING_PATCHRIGHT:
+        args.append("--disable-blink-features=AutomationControlled")
 
     launch_kwargs = {
         "user_data_dir": str(profile_path),
@@ -523,11 +544,10 @@ def launch_account_browser(
         "device_scale_factor": 1.5 if mobile else 1,
         "is_mobile": bool(mobile),
         "has_touch": bool(mobile),
-        "locale": "ar-EG",
-        "timezone_id": (os.environ.get("FB_TIMEZONE") or "Asia/Riyadh").strip() or "Asia/Riyadh",
+        "locale": default_locale,
+        "timezone_id": default_tz,
     }
 
-    proxy_srv = (proxy or os.environ.get("FB_PROXY") or "").strip()
     if proxy_srv:
         launch_kwargs["proxy"] = {"server": proxy_srv}
 
@@ -540,9 +560,69 @@ def launch_account_browser(
 
     stealth_template = """
     (() => {
-        try {
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined, configurable: true });
-        } catch (e) {}
+        const useShims = __USE_SHIMS__;
+        if (useShims) {
+            try {
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined, configurable: true });
+            } catch (e) {}
+
+            // استكمال كائن window.chrome وبنية الإضافات (Plugins) الحقيقية عند غياب Patchright
+            try {
+                if (!window.chrome) window.chrome = {};
+                if (!window.chrome.runtime) window.chrome.runtime = {};
+                if (!window.chrome.loadTimes) window.chrome.loadTimes = function() { return {}; };
+                if (!window.chrome.csi) window.chrome.csi = function() { return {}; };
+                if (!window.chrome.app) {
+                    window.chrome.app = { isInstalled: false, InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' } };
+                }
+            } catch (e) {}
+
+            try {
+                if (!navigator.plugins || navigator.plugins.length === 0) {
+                    const fakePlugins = [
+                        { name: 'PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+                        { name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+                        { name: 'Chromium PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+                        { name: 'Microsoft Edge PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+                        { name: 'WebKit built-in PDF', filename: 'internal-pdf-viewer', description: 'Portable Document Format' }
+                    ];
+                    const plugArr = {
+                        length: fakePlugins.length,
+                        item: (i) => fakePlugins[i] || null,
+                        namedItem: (n) => fakePlugins.find((p) => p.name === n) || null,
+                        refresh: () => {},
+                        [Symbol.iterator]: function* () { for (const p of fakePlugins) yield p; }
+                    };
+                    fakePlugins.forEach((p, idx) => { plugArr[idx] = p; });
+                    Object.defineProperty(navigator, 'plugins', { get: () => plugArr, configurable: true });
+                }
+            } catch (e) {}
+
+            try {
+                Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => __CORES__, configurable: true });
+                Object.defineProperty(navigator, 'deviceMemory', { get: () => __MEMORY__, configurable: true });
+                Object.defineProperty(navigator, 'languages', { get: () => __LANGS__, configurable: true });
+            } catch (e) {}
+
+            try {
+                const _v = __VENDOR__;
+                const _r = __RENDERER__;
+                const getParameterProto = WebGLRenderingContext.prototype.getParameter;
+                WebGLRenderingContext.prototype.getParameter = function(param) {
+                    if (param === 37445) return _v;
+                    if (param === 37446) return _r;
+                    return getParameterProto.apply(this, arguments);
+                };
+                if (typeof WebGL2RenderingContext !== 'undefined') {
+                    const getParameterProto2 = WebGL2RenderingContext.prototype.getParameter;
+                    WebGL2RenderingContext.prototype.getParameter = function(param) {
+                        if (param === 37445) return _v;
+                        if (param === 37446) return _r;
+                        return getParameterProto2.apply(this, arguments);
+                    };
+                }
+            } catch (e) {}
+        }
 
         // تنظيف HeadlessChrome إن وُجد دون تغيير رقم الإصدار الفعلي لمنع تعارض بصمة TLS
         try {
@@ -554,80 +634,11 @@ def launch_account_browser(
             }
         } catch (e) {}
 
-        // استكمال كائن window.chrome وبنية الإضافات (Plugins) الحقيقية
-        try {
-            if (!window.chrome) window.chrome = {};
-            if (!window.chrome.runtime) window.chrome.runtime = {};
-            if (!window.chrome.loadTimes) window.chrome.loadTimes = function() { return {}; };
-            if (!window.chrome.csi) window.chrome.csi = function() { return {}; };
-            if (!window.chrome.app) {
-                window.chrome.app = { isInstalled: false, InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' } };
-            }
-        } catch (e) {}
-
-        try {
-            if (!navigator.plugins || navigator.plugins.length === 0) {
-                const fakePlugins = [
-                    { name: 'PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-                    { name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-                    { name: 'Chromium PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-                    { name: 'Microsoft Edge PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-                    { name: 'WebKit built-in PDF', filename: 'internal-pdf-viewer', description: 'Portable Document Format' }
-                ];
-                const plugArr = {
-                    length: fakePlugins.length,
-                    item: (i) => fakePlugins[i] || null,
-                    namedItem: (n) => fakePlugins.find((p) => p.name === n) || null,
-                    refresh: () => {},
-                    [Symbol.iterator]: function* () { for (const p of fakePlugins) yield p; }
-                };
-                fakePlugins.forEach((p, idx) => { plugArr[idx] = p; });
-                Object.defineProperty(navigator, 'plugins', { get: () => plugArr, configurable: true });
-            }
-        } catch (e) {}
-
-        try {
-            Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => __CORES__, configurable: true });
-            Object.defineProperty(navigator, 'deviceMemory', { get: () => __MEMORY__, configurable: true });
-            Object.defineProperty(navigator, 'languages', { get: () => ['ar-EG', 'ar', 'en-US', 'en'], configurable: true });
-        } catch (e) {}
-
-        // ضبط استعلام الأذونات والأبعاد الخارجية لتفادي كشف النوافذ المخفية
-        try {
-            if (navigator.permissions && navigator.permissions.query) {
-                const origQuery = navigator.permissions.query.bind(navigator.permissions);
-                navigator.permissions.query = (params) => (
-                    params && params.name === 'notifications'
-                        ? Promise.resolve({ state: Notification.permission === 'denied' ? 'prompt' : Notification.permission })
-                        : origQuery(params)
-                );
-            }
-        } catch (e) {}
-
+        // ضبط أبعاد النافذة الخارجية لتفادي كشف النوافذ المخفية
         try {
             if (!window.outerHeight || window.outerHeight <= window.innerHeight) {
                 Object.defineProperty(window, 'outerWidth', { get: () => __VW__, configurable: true });
                 Object.defineProperty(window, 'outerHeight', { get: () => __VH__ + 82, configurable: true });
-            }
-        } catch (e) {}
-
-        // توحيد WebGL بما ينسجم طبيعياً مع نظام التشغيل الفعلي
-        try {
-            const _v = __VENDOR__;
-            const _r = __RENDERER__;
-            const getParameterProto = WebGLRenderingContext.prototype.getParameter;
-            WebGLRenderingContext.prototype.getParameter = function(param) {
-                if (param === 37445) return _v;
-                if (param === 37446) return _r;
-                return getParameterProto.apply(this, arguments);
-            };
-            if (typeof WebGL2RenderingContext !== 'undefined') {
-                const getParameterProto2 = WebGL2RenderingContext.prototype.getParameter;
-                WebGL2RenderingContext.prototype.getParameter = function(param) {
-                    if (param === 37445) return _v;
-                    if (param === 37446) return _r;
-                    return getParameterProto2.apply(this, arguments);
-                };
             }
         } catch (e) {}
 
@@ -643,8 +654,10 @@ def launch_account_browser(
     """
     stealth_script = (
         stealth_template
+        .replace("__USE_SHIMS__", "true" if use_js_fp_shims else "false")
         .replace("__CORES__", str(fp["cores"]))
         .replace("__MEMORY__", str(fp["memory"]))
+        .replace("__LANGS__", json.dumps(langs_list))
         .replace("__VW__", str(vw))
         .replace("__VH__", str(vh))
         .replace("__VENDOR__", json.dumps(fp["webgl_vendor"]))
@@ -656,16 +669,45 @@ def launch_account_browser(
     return context
 
 
+def _bezier_curve_points(x0: float, y0: float, x1: float, y1: float, steps: int = 16) -> list[tuple[float, float]]:
+    """توليد مسار منحنى بيزيه ثلاثي (Cubic Bezier) يحاكي حركة مفصل اليد البشرية نحو الهدف"""
+    dx = x1 - x0
+    dy = y1 - y0
+    spread = max(25.0, min(140.0, (dx * dx + dy * dy) ** 0.5 * 0.35))
+    c1x = x0 + dx * random.uniform(0.20, 0.42) + random.uniform(-spread, spread)
+    c1y = y0 + dy * random.uniform(0.15, 0.45) + random.uniform(-spread * 0.65, spread * 0.65)
+    c2x = x0 + dx * random.uniform(0.58, 0.85) + random.uniform(-spread * 0.5, spread * 0.5)
+    c2y = y0 + dy * random.uniform(0.55, 0.88) + random.uniform(-spread * 0.4, spread * 0.4)
+    pts: list[tuple[float, float]] = []
+    n = max(6, int(steps))
+    for i in range(1, n + 1):
+        u = i / n
+        # تباطؤ وتنعيم طبيعي عند البداية والنهاية (Ease-in-out)
+        t = u * u * (3.0 - 2.0 * u)
+        omt = 1.0 - t
+        px = (omt ** 3) * x0 + 3.0 * (omt ** 2) * t * c1x + 3.0 * omt * (t ** 2) * c2x + (t ** 3) * x1
+        py = (omt ** 3) * y0 + 3.0 * (omt ** 2) * t * c1y + 3.0 * omt * (t ** 2) * c2y + (t ** 3) * y1
+        if i < n:
+            px += random.uniform(-1.2, 1.2)
+            py += random.uniform(-1.2, 1.2)
+        pts.append((px, py))
+    return pts
+
+
 def _curved_mouse_move(page: Page, tx: float, ty: float) -> None:
-    """تحريك المؤشر في مسار منحنٍ غير خطي يحاكي حركة اليد البشرية"""
+    """تحريك المؤشر على منحنى بيزيه طبيعي متدرج من موضع اليد السابق"""
     try:
-        vw = (page.viewport_size or {}).get("width", 1280)
-        vh = (page.viewport_size or {}).get("height", 800)
-        mid_x = max(12.0, min(vw - 12.0, tx + random.uniform(-90, 90)))
-        mid_y = max(12.0, min(vh - 12.0, ty + random.uniform(-60, 60)))
-        page.mouse.move(mid_x, mid_y, steps=random.randint(5, 10))
-        time.sleep(random.uniform(0.03, 0.09))
-        page.mouse.move(tx, ty, steps=random.randint(6, 12))
+        vp = getattr(page, "viewport_size", None) or {}
+        vw = float(vp.get("width", 1280))
+        vh = float(vp.get("height", 800))
+        sx, sy = _CURSOR_POS.get(id(page), (random.uniform(vw * 0.15, vw * 0.45), random.uniform(vh * 0.15, vh * 0.45)))
+        tx_c = max(6.0, min(vw - 6.0, float(tx)))
+        ty_c = max(6.0, min(vh - 6.0, float(ty)))
+        steps = random.randint(12, 20)
+        for px, py in _bezier_curve_points(sx, sy, tx_c, ty_c, steps=steps):
+            page.mouse.move(max(2.0, min(vw - 2.0, px)), max(2.0, min(vh - 2.0, py)))
+            time.sleep(random.uniform(0.008, 0.026))
+        _CURSOR_POS[id(page)] = (tx_c, ty_c)
     except Exception:
         pass
 
@@ -1000,17 +1042,30 @@ def smooth_scroll(page: Page, scrolls: int = 2) -> None:
 
 
 def human_click(page: Page, locator, timeout: int = 4000) -> bool:
-    """نقر بشري سلس بمسار مؤشر منحنٍ وتوقيت متغير طبيعي"""
+    """نقر بشري سلس بمسار بيزيه منحنٍ وتوقيت ضغط وإفلات طبيعي للإصبع/المؤشر"""
     try:
-        locator.scroll_into_view_if_needed(timeout=timeout)
-        box = locator.bounding_box(timeout=timeout)
-        if box:
-            tx = box["x"] + box["width"] * random.uniform(0.32, 0.68)
-            ty = box["y"] + box["height"] * random.uniform(0.32, 0.68)
+        if hasattr(locator, "scroll_into_view_if_needed"):
+            locator.scroll_into_view_if_needed(timeout=timeout)
+        box = locator.bounding_box()
+        if box and box.get("width", 0) > 2 and box.get("height", 0) > 2:
+            tx = box["x"] + box["width"] * random.uniform(0.28, 0.72)
+            ty = box["y"] + box["height"] * random.uniform(0.28, 0.72)
             _curved_mouse_move(page, tx, ty)
-            time.sleep(random.uniform(0.09, 0.24))
+            time.sleep(random.uniform(0.08, 0.22))
+            if hasattr(page.mouse, "down") and hasattr(page.mouse, "up"):
+                page.mouse.down()
+                time.sleep(random.uniform(0.065, 0.145))
+                page.mouse.up()
+                return True
+            if hasattr(page.mouse, "click"):
+                page.mouse.click(tx, ty)
+                return True
         locator.click(timeout=timeout)
         return True
     except Exception:
-        return False
+        try:
+            locator.click(timeout=timeout)
+            return True
+        except Exception:
+            return False
 

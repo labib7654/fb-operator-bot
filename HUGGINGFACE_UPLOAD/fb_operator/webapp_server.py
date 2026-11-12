@@ -12,6 +12,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
 
@@ -25,6 +26,25 @@ import fb_operator.hitl_manager as hitl
 _url_lock = threading.Lock()
 _public_webapp_url: str | None = None
 _mission_launch_lock = threading.Lock()
+_http_rate_lock = threading.Lock()
+_http_rate_buckets: dict[int, deque[float]] = {}
+
+
+def _check_http_rate_limit(uid: int, is_dev: bool = False, max_ops: int = 80, window_sec: float = 2.0) -> bool:
+    if is_dev:
+        return True
+    now = time.monotonic()
+    with _http_rate_lock:
+        dq = _http_rate_buckets.get(uid)
+        if dq is None:
+            dq = deque()
+            _http_rate_buckets[uid] = dq
+        while dq and (now - dq[0]) > window_sec:
+            dq.popleft()
+        if len(dq) >= max_ops:
+            return False
+        dq.append(now)
+        return True
 
 VALID_REACTIONS = {"like", "love", "care", "haha", "wow", "sad", "angry", "unlike"}
 VALID_CMT_MODES = {"first", "author", "keyword", "index"}
@@ -464,6 +484,8 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                 bot_uname = str((hooks.get("get_bot_username") and hooks["get_bot_username"]()) or hooks.get("bot_username") or "")
                 can_inv = eco.can_user_invite(uid)
                 eco_cfg = eco.load_economy_settings()
+                usable_total = len(usable_safe)
+                manageable_total = len(manageable_safe)
                 self._send_json(200, {
                     "authorized": True,
                     "status": "approved",
@@ -472,8 +494,10 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                     "user": {"id": uid, "name": user_rec.get("name", ""), "username": user_rec.get("username", "")},
                     "permissions": perms,
                     "enabled_labels": enabled_labels,
-                    "usable_accounts": usable_safe,
-                    "manageable_accounts": manageable_safe,
+                    "usable_accounts": usable_safe[:250] if usable_total > 250 else usable_safe,
+                    "usable_total": usable_total,
+                    "manageable_accounts": manageable_safe[:250] if manageable_total > 250 else manageable_safe,
+                    "manageable_total": manageable_total,
                     "mission_state": mission_state,
                     "wallet": eco.get_user_wallet(uid),
                     "settlement_snapshot": eco.build_user_settlement_snapshot(uid),
@@ -635,6 +659,74 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                     self._send_json(200, {"ok": True, **st_hitl})
                 return
 
+            if path == "/api/accounts/list":
+                auth = self._authenticate(touch_login=False)
+                if not auth:
+                    return
+                uid, tg_user, user_rec = auth
+                if not self._require_approved(uid, tg_user, user_rec):
+                    return
+                is_dev = hooks["is_super_admin"](uid)
+                if not _check_http_rate_limit(uid, is_dev=is_dev):
+                    self._send_json(429, {"error": "طلبات متتالية كثيرة؛ انتظر لحظة."})
+                    return
+                perms = {k: True for k in hooks["PERMISSION_LABELS"]} if is_dev else hooks["get_user_permissions"](uid)
+                qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                kind = (qs.get("kind") or ["manageable"])[0].strip().lower()
+                q_str = (qs.get("q") or [""])[0].strip().lower()
+                try:
+                    page_n = max(1, int((qs.get("page") or ["1"])[0]))
+                except ValueError:
+                    page_n = 1
+                try:
+                    limit_n = max(10, min(250, int((qs.get("limit") or ["100"])[0])))
+                except ValueError:
+                    limit_n = 100
+
+                items: list[dict[str, Any]] = []
+                if kind == "usable":
+                    if is_dev or perms.get("can_use_accounts") or perms.get("can_execute"):
+                        for a in hooks["get_usable_accounts_for_user"](uid):
+                            items.append({
+                                "id": a["id"],
+                                "name": a.get("name", a["id"]),
+                                "is_active": "نشط" in str(a.get("status", "")),
+                            })
+                else:
+                    if is_dev or perms.get("can_add_accounts") or perms.get("can_delete_accounts"):
+                        for a in hooks["get_manageable_accounts_for_user"](uid):
+                            owner_lbl = f"{a.get('owner_name', '')} ({a.get('owner_id', '')})" if a.get("owner_id") else "حساب نظام"
+                            items.append({
+                                "id": a["id"],
+                                "name": a.get("name", a["id"]),
+                                "email": a.get("email", ""),
+                                "is_active": "نشط" in str(a.get("status", "")),
+                                "owner_label": owner_lbl,
+                                "diagnostic_reason": a.get("diagnostic_reason", ""),
+                            })
+
+                if q_str:
+                    items = [
+                        it for it in items
+                        if q_str in str(it.get("id", "")).lower()
+                        or q_str in str(it.get("name", "")).lower()
+                        or q_str in str(it.get("email", "")).lower()
+                    ]
+                total_cnt = len(items)
+                pages_cnt = max(1, (total_cnt + limit_n - 1) // limit_n)
+                page_n = min(page_n, pages_cnt)
+                start_i = (page_n - 1) * limit_n
+                self._send_json(200, {
+                    "ok": True,
+                    "kind": kind,
+                    "page": page_n,
+                    "limit": limit_n,
+                    "total": total_cnt,
+                    "pages": pages_cnt,
+                    "items": items[start_i : start_i + limit_n],
+                })
+                return
+
             self._send_json(404, {"error": "المسار غير موجود"})
 
         def do_POST(self) -> None:
@@ -643,6 +735,9 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
             if not auth:
                 return
             uid, tg_user, user_rec = auth
+            if not _check_http_rate_limit(uid, is_dev=hooks["is_super_admin"](uid)):
+                self._send_json(429, {"error": "طلبات متتالية كثيرة؛ تمهل ثانية لحماية الخادم."})
+                return
             user_label = str(tg_user.get("first_name") or user_rec.get("name") or uid)
             username = str(tg_user.get("username") or user_rec.get("username") or "")
 

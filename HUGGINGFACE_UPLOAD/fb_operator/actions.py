@@ -13,7 +13,10 @@ import time
 import random
 import re
 import threading
-from playwright.sync_api import Page, Locator
+try:
+    from patchright.sync_api import Page, Locator
+except Exception:
+    from playwright.sync_api import Page, Locator
 from fb_operator.browser_manager import (
     human_delay,
     dismiss_dialogs,

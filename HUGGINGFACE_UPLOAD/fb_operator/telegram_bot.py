@@ -36,7 +36,7 @@ import threading
 from datetime import datetime
 import telebot
 from telebot import types
-from playwright.sync_api import sync_playwright
+from collections import deque
 
 from fb_operator.config import BROKEN_ACCOUNT_TTL_HOURS
 from fb_operator.account_manager import (
@@ -54,6 +54,7 @@ from fb_operator.admin_manager import (
     record_audit_log, load_audit_logs, SUPER_ADMIN_ID, PERMISSION_LABELS
 )
 from fb_operator.browser_manager import (
+    sync_playwright, USING_PATCHRIGHT,
     launch_account_browser, auto_login_facebook, check_facebook_login_cookies,
     human_delay, get_login_error, check_facebook_page_access,
     diagnose_facebook_challenge, save_account_storage_state, get_profile_lock
@@ -98,7 +99,7 @@ from fb_operator.economy_manager import (
 
 BOT_TOKEN = (os.environ.get("BOT_TOKEN") or "").strip() or "8798272294:AAGzBDYCu3B9tks46u3_U0mxsH9r0Olofzg"
 
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML", threaded=True, num_threads=32)
 _bot_username_cache = ""
 
 
@@ -230,8 +231,70 @@ def _track_view(user_id: int, chat_id: int, msg_id: int | None, view: str, targe
         }
 
 
+def _detect_browser_concurrency() -> int:
+    """تحديد أقصى عدد متصفحات متزامنة تلقائياً حسب الذاكرة المتاحة لمنع الانهيار تحت الضغط"""
+    raw_env = (os.environ.get("FB_MAX_BROWSERS") or "").strip()
+    if raw_env.isdigit():
+        return max(1, min(20, int(raw_env)))
+    avail_mb = 0
+    try:
+        meminfo = Path("/proc/meminfo")
+        if meminfo.exists():
+            txt = meminfo.read_text(encoding="utf-8", errors="ignore")
+            m = re.search(r"MemTotal:\s+(\d+)\s+kB", txt)
+            if m:
+                avail_mb = int(m.group(1)) // 1024
+    except Exception:
+        avail_mb = 0
+    if avail_mb <= 0 and os.name == "nt":
+        try:
+            import ctypes
+            class _MEMSTAT(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+            ms = _MEMSTAT()
+            ms.dwLength = ctypes.sizeof(_MEMSTAT)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
+                avail_mb = int(ms.ullTotalPhys // (1024 * 1024))
+        except Exception:
+            pass
+    if avail_mb > 0:
+        return max(2, min(12, avail_mb // 900))
+    return 4
+
+
 # أقفال عزل بروفايلات المتصفح مستوردة بشكل موحد من browser_manager (get_profile_lock)
-_browser_semaphore = threading.BoundedSemaphore(4)
+_browser_semaphore = threading.BoundedSemaphore(_detect_browser_concurrency())
+
+_RATE_LOCK = threading.Lock()
+_USER_RATE_BUCKETS: dict[int, deque[float]] = {}
+
+
+def _check_user_rate_limit(user_id: int, max_ops: int = 35, window_sec: float = 5.0) -> bool:
+    """حارس انزلاق زمني ضد الإغراق لحماية البوت من التهنيج عند الضغط العالي"""
+    if is_super_admin(user_id):
+        return True
+    now = time.monotonic()
+    with _RATE_LOCK:
+        dq = _USER_RATE_BUCKETS.get(user_id)
+        if dq is None:
+            dq = deque()
+            _USER_RATE_BUCKETS[user_id] = dq
+        while dq and (now - dq[0]) > window_sec:
+            dq.popleft()
+        if len(dq) >= max_ops:
+            return False
+        dq.append(now)
+        return True
 
 
 # ----------------- إدارة الجلسات المتعددة وعزل المستخدمين (Multi-Tenant Engine) -----------------
@@ -1835,6 +1898,10 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
 
     if data == "noop":
         safe_answer(call.id)
+        return
+
+    if not _check_user_rate_limit(user_id):
+        safe_answer(call.id, "⏳ تمهل ثانية؛ تم استلام طلبات متتالية كثيرة لحماية الخادم.", show_alert=False)
         return
 
     if data == "enter_invite_code":

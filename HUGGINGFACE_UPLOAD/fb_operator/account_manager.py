@@ -22,6 +22,9 @@ PROFILES_DIR = _cfg.PROFILES_DIR
 SESSIONS_DIR = _cfg.SESSIONS_DIR
 _accounts_lock = threading.RLock()
 _git_lock = threading.Lock()
+_ACC_CACHE_KEY: tuple[str, int, int] | None = None
+_ACC_CACHE_DATA: list[dict] = []
+_ACC_INDEX_BY_ID: dict[str, dict] = {}
 
 
 def _cleanup_session_file(account_id: str) -> None:
@@ -223,14 +226,26 @@ def git_sync_save(async_mode: bool = True) -> None:
 
 
 def load_accounts() -> list[dict]:
-    """قراءة قائمة الحسابات المسجلة من الملف بأمان ضد تعدد الخيوط"""
+    """قراءة قائمة الحسابات مع كاش ذاكرة O(1) مفهرس ومربوط ببصمة الملف للتعامل الفوري مع 2,000+ حساب"""
+    global _ACC_CACHE_KEY, _ACC_CACHE_DATA, _ACC_INDEX_BY_ID
     with _accounts_lock:
         if not ACCOUNTS_FILE.exists():
+            _ACC_CACHE_KEY = None
+            _ACC_CACHE_DATA = []
+            _ACC_INDEX_BY_ID = {}
             return []
         try:
+            st = ACCOUNTS_FILE.stat()
+            sig = (str(ACCOUNTS_FILE), int(st.st_mtime_ns), int(st.st_size))
+            if _ACC_CACHE_KEY == sig:
+                return [dict(a) for a in _ACC_CACHE_DATA]
             with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            return data if isinstance(data, list) else []
+            clean = [dict(a) for a in data if isinstance(a, dict)] if isinstance(data, list) else []
+            _ACC_CACHE_KEY = sig
+            _ACC_CACHE_DATA = clean
+            _ACC_INDEX_BY_ID = {str(a.get("id")): a for a in clean if a.get("id")}
+            return [dict(a) for a in clean]
         except Exception:
             # في حال تلف الملف مؤقتاً نحفظ نسخة احتياطية ولا نعيد الكتابة عشوائياً
             try:
@@ -243,9 +258,18 @@ def load_accounts() -> list[dict]:
 
 
 def save_accounts(accounts: list[dict], sync_git: bool = True) -> None:
-    """حفظ قائمة الحسابات في الملف بصورة ذرية ومزامنتها في جيت هب"""
+    """حفظ قائمة الحسابات ذرياً وتحديث كاش الذاكرة والفهرس السريع فوراً"""
+    global _ACC_CACHE_KEY, _ACC_CACHE_DATA, _ACC_INDEX_BY_ID
     with _accounts_lock:
         _atomic_write_json(ACCOUNTS_FILE, accounts)
+        try:
+            st = ACCOUNTS_FILE.stat()
+            clean = [dict(a) for a in accounts if isinstance(a, dict)]
+            _ACC_CACHE_KEY = (str(ACCOUNTS_FILE), int(st.st_mtime_ns), int(st.st_size))
+            _ACC_CACHE_DATA = clean
+            _ACC_INDEX_BY_ID = {str(a.get("id")): a for a in clean if a.get("id")}
+        except Exception:
+            _ACC_CACHE_KEY = None
     if sync_git:
         git_sync_save(async_mode=True)
 
@@ -508,12 +532,11 @@ def purge_expired_broken_accounts(max_age_hours: int = 24, now_ts: float | None 
 
 
 def get_account_by_id(account_id: str) -> dict | None:
-    """استرجاع بيانات حساب محدد عبر معرّفه"""
-    accounts = load_accounts()
-    for acc in accounts:
-        if acc.get("id") == account_id:
-            return acc
-    return None
+    """استرجاع بيانات حساب محدد بسرعة O(1) من الفهرس"""
+    with _accounts_lock:
+        load_accounts()
+        rec = _ACC_INDEX_BY_ID.get(str(account_id or ""))
+        return dict(rec) if rec else None
 
 
 def get_detected_chrome_profiles() -> list[dict]:

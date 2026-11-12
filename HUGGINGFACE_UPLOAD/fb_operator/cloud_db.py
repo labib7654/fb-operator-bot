@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -23,6 +24,9 @@ from typing import Any
 import requests
 
 _db_lock = threading.RLock()
+_SUPABASE_CHUNK_SIZE = 50
+_SUPABASE_PULL_PAGE_SIZE = 1000
+_SUPABASE_ROW_HASH_CACHE: dict[str, dict[str, str]] = {}
 _sync_state = {
     "last_push_ts": 0.0,
     "last_push_iso": "",
@@ -172,6 +176,7 @@ def save_cloud_db_config(patch: dict) -> dict:
 
 def clear_cloud_db_config() -> dict:
     with _db_lock:
+        _SUPABASE_ROW_HASH_CACHE.clear()
         cfg_path, _ = _active_db_paths()
         if cfg_path.exists():
             try:
@@ -411,43 +416,84 @@ def _turso_pull(cfg: dict) -> dict:
 # --- Adapter 2: Supabase PostgreSQL PostgREST HTTPS API ---
 def _supabase_headers(cfg: dict) -> dict[str, str]:
     key = (cfg.get("supabase_key") or "").strip()
-    return {
+    headers = {
         "apikey": key,
-        "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
     }
+    # المفاتيح الحديثة sb_secret_ / sb_publishable_ ليست JWT لذا لا تُرسل في Authorization: Bearer
+    if key and not key.startswith("sb_"):
+        headers["Authorization"] = f"Bearer {key}"
+    return headers
 
 
-def _supabase_push(cfg: dict, kv: dict[str, str]) -> dict:
+def _supabase_push(cfg: dict, kv: dict[str, str], force: bool = False) -> dict:
     url = _clean_url(cfg.get("supabase_url", ""))
     key = (cfg.get("supabase_key") or "").strip()
     if not url or not key:
         return {"ok": False, "error": "بيانات Supabase (URL أو Key) غير مكتملة."}
+
     endpoint = f"{url}/rest/v1/{_TABLE_NAME}?on_conflict=doc_key"
     now_f = time.time()
-    rows = [{"doc_key": k, "payload": v, "updated_at": now_f} for k, v in kv.items()]
+    cache_key = f"{url}|{key[:12]}"
+    with _db_lock:
+        prev_hashes = dict(_SUPABASE_ROW_HASH_CACHE.get(cache_key) or {})
+
+    pending_rows: list[tuple[dict[str, Any], str]] = []
+    manifest_item: tuple[dict[str, Any], str] | None = None
+    data_changed = False
+    for k, v in kv.items():
+        rhash = hashlib.sha256(str(v).encode("utf-8", errors="ignore")).hexdigest()
+        if k == "meta:manifest":
+            manifest_item = ({"doc_key": k, "payload": v, "updated_at": now_f}, rhash)
+            continue
+        if not force and prev_hashes.get(k) == rhash:
+            continue
+        data_changed = True
+        pending_rows.append(({"doc_key": k, "payload": v, "updated_at": now_f}, rhash))
+
+    if manifest_item and (force or data_changed):
+        pending_rows.append(manifest_item)
+
+    if not pending_rows:
+        return {"ok": True, "provider": "supabase", "keys": 0, "chunks": 0, "delta_skipped": True}
+
     headers = {
         **_supabase_headers(cfg),
         "Prefer": "resolution=merge-duplicates,return=minimal",
     }
-    try:
-        resp = requests.post(endpoint, headers=headers, json=rows, timeout=25)
-    except Exception as e:
-        return {"ok": False, "error": f"خطأ اتصال Supabase: {e}"}
 
-    if 200 <= resp.status_code < 300:
-        return {"ok": True, "provider": "supabase", "keys": len(rows)}
-    body_low = (resp.text or "").lower()
-    if resp.status_code == 404 or "pgrst205" in body_low or "does not exist" in body_low:
-        return {
-            "ok": False,
-            "needs_table": True,
-            "error": (
-                f"الجدول {_TABLE_NAME} غير منشأ بعد في Supabase! نفّذ هذا الأمر في SQL Editor هناك:\n"
-                f"CREATE TABLE IF NOT EXISTS {_TABLE_NAME} (doc_key TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at DOUBLE PRECISION NOT NULL);"
-            ),
-        }
-    return {"ok": False, "error": f"رفض Supabase (HTTP {resp.status_code}): {resp.text[:200]}"}
+    uploaded_count = 0
+    chunks_count = 0
+    for i in range(0, len(pending_rows), _SUPABASE_CHUNK_SIZE):
+        batch = pending_rows[i : i + _SUPABASE_CHUNK_SIZE]
+        rows_payload = [item[0] for item in batch]
+        try:
+            resp = requests.post(endpoint, headers=headers, json=rows_payload, timeout=25)
+        except Exception as e:
+            return {"ok": False, "error": f"خطأ اتصال Supabase بالدفعة {chunks_count + 1}: {e}"}
+
+        if 200 <= resp.status_code < 300:
+            with _db_lock:
+                bucket = _SUPABASE_ROW_HASH_CACHE.setdefault(cache_key, {})
+                for row_obj, rhash in batch:
+                    bucket[row_obj["doc_key"]] = rhash
+            uploaded_count += len(batch)
+            chunks_count += 1
+            continue
+
+        body_low = (resp.text or "").lower()
+        if resp.status_code == 404 or "pgrst205" in body_low or "does not exist" in body_low:
+            return {
+                "ok": False,
+                "needs_table": True,
+                "error": (
+                    f"الجدول {_TABLE_NAME} غير منشأ بعد في Supabase! نفّذ هذا الأمر في SQL Editor هناك:\n"
+                    f"CREATE TABLE IF NOT EXISTS {_TABLE_NAME} (doc_key TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at DOUBLE PRECISION NOT NULL);"
+                ),
+            }
+        return {"ok": False, "error": f"رفض Supabase (HTTP {resp.status_code}): {resp.text[:200]}"}
+
+    return {"ok": True, "provider": "supabase", "keys": uploaded_count, "chunks": chunks_count, "total_keys": len(kv)}
 
 
 def _supabase_pull(cfg: dict) -> dict:
@@ -455,30 +501,50 @@ def _supabase_pull(cfg: dict) -> dict:
     key = (cfg.get("supabase_key") or "").strip()
     if not url or not key:
         return {"ok": False, "error": "بيانات Supabase (URL أو Key) غير مكتملة."}
-    endpoint = f"{url}/rest/v1/{_TABLE_NAME}?select=doc_key,payload"
-    try:
-        resp = requests.get(endpoint, headers=_supabase_headers(cfg), timeout=25)
-    except Exception as e:
-        return {"ok": False, "error": f"خطأ اتصال Supabase: {e}"}
-    if not (200 <= resp.status_code < 300):
-        body_low = (resp.text or "").lower()
-        if resp.status_code == 404 or "pgrst205" in body_low or "does not exist" in body_low:
-            return {
-                "ok": False,
-                "needs_table": True,
-                "error": f"الجدول {_TABLE_NAME} غير منشأ بعد في Supabase SQL Editor.",
-            }
-        return {"ok": False, "error": f"فشل قراءة Supabase (HTTP {resp.status_code}): {resp.text[:200]}"}
-    try:
-        rows = resp.json()
-        kv: dict[str, str] = {}
-        if isinstance(rows, list):
-            for r in rows:
-                if isinstance(r, dict) and r.get("doc_key"):
-                    kv[str(r["doc_key"])] = str(r.get("payload") or "")
-        return {"ok": True, "provider": "supabase", "kv": kv}
-    except Exception as e:
-        return {"ok": False, "error": f"استجابة Supabase غير صالحة: {e}"}
+
+    base_endpoint = f"{url}/rest/v1/{_TABLE_NAME}?select=doc_key,payload&order=doc_key.asc"
+    kv: dict[str, str] = {}
+    offset = 0
+    page_size = _SUPABASE_PULL_PAGE_SIZE
+
+    while offset < 250_000:
+        hdrs = {
+            **_supabase_headers(cfg),
+            "Range-Unit": "items",
+            "Range": f"{offset}-{offset + page_size - 1}",
+        }
+        try:
+            resp = requests.get(base_endpoint, headers=hdrs, timeout=25)
+        except Exception as e:
+            return {"ok": False, "error": f"خطأ اتصال Supabase: {e}"}
+
+        if not (200 <= resp.status_code < 300):
+            body_low = (resp.text or "").lower()
+            if resp.status_code == 416:
+                break
+            if resp.status_code == 404 or "pgrst205" in body_low or "does not exist" in body_low:
+                return {
+                    "ok": False,
+                    "needs_table": True,
+                    "error": f"الجدول {_TABLE_NAME} غير منشأ بعد في Supabase SQL Editor.",
+                }
+            return {"ok": False, "error": f"فشل قراءة Supabase (HTTP {resp.status_code}): {resp.text[:200]}"}
+
+        try:
+            rows = resp.json()
+        except Exception as e:
+            return {"ok": False, "error": f"استجابة Supabase غير صالحة: {e}"}
+
+        if not isinstance(rows, list) or not rows:
+            break
+        for r in rows:
+            if isinstance(r, dict) and r.get("doc_key"):
+                kv[str(r["doc_key"])] = str(r.get("payload") or "")
+        if len(rows) < page_size:
+            break
+        offset += len(rows)
+
+    return {"ok": True, "provider": "supabase", "kv": kv}
 
 
 # --- Adapter 3: Firebase Realtime Database Spark Free REST API ---
@@ -558,8 +624,8 @@ def test_cloud_db_connection(cfg_override: dict | None = None) -> dict:
     }
 
 
-def push_cloud_db_state(docs_dict: dict[str, bytes], sessions_dict: dict[str, bytes]) -> dict:
-    """مزامنة فورية إلى SQLite WAL المحلي + القاعدة السحابية الخارجية (إن كانت مربوطة)"""
+def push_cloud_db_state(docs_dict: dict[str, bytes], sessions_dict: dict[str, bytes], force: bool = False) -> dict:
+    """مزامنة فورية إلى SQLite WAL المحلي + القاعدة السحابية الخارجية (بنظام التغييرات الجزئية والدفعات لـ 2,000+ حساب)"""
     local_res = write_local_sqlite_mirror(docs_dict, sessions_dict)
     cfg = load_cloud_db_config(mask_secrets=False)
     if not cfg.get("enabled"):
@@ -572,7 +638,7 @@ def push_cloud_db_state(docs_dict: dict[str, bytes], sessions_dict: dict[str, by
     if provider == "turso":
         res = _turso_push(cfg, kv, session_ids)
     elif provider == "supabase":
-        res = _supabase_push(cfg, kv)
+        res = _supabase_push(cfg, kv, force=force)
     elif provider == "firebase":
         res = _firebase_push(cfg, kv)
     else:

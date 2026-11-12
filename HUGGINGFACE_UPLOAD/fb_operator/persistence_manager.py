@@ -1236,7 +1236,7 @@ def cloud_db_sync_upload(force: bool = False) -> dict:
     """مزامنة الحالة الكاملة إلى SQLite WAL المحلي + القاعدة السحابية الخارجية (Turso/Supabase/Firebase)."""
     global _last_cloud_db_sync_ts
     docs, sessions = collect_persistent_snapshot()
-    res = cloud_db.push_cloud_db_state(docs, sessions)
+    res = cloud_db.push_cloud_db_state(docs, sessions, force=force)
     if res.get("ok") and not res.get("cloud_skipped"):
         _last_cloud_db_sync_ts = time.time()
     return res

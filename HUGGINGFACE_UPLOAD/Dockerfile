@@ -35,7 +35,7 @@ RUN wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | gpg --dearm
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-RUN playwright install --with-deps chromium
+RUN patchright install chromium || playwright install --with-deps chromium
 
 # تثبيت cloudflared لتشغيل نفق HTTPS الآمن للوحة التحكم المصغرة داخل تلغرام عند الحاجة
 RUN wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O /usr/local/bin/cloudflared && \

@@ -17,6 +17,8 @@ from fb_operator.state_events import publish_event
 
 _users_lock = threading.RLock()
 _audit_lock = threading.RLock()
+_USERS_CACHE_KEY: tuple[str, int, int] | None = None
+_USERS_CACHE_DATA: dict = {}
 
 # الآيدي السيادي للمطور الأكبر — محمي برمجياً ولا يمكن تغييره أو انتحاله أبداً
 SUPER_ADMIN_ID = 7411444902
@@ -124,14 +126,39 @@ def _build_super_profile(existing: dict | None = None) -> dict:
     return prof
 
 
+def _copy_users_snapshot(raw: dict) -> dict:
+    out: dict = {}
+    for k, v in raw.items():
+        if isinstance(v, dict):
+            item = dict(v)
+            if isinstance(v.get("permissions"), dict):
+                item["permissions"] = dict(v["permissions"])
+            out[k] = item
+        else:
+            out[k] = v
+    return out
+
+
 def load_users() -> dict:
-    """قراءة قاعدة بيانات المستخدمين والمسؤولين مع حماية حصانة المطور الأكبر ومنع تصعيد الرتب"""
+    """قراءة قاعدة بيانات المستخدمين مع كاش ذاكرة O(1) وحماية حصانة المطور الأكبر"""
+    global _USERS_CACHE_KEY, _USERS_CACHE_DATA
     with _users_lock:
         if not USERS_FILE.exists():
             initial = {str(SUPER_ADMIN_ID): _build_super_profile()}
             _atomic_write_json(USERS_FILE, initial)
+            try:
+                st = USERS_FILE.stat()
+                _USERS_CACHE_KEY = (str(USERS_FILE), int(st.st_mtime_ns), int(st.st_size))
+                _USERS_CACHE_DATA = _copy_users_snapshot(initial)
+            except Exception:
+                _USERS_CACHE_KEY = None
             return initial
         try:
+            st = USERS_FILE.stat()
+            sig = (str(USERS_FILE), int(st.st_mtime_ns), int(st.st_size))
+            if _USERS_CACHE_KEY == sig:
+                return _copy_users_snapshot(_USERS_CACHE_DATA)
+
             with open(USERS_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if not isinstance(data, dict):
@@ -156,6 +183,8 @@ def load_users() -> dict:
                     # حصر المفاتيح فقط في المفاتيح الرسمية وفرض False افتراضياً
                     v["permissions"] = {pk: bool(raw_perms.get(pk, False)) for pk in DEFAULT_PERMISSIONS}
                     _ensure_wallet_fields(v)
+            _USERS_CACHE_KEY = sig
+            _USERS_CACHE_DATA = _copy_users_snapshot(data)
             return data
         except Exception:
             try:
@@ -168,7 +197,8 @@ def load_users() -> dict:
 
 
 def save_users(data: dict, sync_git: bool = False) -> None:
-    """حفظ قاعدة بيانات المستخدمين بصورة ذرية مع فرض سلامة المطور الأكبر"""
+    """حفظ قاعدة بيانات المستخدمين ذرياً وتحديث كاش الذاكرة فوراً"""
+    global _USERS_CACHE_KEY, _USERS_CACHE_DATA
     with _users_lock:
         # إعادة التحقق الحتمي قبل الكتابة على القرص منعاً لأي تلاعب عارض بالذاكرة
         existing_super = data.get(str(SUPER_ADMIN_ID))
@@ -177,6 +207,12 @@ def save_users(data: dict, sync_git: bool = False) -> None:
             if k != str(SUPER_ADMIN_ID) and isinstance(v, dict):
                 v["role"] = "user"
         _atomic_write_json(USERS_FILE, data)
+        try:
+            st = USERS_FILE.stat()
+            _USERS_CACHE_KEY = (str(USERS_FILE), int(st.st_mtime_ns), int(st.st_size))
+            _USERS_CACHE_DATA = _copy_users_snapshot(data)
+        except Exception:
+            _USERS_CACHE_KEY = None
     if sync_git:
         git_sync_save(async_mode=True)
 
