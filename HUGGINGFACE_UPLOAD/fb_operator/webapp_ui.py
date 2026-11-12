@@ -249,7 +249,7 @@ def get_miniapp_html() -> str:
             margin-top: 24px;
         }
         dialog.hitl-dialog {
-            width: min(820px, 98vw);
+            width: min(860px, 98vw);
             max-width: 98vw;
             max-height: 95dvh;
             margin: auto;
@@ -258,6 +258,17 @@ def get_miniapp_html() -> str:
             border-radius: var(--radius);
             background: var(--bg-sec);
             color: var(--text);
+        }
+        @media (max-width: 768px) {
+            dialog.hitl-dialog {
+                width: 100vw;
+                max-width: 100vw;
+                height: 100dvh;
+                max-height: 100dvh;
+                margin: 0;
+                border-radius: 0;
+                border: none;
+            }
         }
         dialog.hitl-dialog[open] {
             display: flex;
@@ -496,24 +507,43 @@ def get_miniapp_html() -> str:
             text-wrap: balance;
         }
         .hitl-body {
-            padding: 10px 12px max(12px, env(safe-area-inset-bottom, 12px)) 12px;
+            flex: 1;
+            min-height: 0;
+            padding: 6px 10px max(8px, env(safe-area-inset-bottom, 8px)) 10px;
             overflow-y: auto;
             display: flex;
             flex-direction: column;
-            gap: 8px;
+            gap: 6px;
+        }
+        .hitl-head-actions {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            flex-shrink: 0;
+        }
+        .hitl-ar-bar {
+            background: rgba(56, 139, 253, 0.12);
+            border: 1px solid rgba(56, 139, 253, 0.35);
+            border-radius: 8px;
+            padding: 6px 10px;
+            font-size: 13px;
+            line-height: 1.5;
+            color: var(--text);
+            white-space: pre-line;
+            word-break: break-word;
         }
         .hitl-zoom-bar {
             display: flex;
             flex-wrap: wrap;
             align-items: center;
             justify-content: space-between;
-            gap: 6px;
+            gap: 5px;
         }
         .hitl-zoom-group {
             display: flex;
             flex-wrap: wrap;
             align-items: center;
-            gap: 5px;
+            gap: 4px;
         }
         .hitl-zoom-badge {
             font-size: 12px;
@@ -528,8 +558,10 @@ def get_miniapp_html() -> str:
         }
         .hitl-stage {
             position: relative;
+            flex: 1;
             width: 100%;
-            max-height: 58dvh;
+            min-height: 56dvh;
+            max-height: none;
             background: #0d1117;
             border: 1px solid var(--border);
             border-radius: 8px;
@@ -537,6 +569,24 @@ def get_miniapp_html() -> str:
             -webkit-overflow-scrolling: touch;
             overscroll-behavior: contain;
             touch-action: pan-x pan-y pinch-zoom;
+        }
+        .hitl-tools-drawer {
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            background: var(--bg);
+            padding: 4px 8px;
+        }
+        .hitl-tools-drawer summary {
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 700;
+            color: var(--muted);
+            padding: 4px 2px;
+            user-select: none;
+        }
+        .hitl-tools-drawer[open] summary {
+            margin-bottom: 6px;
+            border-bottom: 1px solid var(--border);
         }
         .hitl-canvas-wrap {
             position: relative;
@@ -1118,10 +1168,15 @@ def get_miniapp_html() -> str:
 <dialog id="hitlDialog" class="hitl-dialog" aria-labelledby="hitlDialogTitle" closedby="closerequest">
     <div class="hitl-head">
         <h2 id="hitlDialogTitle">الشاشة الحية التفاعلية لحل التحقق</h2>
-        <button type="button" class="btn btn-muted btn-sm" id="btnHitlClose" autofocus>إغلاق</button>
+        <div class="hitl-head-actions">
+            <span class="hitl-zoom-badge" id="hitlTtlBadge">--:--</span>
+            <button type="button" class="btn btn-muted btn-sm" id="btnHitlExtend" onclick="hitlAction('extend_ttl')">⏳ +5د</button>
+            <button type="button" class="btn btn-muted btn-sm" id="btnHitlClose" autofocus>إغلاق</button>
+        </div>
     </div>
     <div class="hitl-body">
         <div id="hitlLiveStatus" role="status" aria-live="polite" class="status-banner" style="margin-top:0;">جاري تجهيز المتصفح...</div>
+        <div id="hitlArBar" class="hitl-ar-bar hidden"></div>
         <div class="hitl-zoom-bar">
             <div class="hitl-zoom-group">
                 <button type="button" class="btn btn-muted btn-sm" aria-label="تصغير الشاشة" onclick="hitlZoom(-0.5)">🔍-</button>
@@ -1130,8 +1185,9 @@ def get_miniapp_html() -> str:
                 <button type="button" class="btn btn-muted btn-sm" onclick="hitlResetZoom()">إعادة</button>
             </div>
             <div class="hitl-zoom-group">
-                <button type="button" class="btn btn-muted btn-sm" id="btnHitlPanMode" onclick="hitlTogglePanMode()">👆 اللمس: نقر</button>
-                <button type="button" class="btn btn-muted btn-sm" id="btnHitlViewportMode" onclick="hitlToggleViewportMode()">🖥️ وضع الكمبيوتر</button>
+                <button type="button" class="btn btn-muted btn-sm" id="btnHitlPanMode" onclick="hitlTogglePanMode()">👆 نقر</button>
+                <button type="button" class="btn btn-muted btn-sm" id="btnHitlViewportMode" onclick="hitlToggleViewportMode()">🖥️ كمبيوتر</button>
+                <button type="button" class="btn btn-muted btn-sm" id="btnHitlTranslate" onclick="hitlAction('toggle_translate')">🌐 ترجمة: ✅</button>
             </div>
         </div>
         <div class="hitl-stage" id="hitlStage">
@@ -1142,23 +1198,29 @@ def get_miniapp_html() -> str:
         </div>
         <div class="hitl-toolbar">
             <button type="button" class="btn btn-ok btn-sm" onclick="hitlAction('check_now')">✅ فحص وحفظ الجلسة</button>
-            <button type="button" class="btn btn-muted btn-sm" onclick="hitlScroll(-320)">أعلى</button>
-            <button type="button" class="btn btn-muted btn-sm" onclick="hitlScroll(320)">أسفل</button>
-            <button type="button" class="btn btn-muted btn-sm" onclick="hitlKey('Tab')">Tab</button>
-            <button type="button" class="btn btn-muted btn-sm" onclick="hitlKey('Space')">مسافة</button>
-            <button type="button" class="btn btn-muted btn-sm" onclick="hitlKey('Enter')">Enter</button>
-            <button type="button" class="btn btn-muted btn-sm" onclick="hitlKey('Backspace')">حذف حرف</button>
-            <button type="button" class="btn btn-muted btn-sm" onclick="hitlAction('reload')">تحديث الصفحة</button>
-            <button type="button" class="btn btn-primary btn-sm hidden" id="btnHitlPrefill" onclick="hitlAction('prefill_creds')">🔑 إتمام الدخول التلقائي</button>
+            <button type="button" class="btn btn-warn btn-sm" id="btnHitlPauseAuto" onclick="hitlAction('pause_auto')">✋ تحكم يدوي</button>
+            <button type="button" class="btn btn-primary btn-sm hidden" id="btnHitlPrefill" onclick="hitlAction('prefill_creds')">🔑 دخول تلقائي أمامي</button>
         </div>
-        <div class="field" style="margin-bottom:0;">
-            <label for="hitlTextInput">إرسال نص أو رمز التحقق (2FA / OTP) إلى الصفحة الحية</label>
-            <div style="display:flex;gap:6px;flex-wrap:wrap;">
-                <input type="text" id="hitlTextInput" autocomplete="one-time-code" placeholder="أدخل رمز 2FA أو أي نص لإرساله للحقل المحدد..." style="flex:1;min-width:180px;">
-                <button type="button" class="btn btn-primary btn-sm" onclick="hitlSendText(true)">إرسال + Enter</button>
-                <button type="button" class="btn btn-muted btn-sm" onclick="hitlSendText(false)">كتابة فقط</button>
+        <details class="hitl-tools-drawer">
+            <summary>⌨️ أزرار التحكم والكتابة ورمز التحقق (2FA / OTP)</summary>
+            <div class="hitl-toolbar" style="margin-bottom:6px;">
+                <button type="button" class="btn btn-muted btn-sm" onclick="hitlScroll(-320)">أعلى</button>
+                <button type="button" class="btn btn-muted btn-sm" onclick="hitlScroll(320)">أسفل</button>
+                <button type="button" class="btn btn-muted btn-sm" onclick="hitlKey('Tab')">Tab</button>
+                <button type="button" class="btn btn-muted btn-sm" onclick="hitlKey('Space')">مسافة</button>
+                <button type="button" class="btn btn-muted btn-sm" onclick="hitlKey('Enter')">Enter</button>
+                <button type="button" class="btn btn-muted btn-sm" onclick="hitlKey('Backspace')">حذف حرف</button>
+                <button type="button" class="btn btn-muted btn-sm" onclick="hitlAction('reload')">تحديث الصفحة</button>
             </div>
-        </div>
+            <div class="field" style="margin-bottom:0;">
+                <label for="hitlTextInput">إرسال نص أو رمز التحقق (2FA / OTP) إلى الصفحة الحية</label>
+                <div style="display:flex;gap:6px;flex-wrap:wrap;">
+                    <input type="text" id="hitlTextInput" autocomplete="one-time-code" placeholder="أدخل رمز 2FA أو أي نص لإرساله للحقل المحدد..." style="flex:1;min-width:160px;">
+                    <button type="button" class="btn btn-primary btn-sm" onclick="hitlSendText(true)">إرسال + Enter</button>
+                    <button type="button" class="btn btn-muted btn-sm" onclick="hitlSendText(false)">كتابة فقط</button>
+                </div>
+            </div>
+        </details>
     </div>
 </dialog>
 
@@ -3063,10 +3125,21 @@ async function hitlToggleViewportMode() {
     }
 }
 
+function hitlFormatTtl(sec) {
+    const s = Math.max(0, Math.round(Number(sec) || 0));
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+    return String(m).padStart(2, "0") + ":" + String(r).padStart(2, "0");
+}
+
 function applyHitlSnapshot(st) {
     if (!st) return;
     const statusEl = document.getElementById("hitlLiveStatus");
     const prefillBtn = document.getElementById("btnHitlPrefill");
+    const pauseBtn = document.getElementById("btnHitlPauseAuto");
+    const ttlBadge = document.getElementById("hitlTtlBadge");
+    const arBar = document.getElementById("hitlArBar");
+    const trBtn = document.getElementById("btnHitlTranslate");
     const imgEl = document.getElementById("hitlScreenImg");
     const wrap = document.getElementById("hitlCanvasWrap");
 
@@ -3077,12 +3150,36 @@ function applyHitlSnapshot(st) {
         hitlViewportMode = st.mode === "desktop" ? "desktop" : "mobile";
         hitlSyncControls();
     }
+    if (imgEl) {
+        imgEl.style.imageRendering = hitlZoomScale <= 1.05 ? "auto" : "crisp-edges";
+    }
     if (st.frame_b64 && st.frame_b64.startsWith("data:image/jpeg;base64,") && st.frame_seq !== hitlLastFrameSeq) {
         imgEl.src = st.frame_b64;
         hitlLastFrameSeq = st.frame_seq;
     }
+    if (ttlBadge && st.ttl_remaining != null) {
+        ttlBadge.textContent = hitlFormatTtl(st.ttl_remaining);
+    }
+    if (trBtn) {
+        const trOn = st.ar_translate_enabled !== false;
+        trBtn.textContent = trOn ? "🌐 ترجمة: ✅" : "🌐 ترجمة: ❌";
+    }
+    if (arBar) {
+        const arTxt = String(st.screen_text_ar || "").trim();
+        const trOn = st.ar_translate_enabled !== false;
+        if (trOn && arTxt) {
+            arBar.textContent = "🌐 ترجمة الشاشة:\n" + arTxt;
+            arBar.classList.remove("hidden");
+        } else {
+            arBar.textContent = "";
+            arBar.classList.add("hidden");
+        }
+    }
+    if (pauseBtn) {
+        pauseBtn.textContent = st.auto_paused ? "✋ التحكم بيدك الآن" : (st.auto_login_active ? "⏸️ إيقاف التلقائي والتدخل" : "✋ تحكم يدوي");
+    }
     if (prefillBtn) {
-        const showPrefill = !!st.has_credentials && ["full_login", "password_only"].includes(st.challenge_code || "");
+        const showPrefill = !!st.has_credentials && !st.completed;
         prefillBtn.classList.toggle("hidden", !showPrefill);
     }
 
@@ -3095,13 +3192,13 @@ function applyHitlSnapshot(st) {
         return;
     }
 
-    statusEl.style.borderColor = st.error ? "#f47067" : "var(--border)";
+    statusEl.style.borderColor = st.error ? "#f47067" : (st.auto_paused ? "#d29922" : "var(--border)");
     if (st.error) {
         statusEl.textContent = st.error;
     } else if (!st.running && st.ready) {
         statusEl.textContent = st.challenge_message || "أُغلقت جلسة المتصفح.";
     } else {
-        const ttl = st.ttl_remaining != null ? (" | المتبقي: " + st.ttl_remaining + "ث") : "";
+        const ttl = st.ttl_remaining != null ? (" | المتبقي: " + hitlFormatTtl(st.ttl_remaining)) : "";
         statusEl.textContent = (st.challenge_message || "جاري تحميل الصفحة...") + ttl;
     }
 }
@@ -3123,10 +3220,12 @@ async function openHitlLive(accId, accName) {
         try { hitlWaitAbortCtrl.abort(); } catch (_) {}
         hitlWaitAbortCtrl = null;
     }
+    const preferMobile = (typeof window !== "undefined" && window.innerWidth <= 760);
+    const initMode = preferMobile ? "mobile" : "desktop";
     hitlActiveAccId = accId;
     hitlLastFrameSeq = -1;
     hitlPanMode = false;
-    hitlViewportMode = "desktop";
+    hitlViewportMode = initMode;
     hitlResetZoom();
     const titleEl = document.getElementById("hitlDialogTitle");
     if (titleEl) {
@@ -3134,6 +3233,10 @@ async function openHitlLive(accId, accName) {
     }
     const statusEl = document.getElementById("hitlLiveStatus");
     if (statusEl) statusEl.textContent = "جاري تشغيل متصفح الحساب والبث الحي (CDP Screencast)...";
+    const arBar = document.getElementById("hitlArBar");
+    if (arBar) { arBar.textContent = ""; arBar.classList.add("hidden"); }
+    const ttlBadge = document.getElementById("hitlTtlBadge");
+    if (ttlBadge) ttlBadge.textContent = "--:--";
     const imgEl = document.getElementById("hitlScreenImg");
     if (imgEl) imgEl.removeAttribute("src");
 
@@ -3141,7 +3244,7 @@ async function openHitlLive(accId, accName) {
         dlg.showModal();
     }
     try {
-        const res = await apiCall("/api/hitl/start", "POST", { account_id: accId, mode: "desktop" });
+        const res = await apiCall("/api/hitl/start", "POST", { account_id: accId, mode: initMode });
         applyHitlSnapshot(res);
         if (res && !res.completed && (res.running || !res.ready)) {
             scheduleNextHitlFrame(accId, 30);

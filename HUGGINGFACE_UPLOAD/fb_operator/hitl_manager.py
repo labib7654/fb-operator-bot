@@ -7,11 +7,15 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import queue
+import re
 import threading
 import time
+import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any, Callable
+import requests
 
 import fb_operator.account_manager as acc_mgr
 from fb_operator.browser_manager import (
@@ -30,9 +34,103 @@ from fb_operator.proxy_manager import proxy_execution_guard, resolve_proxy_for_a
 HITL_VIEWPORT = (1280, 800)
 HITL_DESKTOP_VIEWPORT = (1280, 800)
 HITL_MOBILE_VIEWPORT = (430, 780)
-HITL_INACTIVITY_TTL_SEC = 180.0
-HITL_MAX_TTL_SEC = 300.0
+HITL_INACTIVITY_TTL_SEC = 600.0
+HITL_MAX_TTL_SEC = 1800.0
+HITL_HARD_CAP_SEC = 7200.0
 MAX_CONCURRENT_HITL = 2
+
+_AR_TRANSLATE_CACHE_LOCK = threading.Lock()
+_AR_TRANSLATE_CACHE: dict[str, str] = {}
+
+_EN_AR_PHRASES: tuple[tuple[str, str], ...] = (
+    ("use the arrows to move the character on the tiles which have the same icons as shown on the left",
+     "استخدم الأسهم لتحريك الشخصية فوق المربعات التي تحمل نفس الرموز الظاهرة على اليسار، ثم اضغط إرسال (Submit)."),
+    ("use the arrows to rotate the animal to face in the direction of the hand",
+     "استخدم الأسهم لتدوير الشكل حتى يواجه نفس اتجاه اليد، ثم اضغط إرسال (Submit)."),
+    ("use the arrows to",
+     "استخدم الأسهم الظاهرة أسفل الصورة للتوجيه ثم اضغط إرسال (Submit)."),
+    ("pick the dice pair", "اختر حجر النرد الذي يطابق المطلوب."),
+    ("match this", "طابق هذا الشكل/الرمز"),
+    ("can't see this challenge? generate new or try audio challenge instead",
+     "إن لم يظهر التحدي بوضوح يمكنك توليد تحدٍ جديد بالضغط على الرابط أسفله."),
+    ("check your notifications on another device",
+     "راجع إشعارات فيسبوك على جهاز آخر مسجل فيه الحساب ووافق على تسجيل الدخول."),
+    ("enter the 6-digit code", "أدخل رمز التحقق المكون من 6 أرقام في خانة النص بالأسفل."),
+    ("confirm your identity", "فيسبوك يطلب تأكيد الهوية لهذا الحساب."),
+    ("forgotten password", "هل نسيت كلمة السر؟"),
+    ("create new account", "إنشاء حساب جديد"),
+    ("try another way", "جرّب طريقة تحقق أخرى"),
+    ("log in", "تسجيل الدخول"),
+    ("submit", "إرسال / تأكيد"),
+    ("continue", "متابعة"),
+)
+
+
+def _quick_glossary_ar(text: str) -> str:
+    low = " ".join(str(text or "").lower().split())
+    hits: list[str] = []
+    for en_key, ar_val in _EN_AR_PHRASES:
+        if en_key in low and ar_val not in hits:
+            hits.append(ar_val)
+    return " • ".join(hits[:2])
+
+
+def _translate_text_to_arabic(text: str) -> str:
+    clean = " ".join(str(text or "").split())[:420]
+    if not clean or not re.search(r"[A-Za-z]{3,}", clean):
+        return ""
+    key = hashlib.sha256(clean.encode("utf-8")).hexdigest()[:24]
+    with _AR_TRANSLATE_CACHE_LOCK:
+        cached = _AR_TRANSLATE_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    glossary = _quick_glossary_ar(clean)
+    translated = glossary
+    try:
+        url = (
+            "https://translate.googleapis.com/translate_a/single"
+            f"?client=gtx&sl=en&tl=ar&dt=t&q={urllib.parse.quote(clean[:320])}"
+        )
+        resp = requests.get(url, timeout=2.5)
+        if resp.status_code == 200:
+            data = resp.json()
+            if isinstance(data, list) and data and isinstance(data[0], list):
+                parts = [str(seg[0]) for seg in data[0] if isinstance(seg, list) and seg and seg[0]]
+                g_ar = " ".join(parts).strip()
+                if g_ar:
+                    translated = f"{glossary} | {g_ar}" if (glossary and len(g_ar) > 8 and glossary not in g_ar) else g_ar
+    except Exception:
+        pass
+
+    with _AR_TRANSLATE_CACHE_LOCK:
+        if len(_AR_TRANSLATE_CACHE) >= 256:
+            _AR_TRANSLATE_CACHE.clear()
+        _AR_TRANSLATE_CACHE[key] = translated
+    return translated
+
+
+def _extract_visible_challenge_text(page) -> str:
+    chunks: list[str] = []
+    try:
+        frames = list(getattr(page, "frames", []) or [])
+    except Exception:
+        frames = [page]
+    for target in [page] + frames[:4]:
+        try:
+            txt = target.evaluate(
+                """() => {
+                    const el = document.querySelector('h1, h2, [role="heading"], .challenge-instructions, #FunCaptcha, form') || document.body;
+                    return el && el.innerText ? el.innerText.slice(0, 320) : '';
+                }"""
+            )
+            if isinstance(txt, str) and txt.strip():
+                clean = " ".join(txt.split())[:300]
+                if clean and clean not in chunks:
+                    chunks.append(clean)
+        except Exception:
+            continue
+    return " | ".join(chunks)[:360]
 
 ALLOWED_KEYS = frozenset({
     "Enter",
@@ -161,6 +259,7 @@ class HITLSession:
     state_lock: threading.Lock = field(default_factory=threading.Lock)
     created_at: float = field(default_factory=time.time)
     last_activity: float = field(default_factory=time.time)
+    max_deadline: float = 0.0
     running: bool = True
     ready: bool = False
     completed: bool = False
@@ -170,6 +269,11 @@ class HITLSession:
     page_url: str = ""
     can_otp: bool = False
     has_credentials: bool = False
+    auto_paused: bool = False
+    auto_login_active: bool = False
+    ar_translate_enabled: bool = True
+    screen_text_orig: str = ""
+    screen_text_ar: str = ""
     error: str = ""
     frame_b64: str = ""
     frame_seq: int = 0
@@ -178,12 +282,28 @@ class HITLSession:
     frame_cond: threading.Condition = field(default_factory=lambda: threading.Condition(threading.Lock()))
     _stop_event: threading.Event = field(default_factory=threading.Event)
 
+    def __post_init__(self) -> None:
+        if not self.max_deadline:
+            self.max_deadline = self.created_at + HITL_MAX_TTL_SEC
+
     def notify_frame(self) -> None:
         with self.frame_cond:
             self.frame_cond.notify_all()
 
-    def touch(self) -> None:
-        self.last_activity = time.time()
+    def touch(self, active_input: bool = False, extra_sec: float = 0.0) -> None:
+        now = time.time()
+        self.last_activity = now
+        cap_end = self.created_at + HITL_HARD_CAP_SEC
+        if extra_sec > 0.0:
+            self.max_deadline = min(cap_end, max(self.max_deadline, now) + float(extra_sec))
+        elif active_input:
+            self.max_deadline = min(cap_end, max(self.max_deadline, now + 300.0))
+
+    def ttl_remaining_sec(self, now: float | None = None) -> int:
+        t = float(now if now is not None else time.time())
+        rem_max = max(0.0, self.max_deadline - t)
+        rem_idle = max(0.0, HITL_INACTIVITY_TTL_SEC - (t - self.last_activity))
+        return max(0, int(min(rem_max, rem_idle)))
 
     def snapshot_dict(self) -> dict[str, Any]:
         with self.state_lock:
@@ -199,18 +319,22 @@ class HITLSession:
                 "page_url": self.page_url,
                 "can_otp": self.can_otp,
                 "has_credentials": self.has_credentials,
+                "auto_paused": self.auto_paused,
+                "auto_login_active": self.auto_login_active,
+                "ar_translate_enabled": self.ar_translate_enabled,
+                "screen_text_ar": self.screen_text_ar if self.ar_translate_enabled else "",
                 "error": self.error,
                 "frame_b64": self.frame_b64,
                 "frame_seq": self.frame_seq,
                 "mode": self.mode,
                 "viewport": {"width": int(self.viewport[0]), "height": int(self.viewport[1])},
-                "ttl_remaining": max(0, int(HITL_MAX_TTL_SEC - (time.time() - self.created_at))),
+                "ttl_remaining": self.ttl_remaining_sec(),
             }
 
 
 def _safe_capture_jpeg_b64(page) -> str:
     try:
-        raw = page.screenshot(type="jpeg", quality=76)
+        raw = page.screenshot(type="jpeg", quality=88)
         return "data:image/jpeg;base64," + base64.b64encode(raw).decode("ascii")
     except Exception:
         return ""
@@ -258,6 +382,27 @@ def _hitl_worker(session: HITLSession, acc: dict) -> None:
                 last_cdp_frame_ts = [0.0]
                 try:
                     page = ctx.pages[0] if ctx.pages else ctx.new_page()
+                    def _restart_cdp_screencast(vw: int, vh: int) -> None:
+                        if cdp is None:
+                            return
+                        try:
+                            cdp.send("Page.stopScreencast")
+                        except Exception:
+                            pass
+                        try:
+                            cdp.send(
+                                "Page.startScreencast",
+                                {
+                                    "format": "jpeg",
+                                    "quality": 88,
+                                    "maxWidth": int(vw),
+                                    "maxHeight": int(vh),
+                                    "everyNthFrame": 1,
+                                },
+                            )
+                        except Exception:
+                            pass
+
                     try:
                         cdp = ctx.new_cdp_session(page)
 
@@ -278,16 +423,7 @@ def _hitl_worker(session: HITLSession, acc: dict) -> None:
                                     pass
 
                         cdp.on("Page.screencastFrame", _on_screencast_frame)
-                        cdp.send(
-                            "Page.startScreencast",
-                            {
-                                "format": "jpeg",
-                                "quality": 68,
-                                "maxWidth": int(max(session.viewport[0], HITL_DESKTOP_VIEWPORT[0])),
-                                "maxHeight": int(max(session.viewport[1], HITL_DESKTOP_VIEWPORT[1])),
-                                "everyNthFrame": 1,
-                            },
-                        )
+                        _restart_cdp_screencast(session.viewport[0], session.viewport[1])
                     except Exception:
                         cdp = None
 
@@ -301,6 +437,23 @@ def _hitl_worker(session: HITLSession, acc: dict) -> None:
                     time.sleep(1.2)
                     dismiss_dialogs(page)
 
+                    def _schedule_translate_async(raw_txt: str) -> None:
+                        if not raw_txt or not session.ar_translate_enabled:
+                            return
+                        quick = _quick_glossary_ar(raw_txt)
+                        if quick:
+                            with session.state_lock:
+                                if raw_txt == session.screen_text_orig and not session.screen_text_ar:
+                                    session.screen_text_ar = quick
+                        def _tr_worker():
+                            ar_out = _translate_text_to_arabic(raw_txt)
+                            if ar_out:
+                                with session.state_lock:
+                                    if raw_txt == session.screen_text_orig:
+                                        session.screen_text_ar = ar_out
+                                session.notify_frame()
+                        threading.Thread(target=_tr_worker, daemon=True).start()
+
                     def _refresh_state(force_shot: bool = False) -> bool:
                         diag = diagnose_facebook_challenge(page)
                         is_logged, fb_id = check_facebook_login_cookies(ctx)
@@ -311,6 +464,8 @@ def _hitl_worker(session: HITLSession, acc: dict) -> None:
                             curr_url = str(page.url or "")[:180]
                         except Exception:
                             pass
+                        vis_txt = _extract_visible_challenge_text(page) if (force_shot or session.ar_translate_enabled) else ""
+                        need_tr = False
 
                         with session.state_lock:
                             session.ready = True
@@ -319,8 +474,12 @@ def _hitl_worker(session: HITLSession, acc: dict) -> None:
                                 session.frame_seq += 1
                             session.page_url = curr_url
                             session.challenge_code = str(diag.get("code") or "unknown")
-                            session.challenge_message = str(diag.get("message") or "")
+                            if not session.auto_paused:
+                                session.challenge_message = str(diag.get("message") or "")
                             session.can_otp = bool(diag.get("can_otp"))
+                            if vis_txt and vis_txt != session.screen_text_orig:
+                                session.screen_text_orig = vis_txt
+                                need_tr = True
 
                             if is_logged and diag.get("is_ok"):
                                 session.completed = True
@@ -329,6 +488,8 @@ def _hitl_worker(session: HITLSession, acc: dict) -> None:
                                 session.challenge_message = "تم تسجيل الدخول وتثبيت الجلسة بنجاح!"
                                 session.notify_frame()
                                 return True
+                        if need_tr:
+                            _schedule_translate_async(vis_txt)
                         session.notify_frame()
                         return False
 
@@ -339,15 +500,25 @@ def _hitl_worker(session: HITLSession, acc: dict) -> None:
                         time.sleep(1.5)
                         return
 
-                    # إذا فتح المتصفح على شاشة تسجيل دخول فارغة وتوفرت بيانات الحساب، نسجل الدخول تلقائياً ليهبط المستخدم على التحقق مباشرة
-                    if session.has_credentials and session.challenge_code in ("full_login", "password_only"):
+                    # دخول تلقائي حي ومباشر أمام المستخدم مع التوقف التلقائي عند أي عائق ليتمكن المستخدم من إصلاحه
+                    if session.has_credentials and session.challenge_code in ("full_login", "password_only") and not session.auto_paused:
+                        def _on_auto_step(step_msg: str) -> None:
+                            with session.state_lock:
+                                if not session.auto_paused:
+                                    session.challenge_message = f"🔑 {step_msg}"
+                            _refresh_state(force_shot=True)
+
                         with session.state_lock:
-                            session.challenge_message = "جاري إدخال بيانات الحساب تلقائياً للوصول مباشرةً لشاشة التحقق..."
+                            session.auto_login_active = True
+                            session.challenge_message = "🔑 جاري تسجيل الدخول التلقائي أمامك (أوقفه في أي لحظة للتحكم اليدوي)..."
                         session.notify_frame()
                         try:
-                            auto_login_facebook(ctx, page, email, real_pass, max_wait=24)
+                            auto_login_facebook(ctx, page, email, real_pass, status_callback=_on_auto_step, max_wait=24)
                         except Exception:
                             pass
+                        finally:
+                            with session.state_lock:
+                                session.auto_login_active = False
                         if _refresh_state(force_shot=True):
                             save_account_storage_state(ctx, acc["profile_dir"])
                             if _on_verified_callback:
@@ -358,14 +529,14 @@ def _hitl_worker(session: HITLSession, acc: dict) -> None:
                     last_capture = time.time()
                     while not session._stop_event.is_set():
                         now = time.time()
-                        if (now - session.created_at) >= HITL_MAX_TTL_SEC:
+                        if now >= session.max_deadline:
                             with session.state_lock:
-                                session.error = "انتهى الحد الأقصى لجلسة الشاشة الحية (5 دقائق)."
+                                session.error = "انتهى الوقت الممدد لجلسة الشاشة الحية. أعد فتحها لمتابعة التحدي من نفس النقطة."
                             session.notify_frame()
                             break
                         if (now - session.last_activity) >= HITL_INACTIVITY_TTL_SEC:
                             with session.state_lock:
-                                session.error = "أُغلقت الشاشة الحية تلقائياً لعدم التفاعل (3 دقائق)."
+                                session.error = "أُغلقت الشاشة الحية تلقائياً لعدم التفاعل لمدة 10 دقائق."
                             session.notify_frame()
                             break
                         if len(ctx.pages) == 0:
@@ -377,7 +548,6 @@ def _hitl_worker(session: HITLSession, acc: dict) -> None:
                             cmd_obj = None
 
                         if cmd_obj is not None:
-                            session.touch()
                             ev = cmd_obj.get("event")
                             ctype = cmd_obj.get("cmd")
                             did_complete = False
@@ -388,6 +558,8 @@ def _hitl_worker(session: HITLSession, acc: dict) -> None:
                                         ev.set()
                                     break
                                 elif ctype == "click":
+                                    with session.state_lock:
+                                        session.auto_paused = True
                                     vw, vh = session.viewport
                                     x = max(1.0, min(float(vw - 1), float(cmd_obj.get("x") or 0)))
                                     y = max(1.0, min(float(vh - 1), float(cmd_obj.get("y") or 0)))
@@ -397,6 +569,8 @@ def _hitl_worker(session: HITLSession, acc: dict) -> None:
                                     except Exception:
                                         time.sleep(0.25)
                                 elif ctype == "drag":
+                                    with session.state_lock:
+                                        session.auto_paused = True
                                     vw, vh = session.viewport
                                     x1 = max(1.0, min(float(vw - 1), float(cmd_obj.get("x1") or 0)))
                                     y1 = max(1.0, min(float(vh - 1), float(cmd_obj.get("y1") or 0)))
@@ -415,6 +589,8 @@ def _hitl_worker(session: HITLSession, acc: dict) -> None:
                                     except Exception:
                                         time.sleep(0.25)
                                 elif ctype == "check_now":
+                                    with session.state_lock:
+                                        session.auto_paused = False
                                     save_account_storage_state(ctx, acc["profile_dir"], save_pending=True)
                                 elif ctype == "set_mode":
                                     new_mode = "desktop" if str(cmd_obj.get("mode") or "") == "desktop" else "mobile"
@@ -423,11 +599,38 @@ def _hitl_worker(session: HITLSession, acc: dict) -> None:
                                         session.mode = new_mode
                                         session.viewport = new_vp
                                     page.set_viewport_size({"width": new_vp[0], "height": new_vp[1]})
+                                    _restart_cdp_screencast(new_vp[0], new_vp[1])
                                     try:
                                         page.wait_for_timeout(350)
                                     except Exception:
                                         time.sleep(0.35)
+                                elif ctype == "pause_auto":
+                                    with session.state_lock:
+                                        session.auto_paused = True
+                                        session.auto_login_active = False
+                                        session.challenge_message = "⏸️ التحكم اليدوي مفعّل — الشاشة بيدك الآن لتصلح أي خطوة بنفسك."
+                                elif ctype == "extend_ttl":
+                                    with session.state_lock:
+                                        rem_m = max(1, int(round(session.ttl_remaining_sec() / 60.0)))
+                                        session.challenge_message = f"⏳ تم تمديد وقت الجلسة الحية (+5 دقائق إضافية — المتبقي ~{rem_m}د)."
+                                elif ctype == "toggle_translate":
+                                    need_bg_tr = ""
+                                    with session.state_lock:
+                                        if "enabled" in cmd_obj and cmd_obj.get("enabled") is not None:
+                                            session.ar_translate_enabled = bool(cmd_obj.get("enabled"))
+                                        else:
+                                            session.ar_translate_enabled = not session.ar_translate_enabled
+                                        if not session.ar_translate_enabled:
+                                            session.challenge_message = "🌐 تم إيقاف الترجمة الفورية للشاشة."
+                                        else:
+                                            session.challenge_message = "🌐 تم تفعيل الترجمة الفورية إلى العربية."
+                                            if session.screen_text_orig and not session.screen_text_ar:
+                                                need_bg_tr = session.screen_text_orig
+                                    if need_bg_tr:
+                                        _schedule_translate_async(need_bg_tr)
                                 elif ctype == "type":
+                                    with session.state_lock:
+                                        session.auto_paused = True
                                     txt = str(cmd_obj.get("text") or "")[:300]
                                     if txt:
                                         page.keyboard.insert_text(txt)
@@ -439,6 +642,8 @@ def _hitl_worker(session: HITLSession, acc: dict) -> None:
                                         except Exception:
                                             time.sleep(0.35)
                                 elif ctype == "otp":
+                                    with session.state_lock:
+                                        session.auto_paused = True
                                     code = str(cmd_obj.get("code") or "").strip()[:24]
                                     if code:
                                         otp_filled = False
@@ -483,10 +688,31 @@ def _hitl_worker(session: HITLSession, acc: dict) -> None:
                                     time.sleep(0.9)
                                 elif ctype == "prefill_creds":
                                     if email and real_pass:
+                                        def _on_live_step(step_msg: str) -> None:
+                                            with session.state_lock:
+                                                if not session.auto_paused:
+                                                    session.challenge_message = f"🔑 {step_msg}"
+                                            _refresh_state(force_shot=True)
+
+                                        with session.state_lock:
+                                            session.auto_paused = False
+                                            session.auto_login_active = True
+                                            session.challenge_message = "🔑 جاري إدخال بيانات الحساب أمامك مباشرة..."
+                                        session.notify_frame()
                                         try:
-                                            auto_login_facebook(ctx, page, email, real_pass, max_wait=20)
+                                            auto_login_facebook(
+                                                ctx,
+                                                page,
+                                                email,
+                                                real_pass,
+                                                status_callback=_on_live_step,
+                                                max_wait=24,
+                                            )
                                         except Exception:
                                             pass
+                                        finally:
+                                            with session.state_lock:
+                                                session.auto_login_active = False
                             except Exception as ce:
                                 with session.state_lock:
                                     session.error = f"تعذر تنفيذ الإجراء: {str(ce)[:120]}"
@@ -601,11 +827,11 @@ def start_hitl_session(acc_id: str, actor_uid: int, mode: str = "mobile") -> dic
 
 
 def get_hitl_state(acc_id: str) -> dict[str, Any] | None:
+    """قراءة الحالة اللحظية للشاشة الحية دون تمديد مؤقت الخمول التلقائي"""
     with _hitl_lock:
         sess = _sessions.get(acc_id)
         if not sess:
             return None
-        sess.touch()
         return sess.snapshot_dict()
 
 
@@ -615,7 +841,6 @@ def wait_for_hitl_frame(acc_id: str, since_seq: int = -1, timeout: float = 12.0)
         sess = _sessions.get(acc_id)
     if not sess:
         return None
-    sess.touch()
     deadline = time.time() + max(0.5, min(20.0, float(timeout or 12.0)))
     with sess.frame_cond:
         while True:
@@ -683,12 +908,21 @@ def send_hitl_input(acc_id: str, payload: dict[str, Any], wait_sec: float = 4.0)
         cmd.update({"cmd": "reload"})
     elif action == "prefill_creds":
         cmd.update({"cmd": "prefill_creds"})
+    elif action == "pause_auto":
+        cmd.update({"cmd": "pause_auto"})
+    elif action == "extend_ttl":
+        cmd.update({"cmd": "extend_ttl"})
+    elif action == "toggle_translate":
+        cmd.update({"cmd": "toggle_translate", "enabled": payload.get("enabled")})
     elif action == "close":
         cmd.update({"cmd": "close"})
     else:
         return {"ok": False, "error": f"أمر غير معروف: {action}"}
 
-    sess.touch()
+    sess.touch(
+        active_input=(action != "close"),
+        extra_sec=(300.0 if action == "extend_ttl" else 0.0),
+    )
     sess.cmd_queue.put(cmd)
     ev.wait(timeout=max(0.5, min(10.0, wait_sec)))
     return {"ok": True, **sess.snapshot_dict()}
