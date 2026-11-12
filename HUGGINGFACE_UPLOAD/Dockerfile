@@ -37,9 +37,15 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 RUN patchright install chromium || playwright install --with-deps chromium
 
-# تثبيت cloudflared لتشغيل نفق HTTPS الآمن للوحة التحكم المصغرة داخل تلغرام عند الحاجة
+# تثبيت cloudflared لتشغيل نفق HTTPS الآمن للوحة التحكم المصغرة داخل تلغرام ونفق الفورجي
 RUN wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O /usr/local/bin/cloudflared && \
     chmod +x /usr/local/bin/cloudflared || true
+
+# تثبيت محرك go-gost v3.3.3 لتشغيل نفق الفورجي 4G العكسي وبوابات البروكسي السحابية
+RUN wget -q https://github.com/go-gost/gost/releases/download/v3.3.3/gost_3.3.3_linux_amd64.tar.gz -O /tmp/gost.tar.gz && \
+    tar -xzf /tmp/gost.tar.gz -C /usr/local/bin gost && \
+    chmod +x /usr/local/bin/gost && \
+    rm -f /tmp/gost.tar.gz || true
 
 # تخصيص الصلاحيات لمستخدم Docker
 RUN mkdir -p /app/fb_operator/profiles /app/scratch && \

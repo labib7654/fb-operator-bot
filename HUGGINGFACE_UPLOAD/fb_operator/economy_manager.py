@@ -64,6 +64,8 @@ DEFAULT_ECONOMY_SETTINGS: dict = {
     "referral_trigger": "first_active",  # "first_active" | "instant"
     "yer_per_point": 10,
     "active_account_reward": 1,
+    "incomplete_account_yer": 5,
+    "profile_warning_limit": 5,
     "referral_reward": 4,
     "operation_costs": dict(DEFAULT_OP_COSTS),
 }
@@ -139,6 +141,8 @@ def _normalize_settings(raw: dict | None) -> dict:
         "referral_trigger": ref_trigger,
         "yer_per_point": _clamp_int(raw.get("yer_per_point", 10), 10, 1, 1000000),
         "active_account_reward": _clamp_int(raw.get("active_account_reward", 1), 1, 0, 10000),
+        "incomplete_account_yer": _clamp_int(raw.get("incomplete_account_yer", 5), 5, 0, 1000000),
+        "profile_warning_limit": _clamp_int(raw.get("profile_warning_limit", 5), 5, 0, 20),
         "referral_reward": _clamp_int(raw.get("referral_reward", 4), 4, 0, 10000),
         "operation_costs": norm_costs,
     }
@@ -172,6 +176,10 @@ def update_economy_settings(patch: dict, actor_uid: int = 0) -> dict:
                 cur["yer_per_point"] = _clamp_int(patch["yer_per_point"], cur["yer_per_point"], 1, 1000000)
             if "active_account_reward" in patch:
                 cur["active_account_reward"] = _clamp_int(patch["active_account_reward"], cur["active_account_reward"], 0, 10000)
+            if "incomplete_account_yer" in patch:
+                cur["incomplete_account_yer"] = _clamp_int(patch["incomplete_account_yer"], cur.get("incomplete_account_yer", 5), 0, 1000000)
+            if "profile_warning_limit" in patch:
+                cur["profile_warning_limit"] = _clamp_int(patch["profile_warning_limit"], cur.get("profile_warning_limit", 5), 0, 20)
             if "referral_reward" in patch:
                 cur["referral_reward"] = _clamp_int(patch["referral_reward"], cur["referral_reward"], 0, 10000)
             if isinstance(patch.get("operation_costs"), dict):
@@ -278,7 +286,7 @@ def load_points_ledger(user_id: int | None = None, limit: int = 50) -> list[dict
 
 def adjust_user_points(
     target_uid: int,
-    delta: int,
+    delta: int | float,
     tx_type: str,
     reason: str,
     actor_uid: int = 0,
@@ -290,11 +298,13 @@ def adjust_user_points(
     """
     دالة محفظة ذرية آمنة لتعديل النقاط (إضافة/خصم/مكافأة/تسوية):
     - تحترم ترتيب الأقفال (_economy_lock -> _users_lock) لمنع أي جمود.
+    - تدعم الكسور الدقيقة (مثل 0.5 نقطة = 5 ريال) مع الإبقاء على int للأعداد الصحيحة.
     - تمنع السحب بالسالب إلا في التصفير الصريح عند allow_partial_zero=True.
     - تدعم مفتاح عدم التكرار idempotency_key لمنع منح مكافأة واحدة مرتين.
     """
     tid = int(target_uid)
-    delta_int = int(delta)
+    raw_delta = round(float(delta), 2)
+    delta_num: int | float = int(raw_delta) if abs(raw_delta - int(raw_delta)) < 1e-9 else raw_delta
     entry: dict | None = None
     settings = load_economy_settings()
     rate = settings["yer_per_point"]
@@ -306,12 +316,12 @@ def adjust_user_points(
                 if prev.get("idempotency_key") == idempotency_key:
                     with adm_mgr._users_lock:
                         users = adm_mgr.load_users()
-                        cur_bal = int((users.get(str(tid)) or {}).get("points", 0))
+                        cur_bal = adm_mgr.safe_nonneg_points((users.get(str(tid)) or {}).get("points", 0))
                     return {
                         "ok": False,
                         "duplicate": True,
                         "balance": cur_bal,
-                        "yer_value": cur_bal * rate,
+                        "yer_value": int(round(cur_bal * rate)),
                     }
 
         with adm_mgr._users_lock:
@@ -320,34 +330,35 @@ def adjust_user_points(
             if not u:
                 return {"ok": False, "error": "user_not_found"}
 
-            bal_before = int(u.get("points", 0))
-            if delta_int < 0:
-                abs_d = abs(delta_int)
-                if bal_before < abs_d:
+            bal_before = adm_mgr.safe_nonneg_points(u.get("points", 0))
+            if delta_num < 0:
+                abs_d = round(abs(float(delta_num)), 2)
+                if float(bal_before) + 1e-9 < abs_d:
                     if not allow_partial_zero:
                         return {
                             "ok": False,
                             "error": "insufficient_points",
-                            "required": abs_d,
+                            "required": adm_mgr.safe_nonneg_points(abs_d),
                             "balance": bal_before,
                             "yer_per_point": rate,
                         }
-                    delta_int = -bal_before
+                    delta_num = -bal_before if bal_before else 0
 
-            bal_after = bal_before + delta_int
+            bal_after = adm_mgr.safe_nonneg_points(float(bal_before) + float(delta_num))
             u["points"] = bal_after
-            if delta_int > 0:
-                u["total_points_earned"] = int(u.get("total_points_earned", 0)) + delta_int
-            elif delta_int < 0:
-                u["total_points_spent"] = int(u.get("total_points_spent", 0)) + abs(delta_int)
+            if delta_num > 0:
+                u["total_points_earned"] = adm_mgr.safe_nonneg_points(float(u.get("total_points_earned", 0)) + float(delta_num))
+            elif delta_num < 0:
+                u["total_points_spent"] = adm_mgr.safe_nonneg_points(float(u.get("total_points_spent", 0)) + abs(float(delta_num)))
 
-            yer_delta = abs(delta_int) * rate
-            if mark_settled_yer and delta_int < 0:
+            yer_delta = int(round(abs(float(delta_num)) * rate))
+            if mark_settled_yer and delta_num < 0:
                 u["total_yer_settled"] = int(u.get("total_yer_settled", 0)) + yer_delta
 
             adm_mgr.save_users(users, sync_git=False)
 
         tx_id = _gen_id("TX", 8)
+        yer_signed = int(round(float(delta_num) * rate))
         entry = {
             "id": tx_id,
             "timestamp": _now_str(),
@@ -355,11 +366,11 @@ def adjust_user_points(
             "user_name": str(u.get("name", "")),
             "actor_uid": int(actor_uid or 0),
             "tx_type": str(tx_type),
-            "delta": delta_int,
+            "delta": delta_num,
             "balance_before": bal_before,
             "balance_after": bal_after,
             "yer_per_point": rate,
-            "yer_amount": delta_int * rate,
+            "yer_amount": yer_signed,
             "reason": str(reason or "")[:300],
             "idempotency_key": idempotency_key,
             "extra": extra if isinstance(extra, dict) else {},
@@ -370,57 +381,121 @@ def adjust_user_points(
         _atomic_write_json(POINTS_LEDGER_FILE, ledger)
 
     acc_mgr.git_sync_save(async_mode=True)
-    sign_txt = f"+{delta_int}" if delta_int >= 0 else str(delta_int)
+    sign_txt = f"+{delta_num}" if delta_num >= 0 else str(delta_num)
     adm_mgr.record_audit_log(
         tid,
         entry["user_name"],
         f"POINTS_{tx_type}",
-        f"{sign_txt} نقطة ({abs(delta_int) * rate} ريال) | الرصيد الجديد: {entry['balance_after']} | {reason}",
+        f"{sign_txt} نقطة ({yer_delta} ريال) | الرصيد الجديد: {entry['balance_after']} | {reason}",
     )
     publish_event("economy", tid, tx_type.lower())
     return {
         "ok": True,
         "tx": entry,
-        "delta": delta_int,
+        "delta": delta_num,
         "balance": entry["balance_after"],
         "yer_per_point": rate,
-        "yer_value": entry["balance_after"] * rate,
-        "yer_delta": abs(delta_int) * rate,
+        "yer_value": int(round(float(entry["balance_after"]) * rate)),
+        "yer_delta": yer_delta,
     }
 
 
-def reward_account_activation(owner_id: int, acc_id: str, acc_name: str = "") -> dict:
+def reward_account_activation(
+    owner_id: int,
+    acc_id: str,
+    acc_name: str = "",
+    profile_quality: dict | None = None,
+) -> dict:
     """
-    منح نقاط تفعيل حساب فيسبوك نشط للمالك (+1 نقطة = 10 ريال افتراضياً، بدون تكرار لنفس الحساب)،
-    وإطلاق مكافأة الإحالة (+4 نقاط = 40 ريال) للمُحيل إذا كان هذا أول حساب نشط للمدعو.
+    منح نقاط تفعيل حساب فيسبوك نشط للمالك (+1 نقطة = 10 ريال للحساب المكتمل، بدون تكرار):
+    - يطبق نظام الـ 5 إنذارات عندما يكون الحساب ناقص المواصفات (الاسم العربي، الغلاف، السيرة، الجامعة، الحالة، المنشورات):
+      * الإنذارات 1..5: تحذير واضح + بقاء المكافأة كاملة (10 ريال).
+      * بعد استنفاد الـ 5 إنذارات: يُحتسب الحساب الناقص بنصف السعر (5 ريال = 0.5 نقطة افتراضياً)،
+        بينما يستمر احتساب أي حساب كامل المواصفات بـ 10 ريال كاملة.
+    - وإطلاق مكافأة الإحالة (+4 نقاط = 40 ريال) للمُحيل عند أول حساب نشط للمدعو.
     """
     settings = load_economy_settings()
+    rate = settings["yer_per_point"]
     acc_reward = settings["active_account_reward"]
+    inc_yer = int(settings.get("incomplete_account_yer", 5))
+    warn_limit = int(settings.get("profile_warning_limit", 5))
     ref_reward = settings["referral_reward"]
     oid = int(owner_id)
+
+    wallet_now = get_user_wallet(oid)
     out: dict = {
         "owner_id": oid,
         "owner_awarded": 0,
-        "owner_balance": get_user_wallet(oid)["points"],
+        "owner_awarded_yer": 0,
+        "owner_balance": wallet_now["points"],
+        "owner_yer_value": wallet_now["yer_value"],
         "referral_inviter_id": 0,
         "referral_awarded": 0,
         "referral_inviter_balance": 0,
-        "yer_per_point": settings["yer_per_point"],
+        "yer_per_point": rate,
+        "warning_status": "none",  # none | complete | warned | penalized
+        "warning_num": 0,
+        "warning_limit": warn_limit,
+        "warnings_remaining": warn_limit,
+        "missing_labels": [],
+        "full_reward_yer": int(round(acc_reward * rate)),
+        "incomplete_reward_yer": inc_yer,
     }
 
+    is_incomplete = bool(
+        isinstance(profile_quality, dict)
+        and profile_quality.get("checked")
+        and not profile_quality.get("passed")
+    )
+    missing_labels = list(profile_quality.get("missing_labels") or []) if isinstance(profile_quality, dict) else []
+    out["missing_labels"] = missing_labels
+
     if oid > 0 and acc_reward > 0:
-        res_owner = adjust_user_points(
-            target_uid=oid,
-            delta=acc_reward,
-            tx_type="ACTIVE_ACCOUNT_REWARD",
-            reason=f"تفعيل حساب فيسبوك نشط ({acc_name or acc_id})",
-            actor_uid=0,
-            idempotency_key=f"acc_active:{acc_id}",
-            extra={"account_id": acc_id},
-        )
-        if res_owner.get("ok"):
-            out["owner_awarded"] = acc_reward
-            out["owner_balance"] = res_owner["balance"]
+        with _economy_lock:
+            ledger_chk = _load_ledger_unlocked()
+            already_paid = any(prev.get("idempotency_key") == f"acc_active:{acc_id}" for prev in ledger_chk)
+            award_pts: int | float = acc_reward
+            tx_reason = f"تفعيل حساب فيسبوك نشط ({acc_name or acc_id})"
+
+            if is_incomplete and not already_paid:
+                with adm_mgr._users_lock:
+                    users = adm_mgr.load_users()
+                    u_obj = users.get(str(oid))
+                    prev_w = int((u_obj or {}).get("profile_warnings_used", 0))
+                    if prev_w < warn_limit:
+                        new_w = prev_w + 1
+                        if isinstance(u_obj, dict):
+                            u_obj["profile_warnings_used"] = new_w
+                            adm_mgr.save_users(users, sync_git=False)
+                        out["warning_status"] = "warned"
+                        out["warning_num"] = new_w
+                        out["warnings_remaining"] = max(0, warn_limit - new_w)
+                        tx_reason = f"تفعيل حساب ناقص مواصفات [إنذار {new_w}/{warn_limit}] ({acc_name or acc_id})"
+                    else:
+                        half_pts = adm_mgr.safe_nonneg_points(inc_yer / max(1, rate))
+                        award_pts = min(acc_reward, half_pts)
+                        out["warning_status"] = "penalized"
+                        out["warning_num"] = warn_limit
+                        out["warnings_remaining"] = 0
+                        tx_reason = f"تفعيل حساب ناقص بعد نفاد الإنذارات ({inc_yer} ر.ي) ({acc_name or acc_id})"
+            elif isinstance(profile_quality, dict) and profile_quality.get("checked") and profile_quality.get("passed"):
+                out["warning_status"] = "complete"
+                tx_reason = f"تفعيل حساب فيسبوك مكتمل المواصفات ({acc_name or acc_id})"
+
+            res_owner = adjust_user_points(
+                target_uid=oid,
+                delta=award_pts,
+                tx_type="ACTIVE_ACCOUNT_REWARD",
+                reason=tx_reason,
+                actor_uid=0,
+                idempotency_key=f"acc_active:{acc_id}",
+                extra={"account_id": acc_id, "warning_status": out["warning_status"], "missing": missing_labels},
+            )
+            if res_owner.get("ok"):
+                out["owner_awarded"] = award_pts
+                out["owner_awarded_yer"] = res_owner["yer_delta"]
+                out["owner_balance"] = res_owner["balance"]
+                out["owner_yer_value"] = res_owner["yer_value"]
 
     # مكافأة المُحيل (+4 نقاط) عند أول تفعيل حساب نشط للمدعو
     inviter_id = 0
@@ -539,19 +614,21 @@ def get_user_wallet(uid: int) -> dict:
     rate = settings["yer_per_point"]
     users = adm_mgr.load_users()
     u = users.get(str(int(uid))) or {}
-    pts = int(u.get("points", 0))
+    pts = adm_mgr.safe_nonneg_points(u.get("points", 0))
     return {
         "user_id": int(uid),
         "points": pts,
         "yer_per_point": rate,
-        "yer_value": pts * rate,
-        "total_points_earned": int(u.get("total_points_earned", 0)),
-        "total_points_spent": int(u.get("total_points_spent", 0)),
+        "yer_value": int(round(float(pts) * rate)),
+        "total_points_earned": adm_mgr.safe_nonneg_points(u.get("total_points_earned", 0)),
+        "total_points_spent": adm_mgr.safe_nonneg_points(u.get("total_points_spent", 0)),
         "total_yer_settled": int(u.get("total_yer_settled", 0)),
         "referred_by": int(u.get("referred_by") or 0),
         "referral_rewarded": bool(u.get("referral_rewarded", False)),
         "referred_count": int(u.get("referred_count", 0)),
         "ref_code": str(u.get("ref_code") or ""),
+        "profile_warnings_used": int(u.get("profile_warnings_used", 0)),
+        "profile_warning_limit": int(settings.get("profile_warning_limit", 5)),
     }
 
 
@@ -806,14 +883,14 @@ def build_user_settlement_snapshot(uid: int) -> dict:
     users = adm_mgr.load_users()
     u = users.get(str(int(uid))) or {}
     bd = acc_mgr.get_accounts_breakdown_by_owner(int(uid))
-    pts = int(u.get("points", 0))
+    pts = adm_mgr.safe_nonneg_points(u.get("points", 0))
     return {
         "user_id": int(uid),
         "name": str(u.get("name", f"مستخدم_{uid}")),
         "username": str(u.get("username", "")),
         "points": pts,
         "yer_per_point": rate,
-        "yer_value": pts * rate,
+        "yer_value": int(round(float(pts) * rate)),
         "total_added": len(bd["all"]),
         "active_added": len(bd["active"]),
         "inactive_added": len(bd["inactive"]),
@@ -918,14 +995,14 @@ def reply_support_ticket(ticket_id: str, sender_uid: int, message_text: str, is_
 
 def settle_payout(
     target_uid: int,
-    settle_points: int | None,
+    settle_points: int | float | None,
     actor_uid: int,
     ticket_id: str | None = None,
     note: str = "تسوية ومحاسبة مالية معتمدة",
 ) -> dict:
     tid = int(target_uid)
     wallet = get_user_wallet(tid)
-    pts_to_settle = wallet["points"] if settle_points is None else int(settle_points)
+    pts_to_settle = wallet["points"] if settle_points is None else adm_mgr.safe_nonneg_points(settle_points)
     if pts_to_settle <= 0:
         return {"ok": False, "error": "لا توجد نقاط موجبة للتسوية أو القيمة المطلوبة صفر."}
 

@@ -504,14 +504,43 @@ def launch_account_browser(
     else:
         vw, vh = fp["viewport"]
 
-    proxy_srv = (proxy or os.environ.get("FB_PROXY") or "").strip()
+    try:
+        from fb_operator import proxy_manager
+
+        proxy_res = proxy_manager.resolve_proxy_for_account(
+            account_id=profile_path.name,
+            explicit_proxy=proxy,
+        )
+    except Exception:
+        fallback_srv = (proxy or os.environ.get("FB_PROXY") or "").strip()
+        proxy_res = {
+            "raw_uri": fallback_srv,
+            "playwright_proxy": {"server": fallback_srv} if fallback_srv else None,
+            "geo_hints": {},
+        }
+
+    proxy_srv = str(proxy_res.get("raw_uri") or "").strip()
+    pw_proxy = proxy_res.get("playwright_proxy")
+    geo_hints = proxy_res.get("geo_hints") or {}
+
     is_auto_linux_no_proxy = bool(is_linux and not proxy_srv and not os.environ.get("FB_TIMEZONE"))
-    default_locale = (os.environ.get("FB_LOCALE") or ("en-US" if is_auto_linux_no_proxy else "ar-EG")).strip() or "en-US"
-    default_tz = (os.environ.get("FB_TIMEZONE") or ("America/New_York" if is_auto_linux_no_proxy else "Asia/Riyadh")).strip() or "America/New_York"
-    langs_list = (
-        ["en-US", "en", "ar-EG", "ar"]
-        if default_locale.lower().startswith("en")
-        else ["ar-EG", "ar", "en-US", "en"]
+    default_locale = (
+        os.environ.get("FB_LOCALE")
+        or geo_hints.get("locale")
+        or ("en-US" if is_auto_linux_no_proxy else "ar-EG")
+    ).strip() or "en-US"
+    default_tz = (
+        os.environ.get("FB_TIMEZONE")
+        or geo_hints.get("timezone")
+        or ("America/New_York" if is_auto_linux_no_proxy else "Asia/Riyadh")
+    ).strip() or "America/New_York"
+    langs_list = list(
+        geo_hints.get("languages")
+        or (
+            ["en-US", "en", "ar-EG", "ar"]
+            if default_locale.lower().startswith("en")
+            else ["ar-EG", "ar", "en-US", "en"]
+        )
     )
     use_js_fp_shims = not USING_PATCHRIGHT
 
@@ -548,7 +577,9 @@ def launch_account_browser(
         "timezone_id": default_tz,
     }
 
-    if proxy_srv:
+    if pw_proxy:
+        launch_kwargs["proxy"] = pw_proxy
+    elif proxy_srv:
         launch_kwargs["proxy"] = {"server": proxy_srv}
 
     try:
@@ -1111,4 +1142,245 @@ def human_click(page: Page, locator, timeout: int = 4000) -> bool:
             return True
         except Exception:
             return False
+
+
+_PROFILE_REQUIREMENT_LABELS = {
+    "arabic_name": "اسم عربي طبيعي ومناسب",
+    "avatar": "صورة شخصية حقيقية",
+    "cover": "صورة خلفية (غلاف)",
+    "bio": "سيرة ذاتية (نبذة)",
+    "university": "الجامعة / التعليم",
+    "relationship": "الحالة الاجتماعية",
+    "posts": "منشور أو منشورين على الأقل",
+}
+
+_EMPTY_PROMPT_RE = re.compile(
+    r"(إضافة|أضف)\s+(سيرة ذاتية|نبذة|مدرسة|كلية|جامعة|مكان عمل|حالة اجتماعية)|"
+    r"\b(Add\s+(bio|a\s+bio|high\s+school|college|workplace|relationship\s+status))\b|"
+    r"(لا توجد\s+(مدارس|بيانات|معلومات)\s+لعرضها|No\s+(schools|workplaces|relationship)\s+to\s+show)",
+    re.IGNORECASE,
+)
+_EDU_RE = re.compile(
+    r"(جامعة|كلية|معهد|أكاديمية|درس(?:ت)?\s+في|يدرس\s+في|تدرس\s+في|طالب(?:ة)?\s+في|"
+    r"\b(?:University|College|Institute|Academy|Studied\s+at|Studies\s+at)\b)",
+    re.IGNORECASE,
+)
+_REL_RE = re.compile(
+    r"(أعزب|عزباء|متزوج(?:ة)?|مرتبط(?:ة)?|مخطوب(?:ة)?|أرمل(?:ة)?|منفصل(?:ة)?|في علاقة|"
+    r"\b(?:Single|Married|In\s+a\s+relationship|Engaged|Widowed|Divorced|Separated)\b)",
+    re.IGNORECASE,
+)
+
+
+def _is_good_arabic_profile_name(name: str) -> bool:
+    clean = re.sub(r"\s+", " ", str(name or "")).strip()
+    if not clean or len(clean) < 4:
+        return False
+    lowered = clean.lower()
+    if any(bad in lowered for bad in ("facebook", "test", "bot", "spam", "user", "account")):
+        return False
+    ar_chars = re.findall(r"[\u0600-\u06FF]", clean)
+    lat_chars = re.findall(r"[A-Za-z0-9]", clean)
+    # يشترط وجود حروف عربية حقيقية تغلب على الاسم، وكلمتين على الأقل (الاسم الأول + اللقب)
+    words = [w for w in clean.split(" ") if len(re.findall(r"[\u0600-\u06FF]", w)) >= 2]
+    return len(ar_chars) >= 5 and len(words) >= 2 and len(lat_chars) <= 2
+
+
+def _extract_profile_dom_metrics(page: Page) -> dict:
+    return page.evaluate("""
+        () => {
+            const root = document.querySelector('div[role="main"]') || document.body;
+            const h1s = Array.from(root.querySelectorAll('h1'));
+            let name = '';
+            for (const h of h1s) {
+                const t = (h.innerText || h.textContent || '').trim();
+                if (t && !/^(facebook|فيسبوك|الإشعارات|notifications)$/i.test(t)) {
+                    name = t;
+                    break;
+                }
+            }
+
+            const isRealImg = (src) => {
+                if (!src) return false;
+                const s = String(src).toLowerCase();
+                if (!s.startsWith('http') && !s.startsWith('data:image')) return false;
+                if (s.includes('rsrc.php') || s.includes('default') || s.includes('silhouette') || s.includes('blank')) return false;
+                return true;
+            };
+
+            let hasAvatar = false;
+            const avatarSels = [
+                'a[aria-label*="صورة الملف الشخصي"] image, a[aria-label*="صورة الملف الشخصي"] img',
+                'a[aria-label*="Profile picture"] image, a[aria-label*="Profile picture"] img',
+                '[aria-label*="إجراءات الملف الشخصي"] image, [aria-label*="Profile photo"] img',
+                'svg image',
+                'img.profile-avatar, img[data-testid="profile_avatar"]'
+            ];
+            for (const sel of avatarSels) {
+                const els = Array.from(root.querySelectorAll(sel));
+                for (const el of els) {
+                    const src = el.getAttribute('src') || el.getAttribute('xlink:href') || el.getAttribute('href') || '';
+                    if (isRealImg(src)) {
+                        const rect = el.getBoundingClientRect ? el.getBoundingClientRect() : {width: 80, height: 80};
+                        if ((rect.width || 80) >= 40 && (rect.height || 80) >= 40) {
+                            hasAvatar = true;
+                            break;
+                        }
+                    }
+                }
+                if (hasAvatar) break;
+            }
+
+            let hasCover = false;
+            const coverSels = [
+                'img[data-imgperflogname="profileCoverPhoto"]',
+                'a[aria-label*="صورة الغلاف"] img, a[aria-label*="Cover photo"] img',
+                'div[aria-label*="صورة الغلاف"] img, div[aria-label*="Cover photo"] img',
+                'img.profile-cover'
+            ];
+            for (const sel of coverSels) {
+                const els = Array.from(root.querySelectorAll(sel));
+                for (const el of els) {
+                    const src = el.getAttribute('src') || '';
+                    if (isRealImg(src)) {
+                        hasCover = true;
+                        break;
+                    }
+                }
+                if (hasCover) break;
+            }
+            if (!hasCover) {
+                const topImgs = Array.from(root.querySelectorAll('img'));
+                for (const img of topImgs) {
+                    const src = img.getAttribute('src') || '';
+                    if (!isRealImg(src)) continue;
+                    const rect = img.getBoundingClientRect ? img.getBoundingClientRect() : {width: 0, height: 0, top: 9999};
+                    if (rect.width >= 320 && rect.height >= 110 && rect.top >= 0 && rect.top <= 420) {
+                        hasCover = true;
+                        break;
+                    }
+                }
+            }
+
+            const bioEl = root.querySelector('[data-testid="profile_bio"], .profile-bio');
+            const bioExplicitText = bioEl ? (bioEl.innerText || '').trim() : '';
+
+            const rawText = (root.innerText || document.body.innerText || '').slice(0, 7000);
+            const articles = Array.from(root.querySelectorAll('[role="article"], .profile-post'));
+            let postsCount = 0;
+            for (const art of articles) {
+                const txt = (art.innerText || '').trim();
+                if (!txt || txt.length < 4) continue;
+                if (/لا توجد منشورات|no posts available/i.test(txt)) continue;
+                postsCount += 1;
+            }
+            return {
+                name,
+                hasAvatar,
+                hasCover,
+                bioExplicitText,
+                rawText,
+                postsCount,
+            };
+        }
+    """)
+
+
+def inspect_facebook_profile_quality(page: Page, navigate: bool = True) -> dict:
+    """
+    فحص اكتمال وجودة البروفايل الشخصي لحساب فيسبوك بعد تسجيل الدخول:
+    1) اسم عربي مناسب
+    2) صورة شخصية
+    3) صورة خلفية (غلاف)
+    4) سيرة ذاتية (نبذة)
+    5) الجامعة / الدراسة
+    6) الحالة الاجتماعية
+    7) منشور أو منشوران على الأقل
+    """
+    try:
+        if navigate:
+            page.goto("https://www.facebook.com/me", wait_until="domcontentloaded", timeout=25000)
+            human_delay(1.4, 2.3)
+            dismiss_overlays(page)
+            smooth_scroll(page, scrolls=1)
+            human_delay(0.8, 1.4)
+
+        m = _extract_profile_dom_metrics(page)
+        raw_text = str(m.get("rawText") or "")
+        filtered_lines = [
+            ln.strip() for ln in raw_text.splitlines()
+            if ln.strip() and not _EMPTY_PROMPT_RE.search(ln)
+        ]
+        clean_text = "\n".join(filtered_lines)
+
+        has_edit_bio = bool(re.search(r"تعديل (?:السيرة الذاتية|النبذة المختصرة)|Edit\s+bio", clean_text, re.IGNORECASE))
+        has_add_bio = bool(re.search(r"(?:إضافة|أضف)\s+(?:سيرة ذاتية|نبذة)|Add\s+(?:a\s+)?bio", raw_text, re.IGNORECASE))
+        bio_explicit = str(m.get("bioExplicitText") or "").strip()
+
+        has_edu = bool(_EDU_RE.search(clean_text))
+        has_rel = bool(_REL_RE.search(clean_text))
+        has_bio = bool(bio_explicit or (has_edit_bio and not has_add_bio))
+
+        # إذا لم تظهر النبذة/الجامعة/الحالة الاجتماعية في الواجهة الرئيسية، نفحص تبويب "حول" /me/about
+        if navigate and not (has_edu and has_rel):
+            try:
+                page.goto("https://www.facebook.com/me/about", wait_until="domcontentloaded", timeout=20000)
+                human_delay(1.0, 1.8)
+                about_text = page.evaluate("""
+                    () => (document.querySelector('div[role="main"]')?.innerText || document.body.innerText || '').slice(0, 7000)
+                """)
+                about_clean = "\n".join(
+                    ln.strip() for ln in str(about_text or "").splitlines()
+                    if ln.strip() and not _EMPTY_PROMPT_RE.search(ln)
+                )
+                if not has_edu:
+                    has_edu = bool(_EDU_RE.search(about_clean))
+                if not has_rel:
+                    has_rel = bool(_REL_RE.search(about_clean))
+                if not has_bio and re.search(r"تعديل (?:السيرة الذاتية|النبذة)|Edit\s+bio", about_clean, re.IGNORECASE):
+                    has_bio = True
+            except Exception:
+                pass
+
+        profile_name = str(m.get("name") or "").strip()
+        posts_count = int(m.get("postsCount") or 0)
+
+        checks = {
+            "arabic_name": _is_good_arabic_profile_name(profile_name),
+            "avatar": bool(m.get("hasAvatar")),
+            "cover": bool(m.get("hasCover")),
+            "bio": bool(has_bio),
+            "university": bool(has_edu),
+            "relationship": bool(has_rel),
+            "posts": posts_count >= 1,
+        }
+        missing_keys = [k for k, ok in checks.items() if not ok]
+        missing_labels = [_PROFILE_REQUIREMENT_LABELS[k] for k in missing_keys]
+        passed_cnt = sum(1 for ok in checks.values() if ok)
+
+        return {
+            "checked": True,
+            "passed": len(missing_keys) == 0,
+            "score": passed_cnt,
+            "total": len(checks),
+            "profile_name": profile_name,
+            "posts_count": posts_count,
+            "checks": checks,
+            "missing_keys": missing_keys,
+            "missing_labels": missing_labels,
+        }
+    except Exception as e:
+        return {
+            "checked": False,
+            "passed": False,
+            "score": 0,
+            "total": len(_PROFILE_REQUIREMENT_LABELS),
+            "profile_name": "",
+            "posts_count": 0,
+            "checks": {},
+            "missing_keys": [],
+            "missing_labels": [],
+            "error": str(e)[:120],
+        }
+
 

@@ -36,6 +36,7 @@ WHITELIST_JSON_FILES = (
     "support_tickets.json",
     "backup_meta.json",
     "ui_states.json",
+    "proxies.json",
 )
 
 _SESSION_ENTRY_RE = re.compile(r"^sessions/(acc_\d+)\.json$")
@@ -328,9 +329,11 @@ def _active_paths() -> tuple[dict[str, Path], Path, Path]:
     active_data_dir = Path(acc_m.ACCOUNTS_FILE).parent
     raw_meta = Path(cfg_m.BACKUP_META_FILE)
     raw_ui = Path(cfg_m.UI_STATES_FILE)
+    raw_proxies = Path(getattr(cfg_m, "PROXIES_FILE", Path(cfg_m.DATA_DIR) / "proxies.json"))
     base_data_dir = Path(cfg_m.DATA_DIR)
     meta_path = (active_data_dir / "backup_meta.json") if (raw_meta.parent == base_data_dir and active_data_dir != base_data_dir) else raw_meta
     ui_path = (active_data_dir / "ui_states.json") if (raw_ui.parent == base_data_dir and active_data_dir != base_data_dir) else raw_ui
+    proxies_path = (active_data_dir / "proxies.json") if (raw_proxies.parent == base_data_dir and active_data_dir != base_data_dir) else raw_proxies
 
     json_map = {
         "accounts.json": Path(acc_m.ACCOUNTS_FILE),
@@ -342,6 +345,7 @@ def _active_paths() -> tuple[dict[str, Path], Path, Path]:
         "support_tickets.json": Path(eco_m.SUPPORT_TICKETS_FILE),
         "backup_meta.json": meta_path,
         "ui_states.json": ui_path,
+        "proxies.json": proxies_path,
     }
     profiles_dir = Path(acc_m.PROFILES_DIR)
     sessions_dir = Path(acc_m.SESSIONS_DIR)
@@ -579,7 +583,7 @@ def _parse_and_validate_backup_zip(raw_bytes: bytes) -> dict:
                         return {"ok": False, "error": f"ملف JSON تالف داخل النسخة: {clean_name}"}
                     if clean_name in ("accounts.json", "audit_logs.json", "points_ledger.json", "invite_codes.json", "support_tickets.json") and not isinstance(parsed, list):
                         return {"ok": False, "error": f"بنية غير صحيحة للملف: {clean_name}"}
-                    if clean_name in ("users.json", "economy_settings.json", "backup_meta.json", "ui_states.json") and not isinstance(parsed, dict):
+                    if clean_name in ("users.json", "economy_settings.json", "backup_meta.json", "ui_states.json", "proxies.json") and not isinstance(parsed, dict):
                         return {"ok": False, "error": f"بنية غير صحيحة للملف: {clean_name}"}
                     staged_json[clean_name] = content
                 else:
@@ -764,6 +768,7 @@ def _merge_staged_payload(staged_json: dict[str, bytes], staged_sessions: dict[s
         cur_audit: list[dict] = _safe_parse(json_map["audit_logs.json"].read_bytes() if json_map["audit_logs.json"].exists() else None, [])
         cur_ui: dict = _safe_parse(json_map["ui_states.json"].read_bytes() if json_map["ui_states.json"].exists() else None, {})
         cur_meta: dict = _safe_parse(json_map["backup_meta.json"].read_bytes() if json_map["backup_meta.json"].exists() else None, {})
+        cur_proxies: dict = _safe_parse(json_map["proxies.json"].read_bytes() if json_map["proxies.json"].exists() else None, {})
 
         inc_accounts = _safe_parse(staged_json.get("accounts.json"), [])
         inc_users = _safe_parse(staged_json.get("users.json"), {})
@@ -774,6 +779,7 @@ def _merge_staged_payload(staged_json: dict[str, bytes], staged_sessions: dict[s
         inc_ui = _safe_parse(staged_json.get("ui_states.json"), {})
         inc_eco = _safe_parse(staged_json.get("economy_settings.json"), {})
         inc_meta = _safe_parse(staged_json.get("backup_meta.json"), {})
+        inc_proxies = _safe_parse(staged_json.get("proxies.json"), {})
 
         stats = {
             "accounts_added": 0,
@@ -787,6 +793,7 @@ def _merge_staged_payload(staged_json: dict[str, bytes], staged_sessions: dict[s
             "invites_added": 0,
             "tickets_added": 0,
             "ui_states_added": 0,
+            "proxies_added": 0,
         }
 
         # 1) دمج الحسابات والجلسات مع إعادة ترقيم التصادمات
@@ -940,11 +947,12 @@ def _merge_staged_payload(staged_json: dict[str, bytes], staged_sessions: dict[s
                     cur_u["referral_rewarded"] = True
                 cur_u["total_logins"] = max(int(cur_u.get("total_logins", 0)), int(inc_u.get("total_logins", 0)))
                 cur_u["referred_count"] = max(int(cur_u.get("referred_count", 0)), int(inc_u.get("referred_count", 0)))
+                cur_u["profile_warnings_used"] = max(int(cur_u.get("profile_warnings_used", 0)), int(inc_u.get("profile_warnings_used", 0)))
                 if uid_s not in inc_tx_uids:
                     # أرشيف قديم بلا سجل قيود: لا نضيع النقاط إن لم تكن مسجلة في قيود قادمة
-                    if int(inc_u.get("points", 0)) > int(cur_u.get("points", 0)) and int(cur_u.get("total_points_earned", 0)) == 0:
-                        cur_u["points"] = int(inc_u.get("points", 0))
-                        cur_u["total_points_earned"] = int(inc_u.get("total_points_earned", 0) or inc_u.get("points", 0))
+                    if float(inc_u.get("points", 0) or 0) > float(cur_u.get("points", 0) or 0) and float(cur_u.get("total_points_earned", 0) or 0) == 0:
+                        cur_u["points"] = adm_m.safe_nonneg_points(inc_u.get("points", 0))
+                        cur_u["total_points_earned"] = adm_m.safe_nonneg_points(inc_u.get("total_points_earned", 0) or inc_u.get("points", 0))
                 stats["users_merged"] += 1
 
         # 3) دمج سجل النقاط بدون مضاعفة الرصيد
@@ -954,7 +962,7 @@ def _merge_staged_payload(staged_json: dict[str, bytes], staged_sessions: dict[s
             (str(e.get("user_id")), str(e.get("tx_type")), str(e.get("delta")), str(e.get("timestamp")), str(e.get("reason") or ""))
             for e in cur_ledger if isinstance(e, dict)
         }
-        delta_adj: dict[str, tuple[int, int, int, int]] = {}  # net_delta, earned, spent, settled
+        delta_adj: dict[str, tuple[float, float, float, int]] = {}  # net_delta, earned, spent, settled
 
         for inc_e in inc_ledger:
             if not isinstance(inc_e, dict):
@@ -987,13 +995,13 @@ def _merge_staged_payload(staged_json: dict[str, bytes], staged_sessions: dict[s
 
             uid_s = str(int(inc_e.get("user_id") or 0))
             if uid_s in existing_uids:
-                d_val = int(inc_e.get("delta") or 0)
-                n_d, earn, spnt, sttl = delta_adj.get(uid_s, (0, 0, 0, 0))
-                n_d += d_val
+                d_val = round(float(inc_e.get("delta") or 0), 2)
+                n_d, earn, spnt, sttl = delta_adj.get(uid_s, (0.0, 0.0, 0.0, 0))
+                n_d = round(n_d + d_val, 2)
                 if d_val > 0:
-                    earn += d_val
+                    earn = round(earn + d_val, 2)
                 elif d_val < 0:
-                    spnt += abs(d_val)
+                    spnt = round(spnt + abs(d_val), 2)
                     if "تصفية" in str(inc_e.get("tx_type", "")) or "تسوية" in str(inc_e.get("reason", "")):
                         sttl += abs(int(inc_e.get("yer_amount") or 0))
                 delta_adj[uid_s] = (n_d, earn, spnt, sttl)
@@ -1001,9 +1009,9 @@ def _merge_staged_payload(staged_json: dict[str, bytes], staged_sessions: dict[s
         for uid_s, (n_d, earn, spnt, sttl) in delta_adj.items():
             u_obj = cur_users.get(uid_s)
             if u_obj:
-                u_obj["points"] = max(0, int(u_obj.get("points", 0)) + n_d)
-                u_obj["total_points_earned"] = int(u_obj.get("total_points_earned", 0)) + earn
-                u_obj["total_points_spent"] = int(u_obj.get("total_points_spent", 0)) + spnt
+                u_obj["points"] = adm_m.safe_nonneg_points(float(u_obj.get("points", 0) or 0) + n_d)
+                u_obj["total_points_earned"] = adm_m.safe_nonneg_points(float(u_obj.get("total_points_earned", 0) or 0) + earn)
+                u_obj["total_points_spent"] = adm_m.safe_nonneg_points(float(u_obj.get("total_points_spent", 0) or 0) + spnt)
                 u_obj["total_yer_settled"] = int(u_obj.get("total_yer_settled", 0)) + sttl
 
         adm_m.save_users(cur_users, sync_git=False)
@@ -1079,6 +1087,30 @@ def _merge_staged_payload(staged_json: dict[str, bytes], staged_sessions: dict[s
         if inc_meta and not cur_meta.get("channel_id") and inc_meta.get("channel_id"):
             cur_meta.update(inc_meta)
             _atomic_write_bytes(json_map["backup_meta.json"], json.dumps(cur_meta, ensure_ascii=False, indent=2).encode("utf-8"))
+
+        if inc_proxies and isinstance(inc_proxies, dict):
+            if not isinstance(cur_proxies, dict):
+                cur_proxies = {}
+            cur_list = cur_proxies.get("proxies") if isinstance(cur_proxies.get("proxies"), list) else []
+            seen_uris = {str(p.get("uri", "")).strip() for p in cur_list if isinstance(p, dict) and p.get("uri")}
+            for item in (inc_proxies.get("proxies") or []):
+                if not isinstance(item, dict):
+                    continue
+                u = str(item.get("uri", "")).strip()
+                if u and u not in seen_uris:
+                    cur_list.append(dict(item))
+                    seen_uris.add(u)
+                    stats["proxies_added"] += 1
+            cur_proxies["proxies"] = cur_list
+            cur_binds = cur_proxies.get("bindings") if isinstance(cur_proxies.get("bindings"), dict) else {}
+            inc_binds = inc_proxies.get("bindings") if isinstance(inc_proxies.get("bindings"), dict) else {}
+            for acc_k, p_uri in inc_binds.items():
+                if acc_k not in cur_binds and p_uri:
+                    cur_binds[str(acc_k)] = str(p_uri)
+            cur_proxies["bindings"] = cur_binds
+            if not cur_proxies.get("mode") and inc_proxies.get("mode"):
+                cur_proxies["mode"] = str(inc_proxies.get("mode"))
+            _atomic_write_bytes(json_map["proxies.json"], json.dumps(cur_proxies, ensure_ascii=False, indent=2).encode("utf-8"))
 
         docs_now, sess_now = _collect_snapshot_unlocked(json_map, sessions_dir)
         cloud_db.write_local_sqlite_mirror(docs_now, sess_now)

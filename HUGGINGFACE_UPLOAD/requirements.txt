@@ -3,3 +3,4 @@ patchright>=1.50.0
 pyTelegramBotAPI>=4.26.0
 requests>=2.31.0
 urllib3>=2.0.0
+pproxy>=2.7.0

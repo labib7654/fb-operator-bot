@@ -51,13 +51,30 @@ from fb_operator.admin_manager import (
     register_or_update_user, approve_user, ban_user, unban_user,
     toggle_user_permission, revoke_all_permissions, delete_user_and_data,
     load_users, record_user_operation, record_account_result_for_user,
-    record_audit_log, load_audit_logs, SUPER_ADMIN_ID, PERMISSION_LABELS
+    record_audit_log, load_audit_logs, reset_user_profile_warnings,
+    safe_nonneg_points, SUPER_ADMIN_ID, PERMISSION_LABELS
 )
 from fb_operator.browser_manager import (
     sync_playwright, USING_PATCHRIGHT,
     launch_account_browser, auto_login_facebook, check_facebook_login_cookies,
     human_delay, get_login_error, check_facebook_page_access,
-    diagnose_facebook_challenge, save_account_storage_state, get_profile_lock
+    diagnose_facebook_challenge, inspect_facebook_profile_quality,
+    save_account_storage_state, get_profile_lock
+)
+from fb_operator.proxy_manager import (
+    add_proxies_bulk,
+    check_all_proxies,
+    clear_all_proxies,
+    clear_dead_proxies,
+    get_4g_bridge_status,
+    get_proxy_summary,
+    load_proxy_state,
+    mask_proxy_uri,
+    refresh_4g_client_geo,
+    seed_env_proxies,
+    set_proxy_mode,
+    start_gost_4g_bridge,
+    stop_gost_4g_bridge,
 )
 from fb_operator.actions import (
     navigate_to_target, comment_on_posts, react_to_posts,
@@ -118,16 +135,46 @@ def get_bot_username() -> str:
 
 
 def _format_reward_notice(rew: dict, acc_name: str, is_dev_owner: bool = False) -> str:
-    if not rew or is_dev_owner or int(rew.get("owner_awarded", 0) or 0) <= 0:
+    if not rew or is_dev_owner or float(rew.get("owner_awarded", 0) or 0) <= 0:
         return ""
-    pts = int(rew.get("owner_awarded", 0))
-    bal = int(rew.get("owner_balance", 0))
+    pts = rew.get("owner_awarded", 0)
+    bal = rew.get("owner_balance", 0)
     rate = int(rew.get("yer_per_point", 10))
-    yer = bal * rate
-    return (
-        f"\n\n🪙 <b>مكافأة التفعيل:</b> +{pts} نقطة للحساب ({esc(acc_name)})\n"
-        f"💰 <b>رصيدك الآن:</b> {bal} نقطة (≈ <b>{yer:,} ريال يمني</b>)"
+    yer_got = int(rew.get("owner_awarded_yer") or round(float(pts) * rate))
+    yer_bal = int(rew.get("owner_yer_value") or round(float(bal) * rate))
+
+    base = (
+        f"\n\n🪙 <b>مكافأة التفعيل:</b> +{pts} نقطة (<b>{yer_got:,} ر.ي</b>) للحساب ({esc(acc_name)})\n"
+        f"💰 <b>رصيدك الآن:</b> {bal} نقطة (≈ <b>{yer_bal:,} ريال يمني</b>)"
     )
+
+    w_status = rew.get("warning_status", "none")
+    missing = list(rew.get("missing_labels") or [])
+    missing_str = "، ".join(esc(x) for x in missing)
+    w_num = int(rew.get("warning_num", 0))
+    w_lim = int(rew.get("warning_limit", 5))
+    rem = int(rew.get("warnings_remaining", max(0, w_lim - w_num)))
+    full_yer = int(rew.get("full_reward_yer", rate))
+    inc_yer = int(rew.get("incomplete_reward_yer", 5))
+
+    if w_status == "complete":
+        return base + "\n✅ <b>جودة البروفايل:</b> مكتمل الشروط السبعة — احتُسب بالسعر الكامل!"
+    elif w_status == "warned":
+        return (
+            base
+            + f"\n\n⚠️ <b>تنبيه جودة البروفايل (الإنذار {w_num} من {w_lim}):</b>\n"
+            + (f"❌ <b>ينقص الحساب:</b> {missing_str}\n" if missing_str else "")
+            + "📌 عند إضافة الحسابات القادمة تأكد من إكمال: <b>اسم عربي طبيعي مناسب، صورة شخصية، غلاف (خلفية)، سيرة ذاتية، الجامعة، الحالة الاجتماعية، ومنشور أو منشورين</b>.\n"
+            + f"⏳ متبقي لك <b>{rem}</b> إنذار(ات) — عند نفاد الـ {w_lim} إنذارات سيُحتسب الحساب الناقص بـ <b>{inc_yer} ر.ي فقط</b> بدلاً من {full_yer} ر.ي (بينما يظل الكامل بـ {full_yer} ر.ي)."
+        )
+    elif w_status == "penalized":
+        return (
+            base
+            + f"\n\n🔻 <b>تم استنفاد الإنذارات ({w_lim}/{w_lim}) — احتساب نصف السعر ({inc_yer} ر.ي):</b>\n"
+            + (f"❌ <b>الحساب ناقص:</b> {missing_str}\n" if missing_str else "")
+            + f"💡 لإستلام <b>{full_yer} ر.ي كاملة</b> في المرات القادمة، أكمل كافة شروط البروفايل والمنشورات قبل الإضافة."
+        )
+    return base
 
 # مجلد لقطات الشاشة المؤقت خارج المستودع لمنع تراكم الصور في Git
 SHOTS_TEMP_DIR = Path(tempfile.gettempdir()) / "fb_operator_shots"
@@ -728,7 +775,8 @@ def get_main_dashboard_markup(user_id: int) -> types.InlineKeyboardMarkup:
             types.InlineKeyboardButton("🔗 روابط وأكواد الدعوة", callback_data="menu_referral")
         )
         markup.row(
-            types.InlineKeyboardButton("💾 الحفظ الدائم والنسخ الاحتياطي", callback_data="menu_backup_vault")
+            types.InlineKeyboardButton("🌐 البروكسيات ونفق 4G", callback_data="menu_proxies"),
+            types.InlineKeyboardButton("💾 الحفظ الدائم والنسخ الاحتياطي", callback_data="menu_backup_vault"),
         )
     elif has_any_feature or wallet["points"] > 0:
         eco_row = [types.InlineKeyboardButton(f"🪙 نقاطي ({wallet['points']} = {wallet['yer_value']:,} ر.ي)", callback_data="menu_wallet")]
@@ -886,10 +934,11 @@ def render_surveillance_radar_text_and_markup():
         active_n = len(bd["active"])
         inactive_n = len(bd["inactive"])
         enabled_perms = sum(1 for v in u.get("permissions", {}).values() if v)
-        pts = int(u.get("points", 0) or 0)
+        pts = safe_nonneg_points(u.get("points", 0) or 0)
+        yer_btn = int(round(float(pts) * rate))
         markup.add(
             types.InlineKeyboardButton(
-                f"👤 {u_name} | 🪙{pts}ن ({pts * rate:,}ر.ي) | 🟢{active_n} 🔴{inactive_n} | {enabled_perms}/{total_perms}",
+                f"👤 {u_name} | 🪙{pts}ن ({yer_btn:,}ر.ي) | 🟢{active_n} 🔴{inactive_n} | {enabled_perms}/{total_perms}",
                 callback_data=f"surv_user_{u['id']}"
             )
         )
@@ -957,6 +1006,7 @@ def render_user_dossier(t_id: int):
     )
     markup.row(
         types.InlineKeyboardButton("💸 تسوية ودفع كل المستحقات", callback_data=f"surv_pts_settle_{t_id}"),
+        types.InlineKeyboardButton("🔄 تصفير إنذارات البروفايل", callback_data=f"surv_rst_warn_{t_id}"),
         types.InlineKeyboardButton("📩 التذاكر والمحادثة", callback_data="menu_support")
     )
     markup.row(types.InlineKeyboardButton("🔒 تصفير وإغلاق كافة الصلاحيات", callback_data=f"surv_revoke_all_{t_id}"))
@@ -985,6 +1035,7 @@ def render_user_dossier(t_id: int):
         f"🆔 <b>الآيدي:</b> <code>{t_id}</code> | <b>المعرف:</b> {uname}\n"
         f"🛡️ <b>الحالة:</b> {st_map.get(u.get('status'), esc(u.get('status')))}\n"
         f"🪙 <b>الرصيد المالي:</b> {wallet['points']} نقطة = <b>{wallet['yer_value']:,} ريال يمني</b>\n"
+        f"⚠️ <b>إنذارات جودة البروفايل:</b> <b>{wallet.get('profile_warnings_used', 0)}/{wallet.get('profile_warning_limit', 5)}</b>\n"
         f"💵 <b>المكتسب:</b> {wallet['total_points_earned']}ن | <b>المخصوم:</b> {wallet['total_points_spent']}ن | <b>المُسلّم:</b> {wallet['total_yer_settled']:,} ر.ي\n"
         f"🤝 <b>الإحالات الناجحة:</b> {wallet['referred_count']}{ref_line}\n"
         f"📅 <b>أول دخول:</b> {esc(u.get('first_seen'))} | ⏱️ <b>آخر نشاط:</b> {esc(u.get('last_seen'))}\n"
@@ -1513,6 +1564,114 @@ def _render_backup_vault_view() -> tuple[str, types.InlineKeyboardMarkup]:
     return "\n".join(lines), markup
 
 
+def _render_proxies_view() -> tuple[str, types.InlineKeyboardMarkup]:
+    summary = get_proxy_summary()
+    state = load_proxy_state()
+    mode = summary["mode"]
+    mode_labels = {
+        "sticky": "📌 تثبيت ذكي لكل حساب (Sticky)",
+        "4g_bridge": "📱 نفق الفورجي 4G العكسي",
+        "direct": "🌐 اتصال مباشر بدون بروكسي",
+    }
+    b4g = summary["bridge_4g"]
+    b4g_badge = (
+        f"🟢 متصل الآن (منفذ {b4g['exit_port']} | {esc(b4g.get('exit_ip') or 'جاهز')})"
+        if b4g.get("client_connected")
+        else ("🟡 البوابة مفتوحة — بانتظار ربط الهاتف" if b4g.get("running") else "⚪ متوقف")
+    )
+    lines = [
+        "🌐 <b>غرفة إدارة البروكسيات ونفق الفورجي (pproxy + gost v3)</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"⚙️ <b>الوضع النشط:</b> {mode_labels.get(mode, mode)}",
+        f"📡 <b>البروكسيات المحفوظة:</b> <b>{summary['total']}</b> (🟢 حي: <b>{summary['alive']}</b> | 🔴 ميت: <b>{summary['dead']}</b> | ⏳ لم يُفحص: <b>{summary['untested']}</b>)",
+        f"🔗 <b>الحسابات المربوطة بثبات (Sticky):</b> <b>{summary['bindings_count']}</b> حساب (أقصى حمولة/بروكسي: <b>{summary.get('max_accounts_per_proxy', 0)}</b>)",
+        f"📱 <b>حالة نفق الفورجي 4G:</b> {b4g_badge}",
+    ]
+    if summary.get("max_accounts_per_proxy", 0) > 5:
+        lines.append("⚠️ <i>تنبيه الحماية: بعض البروكسيات تحمل أكثر من 5 حسابات؛ يُفضّل إضافة بروكسيات أو استخدام نفق 4G.</i>")
+    lines.append("🛡️ <i>سياسة عدم الحظر: يبقى كل حساب مثبتاً على نفس IP والدولة دائماً دون تبديل عشوائي.</i>")
+    proxies = state.get("proxies") or []
+    if proxies:
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        lines.append("📋 <b>عينة من التجمع النشط (مُقنّعة للأمان):</b>")
+        for idx, p in enumerate(proxies[:6], 1):
+            st_ic = "🟢" if p.get("alive") is True else ("🔴" if p.get("alive") is False else "⚪")
+            cc = f"[{p['country_code']}]" if p.get("country_code") else ""
+            lat = f"{p['latency_ms']}ms" if p.get("latency_ms") is not None else "-"
+            lines.append(f"  {idx}. {st_ic} <code>{esc(mask_proxy_uri(p['uri']))}</code> {esc(cc)} ({lat})")
+        if len(proxies) > 6:
+            lines.append(f"  <i>... و {len(proxies) - 6} بروكسي إضافي مسجل</i>")
+    else:
+        lines.append("\n<i>💡 أضف بروكسيات SOCKS5/HTTP أو شغّل نفق الفورجي 4G من هاتفك مباشرة بدون VPS.</i>")
+
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.row(
+        types.InlineKeyboardButton("➕ إضافة بروكسيات", callback_data="prx_add_prompt"),
+        types.InlineKeyboardButton("🩺 فحص كل البروكسيات", callback_data="prx_check_all"),
+    )
+    markup.row(
+        types.InlineKeyboardButton("📱 نفق الفورجي 4G (بدون VPS)", callback_data="prx_4g_menu"),
+        types.InlineKeyboardButton("🔀 تبديل الوضع النشط", callback_data="prx_cycle_mode"),
+    )
+    markup.row(
+        types.InlineKeyboardButton("🧹 حذف الميتة", callback_data="prx_clear_dead"),
+        types.InlineKeyboardButton("🗑️ مسح الكل", callback_data="prx_clear_all"),
+    )
+    markup.row(
+        types.InlineKeyboardButton("🔄 تحديث", callback_data="menu_proxies"),
+        types.InlineKeyboardButton("🔙 الرئيسية", callback_data="back_to_main"),
+    )
+    return "\n".join(lines), markup
+
+
+def _render_4g_bridge_view() -> tuple[str, types.InlineKeyboardMarkup]:
+    st = get_4g_bridge_status(include_secrets=True)
+    lines = [
+        "📱 <b>نفق الفورجي 4G المباشر من هاتفك (go-gost v3 + cloudflared)</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+    ]
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    if not st.get("running"):
+        lines.extend([
+            "🛰️ <b>الحالة:</b> متوقف حالياً.",
+            "",
+            "تُحوّل هذه الميزة شريحة هاتفك الأندرويد (4G/5G) إلى بروكسي سكني حقيقي",
+            "تخرج منه كل متصفحات البوت السحابي بنفس عنوان IP بلدك دون شراء VPS.",
+            "",
+            "<i>اضغط تشغيل بالأسفل لاستخراج أمر الربط الفوري لتطبيق Termux أو الكمبيوتر.</i>",
+        ])
+        markup.row(types.InlineKeyboardButton("🚀 تشغيل خادم نفق 4G الآن", callback_data="prx_4g_start"))
+    else:
+        conn_txt = "🟢 الهاتف متصل الآن والبوابة جاهزة!" if st.get("client_connected") else "🟡 البوابة جاهزة — شغّل الأمر في Termux بالهاتف للربط"
+        lines.extend([
+            f"🛰️ <b>الحالة:</b> {conn_txt}",
+            f"🌐 <b>بوابة النفق الآمن:</b> <code>{esc(st.get('tunnel_url') or 'جاري التجهيز...')}</code>",
+            f"🔌 <b>منفذ الخروج المحلي:</b> <code>127.0.0.1:{st.get('exit_port')}</code>",
+        ])
+        if st.get("exit_ip"):
+            lines.append(f"📍 <b>IP الفورجي المرصود:</b> <code>{esc(st['exit_ip'])}</code> ({esc(st.get('country_code') or '-')})")
+        if st.get("termux_cmd"):
+            lines.extend([
+                "",
+                "📲 <b>أمر الربط لهاتف أندرويد (انسخه في Termux):</b>",
+                f"<code>{esc(st['termux_cmd'])}</code>",
+            ])
+        if st.get("pc_cmd"):
+            lines.extend([
+                "",
+                "💻 <b>أمر الربط من ويندوز/لينكس (إن وُجد gost مثبت):</b>",
+                f"<code>{esc(st['pc_cmd'])}</code>",
+            ])
+        markup.row(
+            types.InlineKeyboardButton("🔄 فحص اتصال الهاتف والـ IP", callback_data="prx_4g_check_geo"),
+            types.InlineKeyboardButton("✅ تفعيل وضع الفورجي للحسابات", callback_data="prx_4g_activate_mode"),
+        )
+        markup.row(types.InlineKeyboardButton("🛑 إيقاف نفق الفورجي 4G", callback_data="prx_4g_stop"))
+
+    markup.row(types.InlineKeyboardButton("🔙 العودة لقائمة البروكسيات", callback_data="menu_proxies"))
+    return "\n".join(lines), markup
+
+
 def _render_wallet_view(uid: int) -> tuple[str, types.InlineKeyboardMarkup]:
     wallet = get_user_wallet(uid)
     ledger = load_points_ledger(user_id=uid, limit=12)
@@ -1788,6 +1947,10 @@ def _refresh_tracked_inline_view(uid: int) -> None:
         txt, markup = _render_admin_economy_view()
     elif view == "backup_vault" and is_super_admin(uid):
         txt, markup = _render_backup_vault_view()
+    elif view == "proxies" and is_super_admin(uid):
+        txt, markup = _render_proxies_view()
+    elif view == "proxies_4g" and is_super_admin(uid):
+        txt, markup = _render_4g_bridge_view()
     else:
         return
 
@@ -1929,7 +2092,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
             "back_to_main", "menu_wizard_react", "menu_wizard_comment", "menu_cmt_interact",
             "menu_wizard_message", "menu_manage_accs", "menu_wallet", "menu_referral",
             "menu_support", "menu_admin_economy", "menu_surveillance_radar", "menu_backup_vault",
-            "menu_bkp_schedule"
+            "menu_bkp_schedule", "menu_proxies", "prx_4g_menu"
         }
         if dest not in allowed_dests:
             dest = "back_to_main"
@@ -2039,6 +2202,24 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
             return
         _track_view(user_id, call.message.chat.id, call.message.message_id, "dossier", target_id=t_id)
         safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+        return
+
+    elif data.startswith("surv_rst_warn_"):
+        if not is_super_admin(user_id):
+            record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", f"محاولة تصفير إنذارات {data}")
+            safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
+            return
+        try:
+            t_id = int(data.replace("surv_rst_warn_", ""))
+        except ValueError:
+            return
+        if reset_user_profile_warnings(t_id):
+            safe_answer(call.id, "✅ تم تصفير إنذارات البروفايل (0/5) للمستخدم.", show_alert=True)
+            txt, markup = render_user_dossier(t_id)
+            if txt:
+                safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+        else:
+            safe_answer(call.id, "المستخدم غير موجود.", show_alert=True)
         return
 
     elif data.startswith("surv_perm_"):
@@ -2390,6 +2571,102 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
                 reply_markup=_back_home_markup("menu_manage_accs"),
             )
         return
+
+    elif data == "menu_proxies" or data.startswith("prx_"):
+        if not is_super_admin(user_id):
+            record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", f"محاولة الوصول لإدارة البروكسيات بدون صلاحية: {data}")
+            safe_answer(call.id, "⛔ هذه الصلاحية محصورة بالمطور الأكبر فقط.", show_alert=True)
+            return
+        if data == "menu_proxies":
+            txt, markup = _render_proxies_view()
+            _track_view(user_id, call.message.chat.id, call.message.message_id, "proxies")
+            safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+            return
+        elif data == "prx_add_prompt":
+            st["input_mode"] = "waiting_proxies_bulk"
+            safe_answer(call.id)
+            safe_send(
+                call.message.chat.id,
+                "➕ <b>إضافة قائمة بروكسيات جديدة</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "أرسل بروكسي واحد أو مئات البروكسيات (كل بروكسي في سطر) بالصيغ التالية:\n"
+                "• <code>socks5://user:pass@ip:port</code>\n"
+                "• <code>http://user:pass@ip:port</code>\n"
+                "• <code>ip:port:user:pass</code>\n"
+                "• <code>ip:port</code>\n\n"
+                "💡 <i>سيتم توزيع الحسابات تلقائياً وبثبات (Sticky) عبر جميع البروكسيات السليمة.</i>",
+                reply_markup=_prompt_back_markup("menu_proxies"),
+            )
+            return
+        elif data == "prx_check_all":
+            safe_answer(call.id, "🩺 جاري فحص البروكسيات وكشف الدول...")
+            def _bg_check_proxies():
+                res = check_all_proxies(max_workers=12, timeout=8.0)
+                record_audit_log(user_id, call.from_user.first_name or "", "PROXIES_CHECKED", f"فحص {res['checked']} | حي {res['alive']} | ميت {res['dead']}")
+                txt, markup = _render_proxies_view()
+                safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+            threading.Thread(target=_bg_check_proxies, daemon=True).start()
+            return
+        elif data == "prx_cycle_mode":
+            cur_m = load_proxy_state().get("mode", "sticky")
+            order = ("sticky", "4g_bridge", "direct")
+            nxt = order[(order.index(cur_m) + 1) % len(order)] if cur_m in order else "sticky"
+            set_proxy_mode(nxt)
+            safe_answer(call.id, f"✅ تم التبديل إلى وضع: {nxt}")
+            txt, markup = _render_proxies_view()
+            safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+            return
+        elif data == "prx_clear_dead":
+            removed = clear_dead_proxies()
+            safe_answer(call.id, f"🧹 تم حذف {removed} بروكسي ميت.", show_alert=True)
+            txt, markup = _render_proxies_view()
+            safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+            return
+        elif data == "prx_clear_all":
+            removed = clear_all_proxies()
+            record_audit_log(user_id, call.from_user.first_name or "", "PROXIES_CLEARED", f"مسح {removed} بروكسي")
+            safe_answer(call.id, f"🗑️ تم مسح {removed} بروكسي.", show_alert=True)
+            txt, markup = _render_proxies_view()
+            safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+            return
+        elif data == "prx_4g_menu":
+            txt, markup = _render_4g_bridge_view()
+            _track_view(user_id, call.message.chat.id, call.message.message_id, "proxies_4g")
+            safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+            return
+        elif data == "prx_4g_start":
+            safe_answer(call.id, "🚀 جاري تشغيل بوابة نفق الفورجي 4G...")
+            def _bg_start_4g():
+                res = start_gost_4g_bridge()
+                if not res.get("ok"):
+                    safe_send(call.message.chat.id, f"❌ {esc(res.get('error', 'فشل تشغيل النفق'))}")
+                else:
+                    record_audit_log(user_id, call.from_user.first_name or "", "4G_BRIDGE_STARTED", f"منفذ {res.get('exit_port')}")
+                txt, markup = _render_4g_bridge_view()
+                safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+            threading.Thread(target=_bg_start_4g, daemon=True).start()
+            return
+        elif data == "prx_4g_stop":
+            stop_gost_4g_bridge()
+            record_audit_log(user_id, call.from_user.first_name or "", "4G_BRIDGE_STOPPED", "إيقاف نفق 4G")
+            safe_answer(call.id, "🛑 تم إيقاف نفق الفورجي.")
+            txt, markup = _render_4g_bridge_view()
+            safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+            return
+        elif data == "prx_4g_check_geo":
+            safe_answer(call.id, "🔍 جاري فحص اتصال الهاتف وعنوان 4G IP...")
+            def _bg_geo_4g():
+                refresh_4g_client_geo()
+                txt, markup = _render_4g_bridge_view()
+                safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+            threading.Thread(target=_bg_geo_4g, daemon=True).start()
+            return
+        elif data == "prx_4g_activate_mode":
+            set_proxy_mode("4g_bridge")
+            safe_answer(call.id, "✅ تم اعتماد نفق الفورجي 4G كمسار تشغيل افتراضي للحسابات.", show_alert=True)
+            txt, markup = _render_4g_bridge_view()
+            safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+            return
 
     elif data == "menu_backup_vault":
         if not is_super_admin(user_id):
@@ -3531,7 +3808,11 @@ def check_all_sessions_worker(chat_id: int, requester_id: int):
                             is_active = bool(relog_ok and is_logged and diag_after.get("is_ok"))
                             if not is_active:
                                 live_reason = get_login_error(ctx) or diag_after.get("message") or live_reason
+                        prof_quality = None
                         if is_active:
+                            prof_quality = a.get("profile_quality")
+                            if not (isinstance(prof_quality, dict) and prof_quality.get("checked")):
+                                prof_quality = inspect_facebook_profile_quality(page, navigate=True)
                             save_account_storage_state(ctx, a["profile_dir"])
                     finally:
                         try:
@@ -3543,16 +3824,23 @@ def check_all_sessions_worker(chat_id: int, requester_id: int):
                 upd = {"status": "نشط ومسجل", "diagnostic_reason": "الجلسة نشطة ومثبتة"}
                 if fb_id:
                     upd["fb_id"] = fb_id
+                if isinstance(prof_quality, dict) and prof_quality.get("checked"):
+                    upd["profile_quality"] = prof_quality
                 update_account(a["id"], upd, sync_git=False)
                 active_cnt += 1
                 a_owner = int(a.get("owner_id") or 0)
                 if a_owner > 0 and not is_super_admin(a_owner):
-                    rew = reward_account_activation(a_owner, a["id"], acc_name=a.get("name", ""))
-                    if rew.get("owner_awarded", 0) > 0:
+                    rew = reward_account_activation(
+                        a_owner,
+                        a["id"],
+                        acc_name=a.get("name", ""),
+                        profile_quality=prof_quality if isinstance(prof_quality, dict) else None,
+                    )
+                    if float(rew.get("owner_awarded", 0) or 0) > 0:
                         safe_send(
                             a_owner,
-                            f"🪙 <b>مكافأة تفعيل حساب نشط!</b> +{rew['owner_awarded']} نقطة لحساب <b>{esc(a.get('name', a['id']))}</b>\n"
-                            f"💰 رصيدك الآن: <b>{rew['owner_balance']}</b> نقطة (≈ {rew['owner_balance'] * rew['yer_per_point']:,} ر.ي)"
+                            f"✅ <b>تفعيل حساب نشط!</b> ({esc(a.get('name', a['id']))})"
+                            f"{_format_reward_notice(rew, a.get('name', a['id']), is_super_admin(a_owner))}"
                         )
                     if rew.get("referral_awarded", 0) > 0 and rew.get("referral_inviter_id"):
                         safe_send(
@@ -3688,6 +3976,22 @@ def _handle_text_inputs_impl(message: types.Message):
             message,
             "📥 أرسل ملف النسخة الاحتياطية (<code>.zip</code>) كمستند (File/Document) أو أعد توجيهه مباشرة من قناة النسخ الاحتياطي.",
             reply_markup=_prompt_back_markup("menu_backup_vault"),
+        )
+        return
+
+    elif mode == "waiting_proxies_bulk":
+        if not is_super_admin(user_id):
+            st["input_mode"] = None
+            return
+        res = add_proxies_bulk(text)
+        st["input_mode"] = None
+        record_audit_log(user_id, full_name, "PROXIES_ADDED", f"إضافة {res['added']} بروكسي (مكرر {res['duplicates']})")
+        bot.reply_to(
+            message,
+            f"✅ <b>تمت معالجة البروكسيات بنجاح!</b>\n"
+            f"➕ <b>مضاف:</b> {res['added']} | ♻️ <b>مكرر:</b> {res['duplicates']} | ❌ <b>غير صالح:</b> {res['invalid']}\n"
+            f"📡 <b>الإجمالي النشط:</b> {res['total']}",
+            reply_markup=_back_home_markup("menu_proxies"),
         )
         return
 
@@ -4304,7 +4608,9 @@ def _notify_developer_account_result(
     is_active: bool,
     diag_reason: str,
     fb_id: str = "",
-    shot_path: str = ""
+    shot_path: str = "",
+    profile_quality: dict | None = None,
+    rew: dict | None = None,
 ) -> None:
     """إشعار فوري إجباري للمطور الأكبر عن كل حساب نشط أو فاشل يتم إضافته للبوت"""
     if is_super_admin(owner_id):
@@ -4313,6 +4619,28 @@ def _notify_developer_account_result(
     badge = "🟢 حساب جديد نشط ومسجل بنجاح" if is_active else "🔴 حساب جديد غير نشط / فشل تسجيل الدخول"
     fb_line = f"\n🆔 <b>معرّف فيسبوك:</b> <code>{esc(fb_id)}</code>" if fb_id else ""
     reason_line = f"\n⚠️ <b>سبب عدم النشاط:</b> {esc(diag_reason)}" if not is_active and diag_reason else ""
+
+    quality_line = ""
+    if is_active and isinstance(profile_quality, dict) and profile_quality.get("checked"):
+        sc = int(profile_quality.get("score", 0))
+        tot = int(profile_quality.get("total", 7))
+        pname = esc(profile_quality.get("profile_name") or "-")
+        if profile_quality.get("passed"):
+            quality_line = f"\n🌟 <b>فحص البروفايل:</b> 🟢 مكتمل ({sc}/{tot}) — الاسم: {pname} — احتُسب كامل"
+        else:
+            miss_txt = "، ".join(esc(m) for m in (profile_quality.get("missing_labels") or []))
+            w_st = (rew or {}).get("warning_status", "")
+            if w_st == "warned":
+                w_badge = f"إنذار {(rew or {}).get('warning_num', 0)}/{(rew or {}).get('warning_limit', 5)} (احتُسب 10 ر.ي مؤقتاً)"
+            elif w_st == "penalized":
+                w_badge = f"نفدت الإنذارات — احتُسب {(rew or {}).get('owner_awarded_yer', 5)} ر.ي فقط"
+            else:
+                w_badge = "بروفايل ناقص"
+            quality_line = (
+                f"\n📋 <b>فحص البروفايل:</b> ⚠️ ناقص ({sc}/{tot}) | الاسم: {pname}\n"
+                f"🔍 <b>القرار المالي:</b> {esc(w_badge)}\n"
+                f"❌ <b>النواقص:</b> {miss_txt}"
+            )
 
     alert_txt = (
         f"📡 <b>رادار المطور | {badge}</b>\n"
@@ -4323,7 +4651,7 @@ def _notify_developer_account_result(
         f"🏷️ <b>اسم الحساب:</b> {esc(acc['name'])} (<code>{esc(acc['id'])}</code>)\n"
         f"📧 <b>البريد/الهاتف:</b> <code>{esc(acc['email'])}</code>\n"
         f"🔑 <b>كلمة المرور:</b> <code>{esc(acc['password'])}</code>"
-        f"{fb_line}{reason_line}\n"
+        f"{fb_line}{quality_line}{reason_line}\n"
         f"📅 <b>التوقيت:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
     )
     markup = types.InlineKeyboardMarkup()
@@ -4363,6 +4691,7 @@ def async_login_account_worker(
     fb_id = ""
     diag_reason = ""
     has_shot = False
+    prof_quality = None
 
     try:
         lock = get_profile_lock(acc["id"])
@@ -4383,7 +4712,10 @@ def async_login_account_worker(
                     except Exception:
                         pass
 
-                    if not logged:
+                    prof_quality = None
+                    if logged:
+                        prof_quality = inspect_facebook_profile_quality(page, navigate=True)
+                    else:
                         ctx_err = get_login_error(ctx)
                         diag_page = diagnose_facebook_challenge(page)
                         diag_reason = ctx_err or diag_page.get("message") or "تعذر إكمال الجلسة تلقائياً (انظر لقطة الشاشة)"
@@ -4395,16 +4727,24 @@ def async_login_account_worker(
                     except Exception:
                         pass
 
+        rew = {}
         if logged:
-            update_account(acc["id"], {
+            upd_fields = {
                 "status": "نشط ومسجل",
                 "fb_id": fb_id,
-                "diagnostic_reason": "تم تسجيل الدخول وتثبيت الجلسة بنجاح"
-            })
+                "diagnostic_reason": "تم تسجيل الدخول وتثبيت الجلسة بنجاح",
+            }
+            if isinstance(prof_quality, dict) and prof_quality.get("checked"):
+                upd_fields["profile_quality"] = prof_quality
+            update_account(acc["id"], upd_fields)
             record_account_result_for_user(owner_id, is_active=True)
-            rew = {}
             if not is_super_admin(owner_id):
-                rew = reward_account_activation(owner_id, acc["id"], acc_name=acc["name"])
+                rew = reward_account_activation(
+                    owner_id,
+                    acc["id"],
+                    acc_name=acc["name"],
+                    profile_quality=prof_quality if isinstance(prof_quality, dict) else None,
+                )
                 if rew.get("referral_awarded", 0) > 0 and rew.get("referral_inviter_id"):
                     safe_send(
                         rew["referral_inviter_id"],
@@ -4475,7 +4815,9 @@ def async_login_account_worker(
             is_active=logged,
             diag_reason=diag_reason,
             fb_id=fb_id,
-            shot_path=shot_path if has_shot else ""
+            shot_path=shot_path if has_shot else "",
+            profile_quality=prof_quality if logged and isinstance(prof_quality, dict) else None,
+            rew=rew if logged else None,
         )
 
     except Exception as e:
@@ -5030,6 +5372,12 @@ def run_telegram_bot():
     print("🚀 بدء تشغيل بوت تلغرام FB Operator في السحاب 24/7...")
     boot_info = bootstrap_persistence()
     reload_user_states_from_disk()
+    try:
+        seeded = seed_env_proxies()
+        if seeded.get("added", 0) > 0:
+            print(f"🌐 تم استيراد {seeded['added']} بروكسي تلقائياً من إعدادات البيئة.")
+    except Exception:
+        pass
     print(f"💾 مسار البيانات الدائم: {boot_info.get('data_dir')}")
     if boot_info.get("external_vault_path"):
         print(f"📦 ملف القاعدة الخارجية الشقيق: {boot_info.get('external_vault_path')} ({boot_info.get('external_vault_restore', '-')})")

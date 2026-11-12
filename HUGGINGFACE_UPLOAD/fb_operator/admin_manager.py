@@ -85,16 +85,28 @@ def _safe_nonneg_int(val, default: int = 0) -> int:
         return default
 
 
+def safe_nonneg_points(val, default: int | float = 0) -> int | float:
+    """تنظيف رصيد النقاط مع دعم الكسور الدقيقة (مثل 0.5 نقطة = 5 ريال) وإرجاع int متى ما كان عدداً صحيحاً."""
+    try:
+        v = round(max(0.0, float(val)), 2)
+        if abs(v - int(v)) < 1e-9:
+            return int(v)
+        return v
+    except Exception:
+        return default
+
+
 def _ensure_wallet_fields(u: dict) -> None:
-    u["points"] = _safe_nonneg_int(u.get("points", 0))
-    u["total_points_earned"] = _safe_nonneg_int(u.get("total_points_earned", 0))
-    u["total_points_spent"] = _safe_nonneg_int(u.get("total_points_spent", 0))
+    u["points"] = safe_nonneg_points(u.get("points", 0))
+    u["total_points_earned"] = safe_nonneg_points(u.get("total_points_earned", 0))
+    u["total_points_spent"] = safe_nonneg_points(u.get("total_points_spent", 0))
     u["total_yer_settled"] = _safe_nonneg_int(u.get("total_yer_settled", 0))
     u["referred_by"] = _safe_nonneg_int(u.get("referred_by", 0))
     u["referral_code_used"] = str(u.get("referral_code_used") or "")[:40]
     u["referral_rewarded"] = bool(u.get("referral_rewarded", False))
     u["referred_count"] = _safe_nonneg_int(u.get("referred_count", 0))
     u["ref_code"] = str(u.get("ref_code") or "")[:32]
+    u["profile_warnings_used"] = _safe_nonneg_int(u.get("profile_warnings_used", 0))
 
 
 def _build_super_profile(existing: dict | None = None) -> dict:
@@ -112,9 +124,9 @@ def _build_super_profile(existing: dict | None = None) -> dict:
         "operations_count": existing.get("operations_count", 0),
         "active_accounts_added": existing.get("active_accounts_added", 0),
         "inactive_accounts_added": existing.get("inactive_accounts_added", 0),
-        "points": _safe_nonneg_int(existing.get("points", 0)),
-        "total_points_earned": _safe_nonneg_int(existing.get("total_points_earned", 0)),
-        "total_points_spent": _safe_nonneg_int(existing.get("total_points_spent", 0)),
+        "points": safe_nonneg_points(existing.get("points", 0)),
+        "total_points_earned": safe_nonneg_points(existing.get("total_points_earned", 0)),
+        "total_points_spent": safe_nonneg_points(existing.get("total_points_spent", 0)),
         "total_yer_settled": _safe_nonneg_int(existing.get("total_yer_settled", 0)),
         "referred_by": 0,
         "referral_code_used": "",
@@ -548,3 +560,20 @@ def remove_sub_admin(user_id: int):
 
 def toggle_permission(user_id: int, permission: str):
     return toggle_user_permission(user_id, permission)
+
+
+def reset_user_profile_warnings(target_uid: int) -> bool:
+    """تصفير عداد إنذارات نقص جودة البروفايل للمستخدم بواسطة المطور الأكبر."""
+    tid = str(int(target_uid))
+    u_name = ""
+    with _users_lock:
+        users = load_users()
+        u = users.get(tid)
+        if not isinstance(u, dict):
+            return False
+        u_name = str(u.get("name", ""))
+        u["profile_warnings_used"] = 0
+        save_users(users, sync_git=True)
+    record_audit_log(int(target_uid), u_name, "WARNINGS_RESET", "تصفير إنذارات البروفايل (0/5)")
+    publish_event("users", int(target_uid), "warnings_reset")
+    return True

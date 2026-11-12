@@ -593,7 +593,7 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                     eco_cfg = eco.load_economy_settings()
                     rate_yer = eco_cfg["yer_per_point"]
                     u_perms = u_dict.get("permissions", {})
-                    u_pts = int(u_dict.get("points", 0))
+                    u_pts = adm.safe_nonneg_points(u_dict.get("points", 0))
                     radar_users.append({
                         "id": t_uid,
                         "name": u_dict.get("name", ""),
@@ -604,10 +604,11 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                         "active_accounts_added": u_dict.get("active_accounts_added", 0),
                         "inactive_accounts_added": u_dict.get("inactive_accounts_added", 0),
                         "points": u_pts,
-                        "yer_value": u_pts * rate_yer,
-                        "total_points_earned": int(u_dict.get("total_points_earned", 0)),
-                        "total_points_spent": int(u_dict.get("total_points_spent", 0)),
+                        "yer_value": int(round(float(u_pts) * rate_yer)),
+                        "total_points_earned": adm.safe_nonneg_points(u_dict.get("total_points_earned", 0)),
+                        "total_points_spent": adm.safe_nonneg_points(u_dict.get("total_points_spent", 0)),
                         "total_yer_settled": int(u_dict.get("total_yer_settled", 0)),
+                        "profile_warnings_used": int(u_dict.get("profile_warnings_used", 0)),
                         "referred_by": int(u_dict.get("referred_by") or 0),
                         "referred_count": int(u_dict.get("referred_count", 0)),
                         "referral_rewarded": bool(u_dict.get("referral_rewarded", False)),
@@ -1228,7 +1229,7 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                     amt = None if (raw_amt is None or str(raw_amt).lower() == "all") else None
                     if raw_amt not in (None, "", "all"):
                         try:
-                            amt = int(raw_amt)
+                            amt = adm.safe_nonneg_points(float(raw_amt))
                         except Exception:
                             self._send_json(400, {"error": "قيمة النقاط للتصفية غير صالحة."})
                             return
@@ -1246,9 +1247,9 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                     return
 
                 try:
-                    amount = int(body.get("amount"))
+                    amount = adm.safe_nonneg_points(float(body.get("amount")))
                 except Exception:
-                    self._send_json(400, {"error": "أدخل عدداً صحيحاً من النقاط."})
+                    self._send_json(400, {"error": "أدخل عدداً صالحاً من النقاط."})
                     return
                 if amount <= 0:
                     self._send_json(400, {"error": "عدد النقاط يجب أن يكون أكبر من الصفر."})
