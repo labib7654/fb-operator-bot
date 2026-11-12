@@ -51,6 +51,31 @@ _sessions: dict[str, "HITLSession"] = {}
 _on_verified_callback: Callable[[str, str, int], None] | None = None
 _mission_waiters_lock = threading.Lock()
 _mission_waiters: dict[str, dict[str, Any]] = {}
+_challenge_urls_lock = threading.Lock()
+_challenge_urls: dict[str, tuple[float, str]] = {}
+
+
+def record_hitl_challenge_url(acc_id: str, url: str) -> None:
+    """حفظ آخر رابط تحدٍ/تحقق وصل له الحساب لاستكماله فوراً داخل الشاشة الحية"""
+    clean = str(url or "").strip()
+    low = clean.lower()
+    if not acc_id or "facebook.com" not in low:
+        return
+    if any(x in low for x in ("login.php", "/login/", "login/?next=")):
+        return
+    with _challenge_urls_lock:
+        _challenge_urls[str(acc_id)] = (time.time(), clean[:400])
+
+
+def pop_hitl_challenge_url(acc_id: str, max_age_sec: float = 600.0) -> str:
+    with _challenge_urls_lock:
+        item = _challenge_urls.pop(str(acc_id), None)
+    if not item:
+        return ""
+    ts, url = item
+    if (time.time() - ts) <= max_age_sec:
+        return url
+    return ""
 
 
 def register_mission_hitl_waiter(acc_id: str, owner_uid: int, reason: str = "") -> threading.Event:
@@ -150,7 +175,12 @@ class HITLSession:
     frame_seq: int = 0
     mode: str = "mobile"
     viewport: tuple[int, int] = HITL_MOBILE_VIEWPORT
+    frame_cond: threading.Condition = field(default_factory=lambda: threading.Condition(threading.Lock()))
     _stop_event: threading.Event = field(default_factory=threading.Event)
+
+    def notify_frame(self) -> None:
+        with self.frame_cond:
+            self.frame_cond.notify_all()
 
     def touch(self) -> None:
         self.last_activity = time.time()
@@ -180,14 +210,28 @@ class HITLSession:
 
 def _safe_capture_jpeg_b64(page) -> str:
     try:
-        raw = page.screenshot(type="jpeg", quality=85)
+        raw = page.screenshot(type="jpeg", quality=76)
         return "data:image/jpeg;base64," + base64.b64encode(raw).decode("ascii")
     except Exception:
         return ""
 
 
+def _dispatch_real_click(page, x: float, y: float) -> None:
+    """تمرير نقرة حقيقية عابرة لإطارات التحقق (OOPIF مثل Arkose/reCAPTCHA) وعناصر React"""
+    try:
+        if hasattr(page.mouse, "move") and hasattr(page.mouse, "down") and hasattr(page.mouse, "up"):
+            page.mouse.move(x, y, steps=4)
+            page.mouse.down()
+            time.sleep(0.055)
+            page.mouse.up()
+            return
+    except Exception:
+        pass
+    page.mouse.click(x, y)
+
+
 def _hitl_worker(session: HITLSession, acc: dict) -> None:
-    """الخيط الوحيد المالك لـ Playwright لهذه الجلسة (يمنع greenlet cross-thread error نهائياً)."""
+    """الخيط الوحيد المالك لـ Playwright لهذه الجلسة (يبث الإطارات حياً عبر CDP Screencast بدون Cross-Thread Error)."""
     acc_id = session.acc_id
     lock = get_profile_lock(acc_id)
     email = str(acc.get("email") or "").strip()
@@ -201,24 +245,67 @@ def _hitl_worker(session: HITLSession, acc: dict) -> None:
         proxy_uri = str(proxy_res.get("raw_uri") or "")
         with lock, proxy_execution_guard(proxy_uri, min_gap_sec=0.0):
             with sync_playwright() as p:
+                # نحافظ على بصمة Desktop Chrome المتطابقة مع تسجيل الدخول والمهام لتفادي إبطال فيسبوك للجلسة
                 ctx = launch_account_browser(
                     p,
                     acc["profile_dir"],
                     visible=False,
                     viewport_size=session.viewport,
-                    mobile=(session.mode == "mobile"),
+                    mobile=False,
                     proxy=acc.get("proxy"),
                 )
+                cdp = None
+                last_cdp_frame_ts = [0.0]
                 try:
                     page = ctx.pages[0] if ctx.pages else ctx.new_page()
-                    page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=45000)
-                    time.sleep(1.5)
+                    try:
+                        cdp = ctx.new_cdp_session(page)
+
+                        def _on_screencast_frame(params):
+                            b64 = params.get("data") or ""
+                            sid = params.get("sessionId")
+                            if b64:
+                                with session.state_lock:
+                                    session.frame_b64 = "data:image/jpeg;base64," + b64
+                                    session.frame_seq += 1
+                                    session.ready = True
+                                last_cdp_frame_ts[0] = time.time()
+                                session.notify_frame()
+                            if sid is not None and cdp is not None:
+                                try:
+                                    cdp.send("Page.screencastFrameAck", {"sessionId": sid})
+                                except Exception:
+                                    pass
+
+                        cdp.on("Page.screencastFrame", _on_screencast_frame)
+                        cdp.send(
+                            "Page.startScreencast",
+                            {
+                                "format": "jpeg",
+                                "quality": 68,
+                                "maxWidth": int(max(session.viewport[0], HITL_DESKTOP_VIEWPORT[0])),
+                                "maxHeight": int(max(session.viewport[1], HITL_DESKTOP_VIEWPORT[1])),
+                                "everyNthFrame": 1,
+                            },
+                        )
+                    except Exception:
+                        cdp = None
+
+                    resume_url = pop_hitl_challenge_url(acc_id)
+                    target_url = resume_url if resume_url else "https://www.facebook.com/"
+                    try:
+                        page.goto(target_url, wait_until="domcontentloaded", timeout=45000)
+                    except Exception:
+                        if target_url != "https://www.facebook.com/":
+                            page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=45000)
+                    time.sleep(1.2)
                     dismiss_dialogs(page)
 
-                    def _refresh_state() -> bool:
+                    def _refresh_state(force_shot: bool = False) -> bool:
                         diag = diagnose_facebook_challenge(page)
                         is_logged, fb_id = check_facebook_login_cookies(ctx)
-                        frame = _safe_capture_jpeg_b64(page)
+                        cdp_recent = (time.time() - last_cdp_frame_ts[0]) < 1.2
+                        frame = _safe_capture_jpeg_b64(page) if (force_shot or not cdp_recent) else ""
                         curr_url = ""
                         try:
                             curr_url = str(page.url or "")[:180]
@@ -240,15 +327,33 @@ def _hitl_worker(session: HITLSession, acc: dict) -> None:
                                 session.fb_id = fb_id
                                 session.challenge_code = "ok"
                                 session.challenge_message = "تم تسجيل الدخول وتثبيت الجلسة بنجاح!"
+                                session.notify_frame()
                                 return True
+                        session.notify_frame()
                         return False
 
-                    if _refresh_state():
+                    if _refresh_state(force_shot=True):
                         save_account_storage_state(ctx, acc["profile_dir"])
                         if _on_verified_callback:
                             _on_verified_callback(acc_id, session.fb_id, session.started_by)
-                        time.sleep(2.0)
+                        time.sleep(1.5)
                         return
+
+                    # إذا فتح المتصفح على شاشة تسجيل دخول فارغة وتوفرت بيانات الحساب، نسجل الدخول تلقائياً ليهبط المستخدم على التحقق مباشرة
+                    if session.has_credentials and session.challenge_code in ("full_login", "password_only"):
+                        with session.state_lock:
+                            session.challenge_message = "جاري إدخال بيانات الحساب تلقائياً للوصول مباشرةً لشاشة التحقق..."
+                        session.notify_frame()
+                        try:
+                            auto_login_facebook(ctx, page, email, real_pass, max_wait=24)
+                        except Exception:
+                            pass
+                        if _refresh_state(force_shot=True):
+                            save_account_storage_state(ctx, acc["profile_dir"])
+                            if _on_verified_callback:
+                                _on_verified_callback(acc_id, session.fb_id, session.started_by)
+                            time.sleep(1.5)
+                            return
 
                     last_capture = time.time()
                     while not session._stop_event.is_set():
@@ -256,22 +361,22 @@ def _hitl_worker(session: HITLSession, acc: dict) -> None:
                         if (now - session.created_at) >= HITL_MAX_TTL_SEC:
                             with session.state_lock:
                                 session.error = "انتهى الحد الأقصى لجلسة الشاشة الحية (5 دقائق)."
+                            session.notify_frame()
                             break
                         if (now - session.last_activity) >= HITL_INACTIVITY_TTL_SEC:
                             with session.state_lock:
                                 session.error = "أُغلقت الشاشة الحية تلقائياً لعدم التفاعل (3 دقائق)."
+                            session.notify_frame()
                             break
                         if len(ctx.pages) == 0:
                             break
 
-                        processed_cmd = False
                         try:
-                            cmd_obj = session.cmd_queue.get(timeout=0.35)
+                            cmd_obj = session.cmd_queue.get_nowait()
                         except queue.Empty:
                             cmd_obj = None
 
                         if cmd_obj is not None:
-                            processed_cmd = True
                             session.touch()
                             ev = cmd_obj.get("event")
                             ctype = cmd_obj.get("cmd")
@@ -286,14 +391,31 @@ def _hitl_worker(session: HITLSession, acc: dict) -> None:
                                     vw, vh = session.viewport
                                     x = max(1.0, min(float(vw - 1), float(cmd_obj.get("x") or 0)))
                                     y = max(1.0, min(float(vh - 1), float(cmd_obj.get("y") or 0)))
-                                    if session.mode == "mobile":
-                                        try:
-                                            page.touchscreen.tap(x, y)
-                                        except Exception:
-                                            page.mouse.click(x, y)
-                                    else:
-                                        page.mouse.click(x, y)
-                                    time.sleep(0.45)
+                                    _dispatch_real_click(page, x, y)
+                                    try:
+                                        page.wait_for_timeout(250)
+                                    except Exception:
+                                        time.sleep(0.25)
+                                elif ctype == "drag":
+                                    vw, vh = session.viewport
+                                    x1 = max(1.0, min(float(vw - 1), float(cmd_obj.get("x1") or 0)))
+                                    y1 = max(1.0, min(float(vh - 1), float(cmd_obj.get("y1") or 0)))
+                                    x2 = max(1.0, min(float(vw - 1), float(cmd_obj.get("x2") or 0)))
+                                    y2 = max(1.0, min(float(vh - 1), float(cmd_obj.get("y2") or 0)))
+                                    try:
+                                        page.mouse.move(x1, y1, steps=2)
+                                        page.mouse.down()
+                                        page.mouse.move(x2, y2, steps=10)
+                                        time.sleep(0.05)
+                                        page.mouse.up()
+                                    except Exception:
+                                        pass
+                                    try:
+                                        page.wait_for_timeout(250)
+                                    except Exception:
+                                        time.sleep(0.25)
+                                elif ctype == "check_now":
+                                    save_account_storage_state(ctx, acc["profile_dir"], save_pending=True)
                                 elif ctype == "set_mode":
                                     new_mode = "desktop" if str(cmd_obj.get("mode") or "") == "desktop" else "mobile"
                                     new_vp = HITL_DESKTOP_VIEWPORT if new_mode == "desktop" else HITL_MOBILE_VIEWPORT
@@ -301,15 +423,21 @@ def _hitl_worker(session: HITLSession, acc: dict) -> None:
                                         session.mode = new_mode
                                         session.viewport = new_vp
                                     page.set_viewport_size({"width": new_vp[0], "height": new_vp[1]})
-                                    time.sleep(0.5)
+                                    try:
+                                        page.wait_for_timeout(350)
+                                    except Exception:
+                                        time.sleep(0.35)
                                 elif ctype == "type":
                                     txt = str(cmd_obj.get("text") or "")[:300]
                                     if txt:
                                         page.keyboard.insert_text(txt)
                                         if cmd_obj.get("submit"):
-                                            time.sleep(0.25)
+                                            time.sleep(0.2)
                                             page.keyboard.press("Enter")
-                                        time.sleep(0.5)
+                                        try:
+                                            page.wait_for_timeout(350)
+                                        except Exception:
+                                            time.sleep(0.35)
                                 elif ctype == "otp":
                                     code = str(cmd_obj.get("code") or "").strip()[:24]
                                     if code:
@@ -345,18 +473,18 @@ def _hitl_worker(session: HITLSession, acc: dict) -> None:
                                     k = str(cmd_obj.get("key") or "")
                                     if k in ALLOWED_KEYS:
                                         page.keyboard.press(k)
-                                        time.sleep(0.4)
+                                        time.sleep(0.3)
                                 elif ctype == "scroll":
                                     dy = max(-900, min(900, int(cmd_obj.get("dy") or 300)))
                                     page.mouse.wheel(0, dy)
-                                    time.sleep(0.35)
+                                    time.sleep(0.25)
                                 elif ctype == "reload":
                                     page.reload(wait_until="domcontentloaded", timeout=30000)
-                                    time.sleep(1.0)
+                                    time.sleep(0.9)
                                 elif ctype == "prefill_creds":
                                     if email and real_pass:
                                         try:
-                                            auto_login_facebook(ctx, page, email, real_pass, max_wait=12)
+                                            auto_login_facebook(ctx, page, email, real_pass, max_wait=20)
                                         except Exception:
                                             pass
                             except Exception as ce:
@@ -365,7 +493,7 @@ def _hitl_worker(session: HITLSession, acc: dict) -> None:
                             finally:
                                 try:
                                     last_capture = time.time()
-                                    did_complete = _refresh_state()
+                                    did_complete = _refresh_state(force_shot=True)
                                 except Exception:
                                     did_complete = False
                                 if ev:
@@ -375,34 +503,46 @@ def _hitl_worker(session: HITLSession, acc: dict) -> None:
                                 save_account_storage_state(ctx, acc["profile_dir"])
                                 if _on_verified_callback:
                                     _on_verified_callback(acc_id, session.fb_id, session.started_by)
-                                time.sleep(1.8)
+                                time.sleep(1.5)
                                 break
                             continue
 
-                        if (time.time() - last_capture) >= 1.35:
+                        # ضخ حلقة أحداث Playwright لاستقبال إطارات CDP Screencast لحظياً بدون حجب الخيط
+                        try:
+                            page.wait_for_timeout(110)
+                        except Exception:
+                            time.sleep(0.11)
+
+                        if (time.time() - last_capture) >= 1.2:
                             last_capture = time.time()
-                            if _refresh_state():
+                            if _refresh_state(force_shot=False):
                                 save_account_storage_state(ctx, acc["profile_dir"])
                                 if _on_verified_callback:
                                     _on_verified_callback(acc_id, session.fb_id, session.started_by)
-                                time.sleep(1.8)
+                                time.sleep(1.5)
                                 break
                 finally:
                     try:
-                        if session.completed:
-                            save_account_storage_state(ctx, acc["profile_dir"])
+                        if cdp is not None:
+                            try:
+                                cdp.send("Page.stopScreencast")
+                            except Exception:
+                                pass
+                        save_account_storage_state(ctx, acc["profile_dir"], save_pending=True)
                         ctx.close()
                     except Exception:
                         pass
     except Exception as e:
         with session.state_lock:
             session.error = f"خطأ أثناء فتح الشاشة الحية: {str(e)[:160]}"
+        session.notify_frame()
     finally:
         with session.state_lock:
             session.running = False
             session.ready = True
             completed_flag = bool(session.completed)
             verified_fb_id = str(session.fb_id or "")
+        session.notify_frame()
         with _hitl_lock:
             if _sessions.get(acc_id) is session:
                 _sessions.pop(acc_id, None)
@@ -469,6 +609,27 @@ def get_hitl_state(acc_id: str) -> dict[str, Any] | None:
         return sess.snapshot_dict()
 
 
+def wait_for_hitl_frame(acc_id: str, since_seq: int = -1, timeout: float = 12.0) -> dict[str, Any] | None:
+    """انتظار وصول إطار CDP جديد أو انتهاء الجلسة بآلية Event-Driven دون استهلاك معالج"""
+    with _hitl_lock:
+        sess = _sessions.get(acc_id)
+    if not sess:
+        return None
+    sess.touch()
+    deadline = time.time() + max(0.5, min(20.0, float(timeout or 12.0)))
+    with sess.frame_cond:
+        while True:
+            with sess.state_lock:
+                changed = (sess.frame_seq != since_seq) or (not sess.running) or sess.completed or bool(sess.error)
+            if changed:
+                break
+            rem = deadline - time.time()
+            if rem <= 0:
+                break
+            sess.frame_cond.wait(timeout=rem)
+    return sess.snapshot_dict()
+
+
 def send_hitl_input(acc_id: str, payload: dict[str, Any], wait_sec: float = 4.0) -> dict[str, Any]:
     with _hitl_lock:
         sess = _sessions.get(acc_id)
@@ -490,6 +651,21 @@ def send_hitl_input(acc_id: str, payload: dict[str, Any], wait_sec: float = 4.0)
             x = float(payload.get("x") or 0)
             y = float(payload.get("y") or 0)
         cmd.update({"cmd": "click", "x": x, "y": y})
+    elif action == "drag":
+        vw, vh = sess.viewport
+        try:
+            x1 = float(payload.get("x1_norm")) * vw
+            y1 = float(payload.get("y1_norm")) * vh
+            x2 = float(payload.get("x2_norm")) * vw
+            y2 = float(payload.get("y2_norm")) * vh
+        except Exception:
+            x1 = float(payload.get("x1") or 0)
+            y1 = float(payload.get("y1") or 0)
+            x2 = float(payload.get("x2") or 0)
+            y2 = float(payload.get("y2") or 0)
+        cmd.update({"cmd": "drag", "x1": x1, "y1": y1, "x2": x2, "y2": y2})
+    elif action == "check_now":
+        cmd.update({"cmd": "check_now"})
     elif action == "set_mode":
         cmd.update({"cmd": "set_mode", "mode": str(payload.get("mode") or "mobile")})
     elif action == "type":

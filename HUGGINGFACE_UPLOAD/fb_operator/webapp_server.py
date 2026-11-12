@@ -767,6 +767,30 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                     self._send_json(200, {"ok": True, **st_hitl})
                 return
 
+            if path == "/api/hitl/wait":
+                auth = self._authenticate(touch_login=False)
+                if not auth:
+                    return
+                uid, tg_user, user_rec = auth
+                if not self._require_approved(uid, tg_user, user_rec):
+                    return
+                is_dev = hooks["is_super_admin"](uid)
+                perms = {k: True for k in hooks["PERMISSION_LABELS"]} if is_dev else hooks["get_user_permissions"](uid)
+                qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                acc_id = (qs.get("acc_id") or qs.get("account_id") or [""])[0]
+                if not self._authorize_hitl_acc(uid, tg_user, is_dev, perms, acc_id):
+                    return
+                try:
+                    since_seq = int((qs.get("since") or ["-1"])[0])
+                except Exception:
+                    since_seq = -1
+                st_wait = hitl.wait_for_hitl_frame(acc_id, since_seq=since_seq, timeout=12.0)
+                if not st_wait:
+                    self._send_json(200, {"ok": True, "running": False, "acc_id": acc_id})
+                else:
+                    self._send_json(200, {"ok": True, **st_wait})
+                return
+
             if path == "/api/accounts/list":
                 auth = self._authenticate(touch_login=False)
                 if not auth:

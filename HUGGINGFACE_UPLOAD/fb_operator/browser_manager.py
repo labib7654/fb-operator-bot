@@ -110,12 +110,17 @@ def _resolve_session_file(profile_dir_or_id: str | Path) -> Path:
     return (_get_sessions_dir() / f"{name}.json").resolve()
 
 
-def save_account_storage_state(context: BrowserContext, profile_dir_or_id: str | Path | None = None) -> bool:
-    """حفظ حالة الجلسة كاملة (Cookies + LocalStorage) خارج مجلد الكود لاستعادة الدخول الفوري بعد التحديثات"""
+def save_account_storage_state(
+    context: BrowserContext,
+    profile_dir_or_id: str | Path | None = None,
+    save_pending: bool = True,
+) -> bool:
+    """حفظ حالة الجلسة كاملة (Cookies + LocalStorage) خارج مجلد الكود مع حفظ الكوكيز المعلقة للتحقق دون مساس بالجلسات النشطة"""
     target = profile_dir_or_id or _CTX_PROFILES.get(id(context))
     if not target:
         return False
     session_file = _resolve_session_file(target)
+    pending_file = session_file.with_suffix(".pending.json")
     try:
         if hasattr(context, "storage_state"):
             state = context.storage_state()
@@ -124,11 +129,22 @@ def save_account_storage_state(context: BrowserContext, profile_dir_or_id: str |
         cookies = state.get("cookies", []) if isinstance(state, dict) else []
         has_c_user = any(str(c.get("name", "")) == "c_user" and str(c.get("value", "")).strip() for c in cookies)
         if not has_c_user:
+            # نحفظ الكوكيز الوسيطة (checkpoint/datr/fr) في ملف معلق منفصل فقط دون استبدال أي جلسة نشطة سابقة
+            if save_pending and cookies:
+                pending_file.parent.mkdir(parents=True, exist_ok=True)
+                tmp_p = pending_file.with_suffix(".pending.tmp")
+                tmp_p.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+                os.replace(tmp_p, pending_file)
             return False
         session_file.parent.mkdir(parents=True, exist_ok=True)
         tmp_file = session_file.with_suffix(".tmp")
         tmp_file.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
         os.replace(tmp_file, session_file)
+        if pending_file.exists():
+            try:
+                pending_file.unlink()
+            except Exception:
+                pass
         try:
             from fb_operator import persistence_manager as _pm
             _pm.notify_data_changed("session_saved")
@@ -140,13 +156,18 @@ def save_account_storage_state(context: BrowserContext, profile_dir_or_id: str |
 
 
 def restore_account_storage_state(context: BrowserContext, profile_dir_or_id: str | Path) -> bool:
-    """استعادة الجلسة المحفوظة (cookies + localStorage origins) إلى المتصفح قبل التوجه إلى فيسبوك"""
+    """استعادة الجلسة المحفوظة (أو الكوكيز المعلقة أثناء التحدي) إلى المتصفح قبل التوجه إلى فيسبوك"""
     session_file = _resolve_session_file(profile_dir_or_id)
-    if not session_file.exists():
+    pending_file = session_file.with_suffix(".pending.json")
+    src_file = session_file if session_file.exists() else (pending_file if pending_file.exists() else None)
+    if src_file is None:
         return False
     try:
-        data = json.loads(session_file.read_text(encoding="utf-8"))
+        data = json.loads(src_file.read_text(encoding="utf-8"))
         cookies = data.get("cookies", []) if isinstance(data, dict) else []
+        if not cookies and src_file is session_file and pending_file.exists():
+            data = json.loads(pending_file.read_text(encoding="utf-8"))
+            cookies = data.get("cookies", []) if isinstance(data, dict) else []
         valid_cookies = []
         for c in cookies:
             if not isinstance(c, dict) or not c.get("name") or c.get("value") is None:
@@ -1103,6 +1124,7 @@ def auto_login_facebook(context: BrowserContext, page: Page, email: str, passwor
             return True
 
         if diag["code"] in ("recaptcha", "arkose", "suspended", "wrong_password"):
+            save_account_storage_state(context)
             set_login_error(context, diag["message"])
             log(f"[-] {diag['message']}")
             return False
@@ -1113,6 +1135,7 @@ def auto_login_facebook(context: BrowserContext, page: Page, email: str, passwor
                 warned_2fa = True
             # بعد مرور 6 ثوانٍ على شاشة التحقق في السحابة بدون حل، نتوقف فوراً ليتمكن المستخدم من حله عبر الشاشة الحية/OTP
             if time.time() - start_time >= 6.0 and not visible_page_has_live_human(context):
+                save_account_storage_state(context)
                 set_login_error(context, diag["message"])
                 return False
 

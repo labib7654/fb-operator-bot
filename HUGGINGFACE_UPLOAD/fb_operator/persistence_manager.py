@@ -266,6 +266,7 @@ def default_backup_settings() -> dict:
         "channel_id": None,
         "channel_title": "",
         "enabled": True,
+        "dm_enabled": True,
         "interval_seconds": 3600,
         "interval_label": "كل 1 ساعة",
         "on_change": False,
@@ -293,6 +294,7 @@ def load_backup_settings() -> dict:
         cfg["interval_seconds"] = sec
         cfg["interval_label"] = format_backup_interval(sec)
         cfg["enabled"] = bool(cfg.get("enabled", True))
+        cfg["dm_enabled"] = bool(cfg.get("dm_enabled", True))
         cfg["on_change"] = bool(cfg.get("on_change", False))
         cfg["channel_backup_count"] = int(cfg.get("channel_backup_count") or 0)
         cfg["last_channel_backup_ts"] = float(cfg.get("last_channel_backup_ts") or 0.0)
@@ -1661,6 +1663,9 @@ def bootstrap_persistence() -> dict:
         or (cdb_res.get("ok") and not cdb_res.get("skipped"))
         or (hf_res.get("ok") and not hf_res.get("skipped"))
     )
+    global _last_tg_vault_ts
+    if _last_tg_vault_ts <= 0.0:
+        _last_tg_vault_ts = time.time()
     return {
         "restored": restored_ok,
         "data_dir": str(_cfg.DATA_DIR),
@@ -1742,6 +1747,23 @@ def send_backup_to_channel(bot, channel_id=None, trigger_label: str = "يدوي"
             err_msg = str(e)[:250]
             save_backup_settings({"last_error": err_msg}, mark_dirty=False)
             return {"ok": False, "error": err_msg}
+
+
+def _is_dm_backup_due(meta: dict, now: float, current_dirty: int, already_synced: int, force: bool, last_dm_ts: float) -> bool:
+    """تحديد استحقاق إرسال نسخة DM للمطور مع الالتزام الصارم بإعدادات الإيقاف والجدولة الزمنية."""
+    if force:
+        return True
+    if not bool(meta.get("enabled", True)) or not bool(meta.get("dm_enabled", True)):
+        return False
+    if current_dirty <= already_synced:
+        return False
+    interval_s = max(MIN_BACKUP_INTERVAL_SEC, int(meta.get("interval_seconds") or 3600))
+    elapsed = now - float(last_dm_ts or 0.0)
+    if elapsed >= interval_s:
+        return True
+    if bool(meta.get("on_change")) and elapsed >= max(60.0, min(float(interval_s), 180.0)):
+        return True
+    return False
 
 
 def flush_cloud_backups(bot=None, super_admin_id: int = 0, force: bool = False, skip_tg_dm: bool = False) -> None:

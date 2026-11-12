@@ -137,6 +137,7 @@ from fb_operator.hitl_manager import (
     wait_for_mission_hitl,
     get_mission_hitl_waiter,
     clear_mission_hitl_waiter,
+    record_hitl_challenge_url,
 )
 from fb_operator.economy_manager import (
     OP_COST_LABELS_AR, load_economy_settings, update_economy_settings,
@@ -6922,7 +6923,13 @@ def execute_mission_worker(chat_id: int, user_id: int):
                                             page_ok = bool(diagnose_facebook_challenge(page).get("is_ok", True))
                                         except Exception:
                                             page_ok = True
-                                    if acc_actions > 0 or (logged and page_ok):
+                                    if hitl_pause_req or challenge_hit_this_acc:
+                                        try:
+                                            record_hitl_challenge_url(acc["id"], getattr(page, "url", ""))
+                                        except Exception:
+                                            pass
+                                        save_account_storage_state(ctx, acc["profile_dir"])
+                                    elif acc_actions > 0 or (logged and page_ok):
                                         save_account_storage_state(ctx, acc["profile_dir"])
                                 except Exception:
                                     pass

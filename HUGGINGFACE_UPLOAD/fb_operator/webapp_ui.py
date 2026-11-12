@@ -542,8 +542,11 @@ def get_miniapp_html() -> str:
             position: relative;
             width: 100%;
             margin: 0 auto;
-            aspect-ratio: 430 / 780;
+            aspect-ratio: 1280 / 800;
             cursor: crosshair;
+            touch-action: none;
+            user-select: none;
+            -webkit-user-select: none;
         }
         .hitl-canvas-wrap.pan-mode {
             cursor: grab;
@@ -558,6 +561,7 @@ def get_miniapp_html() -> str:
             object-fit: fill;
             user-select: none;
             -webkit-user-drag: none;
+            pointer-events: none;
         }
         .hitl-tap-dot {
             position: absolute;
@@ -1137,12 +1141,15 @@ def get_miniapp_html() -> str:
             </div>
         </div>
         <div class="hitl-toolbar">
+            <button type="button" class="btn btn-ok btn-sm" onclick="hitlAction('check_now')">✅ فحص وحفظ الجلسة</button>
             <button type="button" class="btn btn-muted btn-sm" onclick="hitlScroll(-320)">أعلى</button>
             <button type="button" class="btn btn-muted btn-sm" onclick="hitlScroll(320)">أسفل</button>
+            <button type="button" class="btn btn-muted btn-sm" onclick="hitlKey('Tab')">Tab</button>
+            <button type="button" class="btn btn-muted btn-sm" onclick="hitlKey('Space')">مسافة</button>
             <button type="button" class="btn btn-muted btn-sm" onclick="hitlKey('Enter')">Enter</button>
             <button type="button" class="btn btn-muted btn-sm" onclick="hitlKey('Backspace')">حذف حرف</button>
             <button type="button" class="btn btn-muted btn-sm" onclick="hitlAction('reload')">تحديث الصفحة</button>
-            <button type="button" class="btn btn-muted btn-sm hidden" id="btnHitlPrefill" onclick="hitlAction('prefill_creds')">تعبئة البريد وكلمة المرور</button>
+            <button type="button" class="btn btn-primary btn-sm hidden" id="btnHitlPrefill" onclick="hitlAction('prefill_creds')">🔑 إتمام الدخول التلقائي</button>
         </div>
         <div class="field" style="margin-bottom:0;">
             <label for="hitlTextInput">إرسال نص أو رمز التحقق (2FA / OTP) إلى الصفحة الحية</label>
@@ -2917,22 +2924,23 @@ document.getElementById("inpAccLimit")?.addEventListener("input", renderMissionC
 // =========================================================================
 let hitlActiveAccId = null;
 let hitlPollTimer = null;
+let hitlWaitAbortCtrl = null;
 let hitlLastFrameSeq = -1;
 let hitlZoomScale = 1.0;
 let hitlPanMode = false;
-let hitlViewportMode = "mobile";
+let hitlViewportMode = "desktop";
 
 function hitlSyncControls() {
     const badge = document.getElementById("hitlZoomBadge");
     if (badge) badge.textContent = hitlZoomScale.toFixed(1) + "x";
     const panBtn = document.getElementById("btnHitlPanMode");
-    if (panBtn) panBtn.textContent = hitlPanMode ? "✋ تحريك الشاشة (بدون نقر)" : "👆 اللمس: نقر";
+    if (panBtn) panBtn.textContent = hitlPanMode ? "✋ وضع السحب (اسحب الشاشة)" : "👆 اللمس: نقر فوري";
     const modeBtn = document.getElementById("btnHitlViewportMode");
-    if (modeBtn) modeBtn.textContent = hitlViewportMode === "desktop" ? "📱 وضع الجوال (خط كبير)" : "🖥️ وضع الكمبيوتر";
+    if (modeBtn) modeBtn.textContent = hitlViewportMode === "desktop" ? "📱 عرض ضيق (430px)" : "🖥️ عرض كامل (1280px)";
     const wrap = document.getElementById("hitlCanvasWrap");
     if (wrap) {
         wrap.classList.toggle("pan-mode", hitlPanMode);
-        wrap.style.touchAction = hitlPanMode ? "none" : "pan-x pan-y pinch-zoom";
+        wrap.style.touchAction = "none";
     }
 }
 
@@ -3033,30 +3041,34 @@ function applyHitlSnapshot(st) {
     }
 }
 
-function scheduleNextHitlFrame(accId) {
+function scheduleNextHitlFrame(accId, delayMs = 45) {
     if (hitlPollTimer) {
         clearTimeout(hitlPollTimer);
         hitlPollTimer = null;
     }
     const dlg = document.getElementById("hitlDialog");
     if (!accId || hitlActiveAccId !== accId || !dlg || !dlg.open) return;
-    hitlPollTimer = setTimeout(() => { pollHitlState(accId); }, 1100);
+    hitlPollTimer = setTimeout(() => { pollHitlState(accId); }, Math.max(20, delayMs));
 }
 
 async function openHitlLive(accId, accName) {
     const dlg = document.getElementById("hitlDialog");
     if (!dlg) return;
+    if (hitlWaitAbortCtrl) {
+        try { hitlWaitAbortCtrl.abort(); } catch (_) {}
+        hitlWaitAbortCtrl = null;
+    }
     hitlActiveAccId = accId;
     hitlLastFrameSeq = -1;
     hitlPanMode = false;
-    hitlViewportMode = "mobile";
+    hitlViewportMode = "desktop";
     hitlResetZoom();
     const titleEl = document.getElementById("hitlDialogTitle");
     if (titleEl) {
         titleEl.textContent = "الشاشة الحية: " + (accName ? (accName + " (" + accId + ")") : accId);
     }
     const statusEl = document.getElementById("hitlLiveStatus");
-    if (statusEl) statusEl.textContent = "جاري تشغيل متصفح الحساب وفتح فيسبوك...";
+    if (statusEl) statusEl.textContent = "جاري تشغيل متصفح الحساب والبث الحي (CDP Screencast)...";
     const imgEl = document.getElementById("hitlScreenImg");
     if (imgEl) imgEl.removeAttribute("src");
 
@@ -3064,10 +3076,10 @@ async function openHitlLive(accId, accName) {
         dlg.showModal();
     }
     try {
-        const res = await apiCall("/api/hitl/start", "POST", { account_id: accId, mode: "mobile" });
+        const res = await apiCall("/api/hitl/start", "POST", { account_id: accId, mode: "desktop" });
         applyHitlSnapshot(res);
         if (res && !res.completed && (res.running || !res.ready)) {
-            scheduleNextHitlFrame(accId);
+            scheduleNextHitlFrame(accId, 30);
         }
     } catch (e) {
         if (statusEl) statusEl.textContent = "تعذر تشغيل الشاشة الحية: " + e.message;
@@ -3079,17 +3091,35 @@ async function pollHitlState(accId) {
     const dlg = document.getElementById("hitlDialog");
     if (!targetAcc || hitlActiveAccId !== targetAcc || !dlg || !dlg.open) return;
     let shouldContinue = true;
+    let nextDelay = 45;
+    if (hitlWaitAbortCtrl) {
+        try { hitlWaitAbortCtrl.abort(); } catch (_) {}
+    }
+    hitlWaitAbortCtrl = typeof AbortController !== "undefined" ? new AbortController() : null;
     try {
-        const st = await apiCall("/api/hitl/state?acc_id=" + encodeURIComponent(targetAcc));
-        applyHitlSnapshot(st);
-        if (st.completed || (!st.running && st.ready)) {
-            shouldContinue = false;
+        const res = await fetch(
+            "/api/hitl/wait?acc_id=" + encodeURIComponent(targetAcc) + "&since=" + encodeURIComponent(String(hitlLastFrameSeq)),
+            {
+                method: "GET",
+                headers: tg && tg.initData ? { "X-Telegram-Init-Data": tg.initData } : {},
+                signal: hitlWaitAbortCtrl ? hitlWaitAbortCtrl.signal : undefined,
+            }
+        );
+        const st = await res.json();
+        if (res.ok && st) {
+            applyHitlSnapshot(st);
+            if (st.completed || (!st.running && st.ready)) {
+                shouldContinue = false;
+            }
+        } else {
+            nextDelay = 900;
         }
     } catch (e) {
-        // تجاهل الانقطاع العابر أثناء البث
+        if (e && e.name === "AbortError") return;
+        nextDelay = 900;
     }
     if (shouldContinue && hitlActiveAccId === targetAcc && dlg.open) {
-        scheduleNextHitlFrame(targetAcc);
+        scheduleNextHitlFrame(targetAcc, nextDelay);
     }
 }
 
@@ -3097,6 +3127,10 @@ async function stopHitlLive() {
     if (hitlPollTimer) {
         clearTimeout(hitlPollTimer);
         hitlPollTimer = null;
+    }
+    if (hitlWaitAbortCtrl) {
+        try { hitlWaitAbortCtrl.abort(); } catch (_) {}
+        hitlWaitAbortCtrl = null;
     }
     const accId = hitlActiveAccId;
     hitlActiveAccId = null;
@@ -3676,7 +3710,40 @@ async function manageAnnouncementAction(annId, action) {
     }
     if (wrap && stage) {
         let dragState = null;
+        let lastTapSentAt = 0;
+
+        async function dispatchCanvasClick(clientX, clientY) {
+            if (!hitlActiveAccId) return;
+            const imgEl = document.getElementById("hitlScreenImg");
+            const rect = (imgEl && imgEl.getBoundingClientRect().width > 0)
+                ? imgEl.getBoundingClientRect()
+                : wrap.getBoundingClientRect();
+            if (!rect.width || !rect.height) return;
+            const xNorm = Math.max(0.002, Math.min(0.998, (clientX - rect.left) / rect.width));
+            const yNorm = Math.max(0.002, Math.min(0.998, (clientY - rect.top) / rect.height));
+            lastTapSentAt = Date.now();
+            if (dot) {
+                dot.style.left = (xNorm * 100).toFixed(2) + "%";
+                dot.style.top = (yNorm * 100).toFixed(2) + "%";
+                dot.classList.remove("hidden");
+                setTimeout(() => dot.classList.add("hidden"), 650);
+            }
+            try { tg?.HapticFeedback?.impactOccurred("light"); } catch (_) {}
+            try {
+                const res = await apiCall("/api/hitl/input", "POST", {
+                    account_id: hitlActiveAccId,
+                    action: "click",
+                    x_norm: xNorm,
+                    y_norm: yNorm
+                });
+                applyHitlSnapshot(res);
+            } catch (e) {
+                showToast(e.message);
+            }
+        }
+
         wrap.addEventListener("pointerdown", (ev) => {
+            if (ev.button && ev.button !== 0) return;
             dragState = {
                 id: ev.pointerId,
                 startX: ev.clientX,
@@ -3685,16 +3752,14 @@ async function manageAnnouncementAction(annId, action) {
                 lastY: ev.clientY,
                 moved: false
             };
-            if (hitlPanMode) {
-                try { wrap.setPointerCapture(ev.pointerId); } catch (_) {}
-            }
+            try { wrap.setPointerCapture(ev.pointerId); } catch (_) {}
         });
         wrap.addEventListener("pointermove", (ev) => {
             if (!dragState || dragState.id !== ev.pointerId) return;
-            if (Math.hypot(ev.clientX - dragState.startX, ev.clientY - dragState.startY) > 8) {
+            if (Math.hypot(ev.clientX - dragState.startX, ev.clientY - dragState.startY) > 18) {
                 dragState.moved = true;
             }
-            if (hitlPanMode) {
+            if (hitlPanMode || dragState.moved) {
                 stage.scrollLeft -= (ev.clientX - dragState.lastX);
                 stage.scrollTop -= (ev.clientY - dragState.lastY);
                 ev.preventDefault();
@@ -3707,29 +3772,13 @@ async function manageAnnouncementAction(annId, action) {
             if (!dragState || dragState.id !== ev.pointerId) return;
             const wasMoved = dragState.moved;
             dragState = null;
-            if (hitlPanMode || wasMoved || !hitlActiveAccId) return;
-
-            const rect = wrap.getBoundingClientRect();
-            if (!rect.width || !rect.height) return;
-            const xNorm = Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width));
-            const yNorm = Math.max(0, Math.min(1, (ev.clientY - rect.top) / rect.height));
-            if (dot) {
-                dot.style.left = (xNorm * 100).toFixed(2) + "%";
-                dot.style.top = (yNorm * 100).toFixed(2) + "%";
-                dot.classList.remove("hidden");
-                setTimeout(() => dot.classList.add("hidden"), 650);
-            }
-            try {
-                const res = await apiCall("/api/hitl/input", "POST", {
-                    account_id: hitlActiveAccId,
-                    action: "click",
-                    x_norm: xNorm,
-                    y_norm: yNorm
-                });
-                applyHitlSnapshot(res);
-            } catch (e) {
-                showToast(e.message);
-            }
+            if (hitlPanMode || wasMoved) return;
+            await dispatchCanvasClick(ev.clientX, ev.clientY);
+        });
+        wrap.addEventListener("click", async (ev) => {
+            if (hitlPanMode) return;
+            if (Date.now() - lastTapSentAt < 450) return;
+            await dispatchCanvasClick(ev.clientX, ev.clientY);
         });
     }
 })();
