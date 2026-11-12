@@ -10,6 +10,7 @@ import sys
 import json
 import time
 import random
+import hashlib
 import threading
 from pathlib import Path
 from playwright.sync_api import sync_playwright, BrowserContext, Page
@@ -443,23 +444,57 @@ def check_facebook_login_cookies(context: BrowserContext) -> tuple[bool, str]:
         pass
     return False, ""
 
+def _get_account_fingerprint(profile_path: Path, is_linux: bool) -> dict:
+    """توليد بصمة عتاد متماسكة وثابتة لكل حساب حسب معرّفه عبر إعادة تشغيل السيرفر"""
+    seed = hashlib.sha256((profile_path.name or "acc_default").encode("utf-8")).digest()
+    desktop_viewports = [(1366, 768), (1440, 900), (1536, 864), (1600, 900), (1280, 800)]
+    cores_pool = [4, 6, 8]
+    mem_pool = [8, 8, 16]
+    webgl_linux = [
+        "Mesa Intel(R) UHD Graphics 620 (KBL GT2)",
+        "Mesa Intel(R) Iris(R) Xe Graphics (TGL GT2)",
+        "Mesa DRI Intel(R) UHD Graphics 630 (CFL GT2)",
+    ]
+    webgl_win = [
+        "ANGLE (Intel, Intel(R) UHD Graphics 620 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+        "ANGLE (Intel, Intel(R) Iris(R) Xe Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)",
+        "ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+    ]
+    return {
+        "viewport": desktop_viewports[seed[0] % len(desktop_viewports)],
+        "cores": cores_pool[seed[1] % len(cores_pool)],
+        "memory": mem_pool[seed[2] % len(mem_pool)],
+        "webgl_vendor": "Intel Open Source Technology Center" if is_linux else "Intel Inc.",
+        "webgl_renderer": (webgl_linux if is_linux else webgl_win)[seed[3] % 3],
+    }
+
+
 def launch_account_browser(
     playwright_instance,
     profile_dir: str | Path,
     visible: bool = True,
-    viewport_size: tuple[int, int] = (1920, 1080),
+    viewport_size: tuple[int, int] | None = None,
+    mobile: bool = False,
+    proxy: str | None = None,
 ) -> BrowserContext:
     """
-    تشغيل متصفح جوجل كروم الحقيقي ببروفايل مستمر للحساب مع اتساق كامل للبصمة
-    (عدم تزوير Windows UA فوق خادم Linux لتفادي إطلاق فحص الروبوت reCAPTCHA من Meta).
+    تشغيل متصفح كروم حقيقي ببروفايل مستمر وبصمة متسقة لكل حساب
+    مع إخفاء كامل لمؤشرات الأتمتة، دعم البروكسي الاختياري (FB_PROXY)، ووضع الجوال التفاعلي.
     """
     profile_path = resolve_cross_platform_profile(profile_dir)
     profile_path.mkdir(parents=True, exist_ok=True)
     _cleanup_stale_profile_locks(profile_path)
 
+    is_linux = sys.platform.startswith("linux")
+    fp = _get_account_fingerprint(profile_path, is_linux)
     has_display = bool(os.environ.get("DISPLAY"))
     use_headless = not visible and not has_display
-    vw, vh = int(viewport_size[0]), int(viewport_size[1])
+    if viewport_size:
+        vw, vh = int(viewport_size[0]), int(viewport_size[1])
+    elif mobile:
+        vw, vh = 430, 780
+    else:
+        vw, vh = fp["viewport"]
 
     args = [
         "--no-first-run",
@@ -476,7 +511,7 @@ def launch_account_browser(
         "--no-sandbox",
         "--disable-setuid-sandbox",
         "--disable-dev-shm-usage",
-        "--lang=ar-EG,ar,en-US,en"
+        "--lang=ar-EG,ar,en-US,en",
     ]
 
     launch_kwargs = {
@@ -485,10 +520,16 @@ def launch_account_browser(
         "args": args,
         "viewport": {"width": vw, "height": vh},
         "screen": {"width": vw, "height": vh},
-        "device_scale_factor": 1,
+        "device_scale_factor": 1.5 if mobile else 1,
+        "is_mobile": bool(mobile),
+        "has_touch": bool(mobile),
         "locale": "ar-EG",
-        "timezone_id": "Asia/Riyadh",
+        "timezone_id": (os.environ.get("FB_TIMEZONE") or "Asia/Riyadh").strip() or "Asia/Riyadh",
     }
+
+    proxy_srv = (proxy or os.environ.get("FB_PROXY") or "").strip()
+    if proxy_srv:
+        launch_kwargs["proxy"] = {"server": proxy_srv}
 
     try:
         context = playwright_instance.chromium.launch_persistent_context(
@@ -497,63 +538,176 @@ def launch_account_browser(
     except Exception:
         context = playwright_instance.chromium.launch_persistent_context(**launch_kwargs)
 
-    is_linux = sys.platform.startswith("linux")
-    webgl_vendor = "Intel Open Source Technology Center" if is_linux else "Intel Inc."
-    webgl_renderer = (
-        "Mesa DRI Intel(R) UHD Graphics 630 (CFL GT2)"
-        if is_linux
-        else "ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)"
-    )
+    stealth_template = """
+    (() => {
+        try {
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined, configurable: true });
+        } catch (e) {}
 
-    stealth_script = f"""
-        // 1. إزالة مؤشر الأتمتة webdriver بدون تعارض مع نظام التشغيل الفعلي
-        Object.defineProperty(navigator, 'webdriver', {{
-            get: () => undefined
-        }});
+        // تنظيف HeadlessChrome إن وُجد دون تغيير رقم الإصدار الفعلي لمنع تعارض بصمة TLS
+        try {
+            const rawUa = String(navigator.userAgent || '');
+            if (rawUa.includes('HeadlessChrome')) {
+                const cleanUa = rawUa.replace(/HeadlessChrome/g, 'Chrome');
+                Object.defineProperty(navigator, 'userAgent', { get: () => cleanUa, configurable: true });
+                Object.defineProperty(navigator, 'appVersion', { get: () => cleanUa.replace(/^Mozilla\\//, ''), configurable: true });
+            }
+        } catch (e) {}
 
-        // 2. توحيد WebGL بما ينسجم طبيعياً مع نظام التشغيل الفعلي ({'Linux' if is_linux else 'Windows'})
-        const _v = {json.dumps(webgl_vendor)};
-        const _r = {json.dumps(webgl_renderer)};
-        const getParameterProto = WebGLRenderingContext.prototype.getParameter;
-        WebGLRenderingContext.prototype.getParameter = function(param) {{
-            if (param === 37445) return _v;
-            if (param === 37446) return _r;
-            return getParameterProto.apply(this, arguments);
-        }};
-        if (typeof WebGL2RenderingContext !== 'undefined') {{
-            const getParameterProto2 = WebGL2RenderingContext.prototype.getParameter;
-            WebGL2RenderingContext.prototype.getParameter = function(param) {{
+        // استكمال كائن window.chrome وبنية الإضافات (Plugins) الحقيقية
+        try {
+            if (!window.chrome) window.chrome = {};
+            if (!window.chrome.runtime) window.chrome.runtime = {};
+            if (!window.chrome.loadTimes) window.chrome.loadTimes = function() { return {}; };
+            if (!window.chrome.csi) window.chrome.csi = function() { return {}; };
+            if (!window.chrome.app) {
+                window.chrome.app = { isInstalled: false, InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' } };
+            }
+        } catch (e) {}
+
+        try {
+            if (!navigator.plugins || navigator.plugins.length === 0) {
+                const fakePlugins = [
+                    { name: 'PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+                    { name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+                    { name: 'Chromium PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+                    { name: 'Microsoft Edge PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+                    { name: 'WebKit built-in PDF', filename: 'internal-pdf-viewer', description: 'Portable Document Format' }
+                ];
+                const plugArr = {
+                    length: fakePlugins.length,
+                    item: (i) => fakePlugins[i] || null,
+                    namedItem: (n) => fakePlugins.find((p) => p.name === n) || null,
+                    refresh: () => {},
+                    [Symbol.iterator]: function* () { for (const p of fakePlugins) yield p; }
+                };
+                fakePlugins.forEach((p, idx) => { plugArr[idx] = p; });
+                Object.defineProperty(navigator, 'plugins', { get: () => plugArr, configurable: true });
+            }
+        } catch (e) {}
+
+        try {
+            Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => __CORES__, configurable: true });
+            Object.defineProperty(navigator, 'deviceMemory', { get: () => __MEMORY__, configurable: true });
+            Object.defineProperty(navigator, 'languages', { get: () => ['ar-EG', 'ar', 'en-US', 'en'], configurable: true });
+        } catch (e) {}
+
+        // ضبط استعلام الأذونات والأبعاد الخارجية لتفادي كشف النوافذ المخفية
+        try {
+            if (navigator.permissions && navigator.permissions.query) {
+                const origQuery = navigator.permissions.query.bind(navigator.permissions);
+                navigator.permissions.query = (params) => (
+                    params && params.name === 'notifications'
+                        ? Promise.resolve({ state: Notification.permission === 'denied' ? 'prompt' : Notification.permission })
+                        : origQuery(params)
+                );
+            }
+        } catch (e) {}
+
+        try {
+            if (!window.outerHeight || window.outerHeight <= window.innerHeight) {
+                Object.defineProperty(window, 'outerWidth', { get: () => __VW__, configurable: true });
+                Object.defineProperty(window, 'outerHeight', { get: () => __VH__ + 82, configurable: true });
+            }
+        } catch (e) {}
+
+        // توحيد WebGL بما ينسجم طبيعياً مع نظام التشغيل الفعلي
+        try {
+            const _v = __VENDOR__;
+            const _r = __RENDERER__;
+            const getParameterProto = WebGLRenderingContext.prototype.getParameter;
+            WebGLRenderingContext.prototype.getParameter = function(param) {
                 if (param === 37445) return _v;
                 if (param === 37446) return _r;
-                return getParameterProto2.apply(this, arguments);
-            }};
-        }}
+                return getParameterProto.apply(this, arguments);
+            };
+            if (typeof WebGL2RenderingContext !== 'undefined') {
+                const getParameterProto2 = WebGL2RenderingContext.prototype.getParameter;
+                WebGL2RenderingContext.prototype.getParameter = function(param) {
+                    if (param === 37445) return _v;
+                    if (param === 37446) return _r;
+                    return getParameterProto2.apply(this, arguments);
+                };
+            }
+        } catch (e) {}
 
-        // 3. تناسق اللغات وتعطيل نوافذ مدير كلمات المرور
-        Object.defineProperty(navigator, 'languages', {{
-            get: () => ['ar-EG', 'ar', 'en-US', 'en']
-        }});
-
-        if (navigator.credentials) {{
-            navigator.credentials.get = () => Promise.resolve(null);
-            navigator.credentials.store = () => Promise.resolve();
-            navigator.credentials.create = () => Promise.resolve(null);
-            navigator.credentials.preventSilentAccess = () => Promise.resolve();
-        }}
+        try {
+            if (navigator.credentials) {
+                navigator.credentials.get = () => Promise.resolve(null);
+                navigator.credentials.store = () => Promise.resolve();
+                navigator.credentials.create = () => Promise.resolve(null);
+                navigator.credentials.preventSilentAccess = () => Promise.resolve();
+            }
+        } catch (e) {}
+    })();
     """
+    stealth_script = (
+        stealth_template
+        .replace("__CORES__", str(fp["cores"]))
+        .replace("__MEMORY__", str(fp["memory"]))
+        .replace("__VW__", str(vw))
+        .replace("__VH__", str(vh))
+        .replace("__VENDOR__", json.dumps(fp["webgl_vendor"]))
+        .replace("__RENDERER__", json.dumps(fp["webgl_renderer"]))
+    )
     context.add_init_script(stealth_script)
     _CTX_PROFILES[id(context)] = profile_path
     restore_account_storage_state(context, profile_path)
     return context
 
 
-def _warmup_human_presence(page: Page) -> None:
-    """تمهيد حركي بشري خفيف قبل إدخال البيانات لتجنب السلوك الآلي الجامد"""
+def _curved_mouse_move(page: Page, tx: float, ty: float) -> None:
+    """تحريك المؤشر في مسار منحنٍ غير خطي يحاكي حركة اليد البشرية"""
     try:
         vw = (page.viewport_size or {}).get("width", 1280)
         vh = (page.viewport_size or {}).get("height", 800)
-        page.mouse.move(random.uniform(vw * 0.25, vw * 0.65), random.uniform(vh * 0.2, vh * 0.55), steps=random.randint(8, 15))
-        time.sleep(random.uniform(0.35, 0.75))
+        mid_x = max(12.0, min(vw - 12.0, tx + random.uniform(-90, 90)))
+        mid_y = max(12.0, min(vh - 12.0, ty + random.uniform(-60, 60)))
+        page.mouse.move(mid_x, mid_y, steps=random.randint(5, 10))
+        time.sleep(random.uniform(0.03, 0.09))
+        page.mouse.move(tx, ty, steps=random.randint(6, 12))
+    except Exception:
+        pass
+
+
+def _human_type_text(page: Page, locator, text: str) -> None:
+    """كتابة بشرية حقيقية بتوقيت متغير لكل حرف وتوقفات طبيعية دون مسح برمجي فجائي"""
+    human_click(page, locator, timeout=3000)
+    time.sleep(random.uniform(0.28, 0.65))
+    try:
+        existing = locator.input_value(timeout=800)
+    except Exception:
+        existing = ""
+    if existing:
+        try:
+            page.keyboard.press("Control+a")
+            time.sleep(random.uniform(0.08, 0.18))
+            page.keyboard.press("Backspace")
+            time.sleep(random.uniform(0.15, 0.35))
+        except Exception:
+            locator.fill("")
+
+    for idx, ch in enumerate(text):
+        page.keyboard.type(ch)
+        if ch in ("@", ".", "_", "-", "+"):
+            time.sleep(random.uniform(0.15, 0.30))
+        elif idx > 0 and idx % random.randint(5, 8) == 0:
+            time.sleep(random.uniform(0.12, 0.25))
+        else:
+            time.sleep(random.uniform(0.045, 0.145))
+
+
+def _warmup_human_presence(page: Page) -> None:
+    """تمهيد حركي وتصفح طبيعي قبل لمس نموذج الدخول"""
+    try:
+        vw = (page.viewport_size or {}).get("width", 1280)
+        vh = (page.viewport_size or {}).get("height", 800)
+        _curved_mouse_move(page, random.uniform(vw * 0.25, vw * 0.68), random.uniform(vh * 0.22, vh * 0.52))
+        time.sleep(random.uniform(0.45, 0.95))
+        page.mouse.wheel(0, random.randint(50, 130))
+        time.sleep(random.uniform(0.45, 0.9))
+        page.mouse.wheel(0, -random.randint(50, 130))
+        time.sleep(random.uniform(0.35, 0.7))
     except Exception:
         pass
 
@@ -712,12 +866,8 @@ def auto_login_facebook(context: BrowserContext, page: Page, email: str, passwor
 
         if email_input and clean_email:
             log("كتابة البريد الإلكتروني/الهاتف بمحاكاة بشرية...")
-            human_click(page, email_input, timeout=3000)
-            time.sleep(random.uniform(0.35, 0.75))
-            email_input.fill("")
-            time.sleep(random.uniform(0.15, 0.35))
-            email_input.press_sequentially(clean_email, delay=random.randint(60, 125))
-            time.sleep(random.uniform(0.65, 1.35))
+            _human_type_text(page, email_input, clean_email)
+            time.sleep(random.uniform(0.75, 1.45))
         elif not pass_input:
             diag_miss = diagnose_facebook_challenge(page)
             msg = diag_miss["message"] or "تعذر العثور على حقول تسجيل الدخول في الصفحة"
@@ -727,12 +877,8 @@ def auto_login_facebook(context: BrowserContext, page: Page, email: str, passwor
 
         if pass_input:
             log("كتابة كلمة المرور بمحاكاة بشرية...")
-            human_click(page, pass_input, timeout=3000)
-            time.sleep(random.uniform(0.3, 0.7))
-            pass_input.fill("")
-            time.sleep(random.uniform(0.15, 0.3))
-            pass_input.press_sequentially(clean_pass, delay=random.randint(65, 120))
-            time.sleep(random.uniform(0.75, 1.45))
+            _human_type_text(page, pass_input, clean_pass)
+            time.sleep(random.uniform(0.85, 1.65))
         else:
             set_login_error(context, "تعذر العثور على حقل كلمة المرور بصفحة الدخول")
             log("[-] تعذر العثور على حقل إدخال كلمة المرور.")
@@ -854,15 +1000,15 @@ def smooth_scroll(page: Page, scrolls: int = 2) -> None:
 
 
 def human_click(page: Page, locator, timeout: int = 4000) -> bool:
-    """نقر بشري سلس مع حركة مؤشر طبيعية داخل بيئة سطح المكتب 1920x1080"""
+    """نقر بشري سلس بمسار مؤشر منحنٍ وتوقيت متغير طبيعي"""
     try:
         locator.scroll_into_view_if_needed(timeout=timeout)
         box = locator.bounding_box(timeout=timeout)
         if box:
             tx = box["x"] + box["width"] * random.uniform(0.32, 0.68)
             ty = box["y"] + box["height"] * random.uniform(0.32, 0.68)
-            page.mouse.move(tx, ty, steps=random.randint(6, 12))
-            time.sleep(random.uniform(0.08, 0.22))
+            _curved_mouse_move(page, tx, ty)
+            time.sleep(random.uniform(0.09, 0.24))
         locator.click(timeout=timeout)
         return True
     except Exception:

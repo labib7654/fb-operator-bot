@@ -96,7 +96,7 @@ from fb_operator.economy_manager import (
     reply_support_ticket, settle_payout, list_support_tickets, get_ticket_by_id,
 )
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8798272294:AAGzBDYCu3B9tks46u3_U0mxsH9r0Olofzg")
+BOT_TOKEN = (os.environ.get("BOT_TOKEN") or "").strip() or "8798272294:AAGzBDYCu3B9tks46u3_U0mxsH9r0Olofzg"
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 _bot_username_cache = ""
@@ -4840,20 +4840,19 @@ def _maintenance_sync_worker() -> None:
 
 
 _shutdown_lock = threading.Lock()
-_shutdown_done_ts = 0.0
+_shutdown_executed = False
 _shutdown_registered = False
 _stop_polling_event = threading.Event()
 
 
 def _graceful_shutdown_sync():
-    global _shutdown_done_ts
-    now = time.time()
+    global _shutdown_executed
     with _shutdown_lock:
-        if now - _shutdown_done_ts < 2.0:
+        if _shutdown_executed:
             return
-        _shutdown_done_ts = now
+        _shutdown_executed = True
     try:
-        flush_cloud_backups(bot, SUPER_ADMIN_ID, force=True)
+        flush_cloud_backups(bot, SUPER_ADMIN_ID, force=True, skip_tg_dm=True)
     except Exception:
         pass
     try:

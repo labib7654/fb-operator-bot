@@ -27,6 +27,8 @@ from fb_operator.browser_manager import (
 )
 
 HITL_VIEWPORT = (1280, 800)
+HITL_DESKTOP_VIEWPORT = (1280, 800)
+HITL_MOBILE_VIEWPORT = (430, 780)
 HITL_INACTIVITY_TTL_SEC = 180.0
 HITL_MAX_TTL_SEC = 300.0
 MAX_CONCURRENT_HITL = 2
@@ -76,6 +78,8 @@ class HITLSession:
     error: str = ""
     frame_b64: str = ""
     frame_seq: int = 0
+    mode: str = "mobile"
+    viewport: tuple[int, int] = HITL_MOBILE_VIEWPORT
     _stop_event: threading.Event = field(default_factory=threading.Event)
 
     def touch(self) -> None:
@@ -98,14 +102,15 @@ class HITLSession:
                 "error": self.error,
                 "frame_b64": self.frame_b64,
                 "frame_seq": self.frame_seq,
-                "viewport": {"width": HITL_VIEWPORT[0], "height": HITL_VIEWPORT[1]},
+                "mode": self.mode,
+                "viewport": {"width": int(self.viewport[0]), "height": int(self.viewport[1])},
                 "ttl_remaining": max(0, int(HITL_MAX_TTL_SEC - (time.time() - self.created_at))),
             }
 
 
 def _safe_capture_jpeg_b64(page) -> str:
     try:
-        raw = page.screenshot(type="jpeg", quality=68)
+        raw = page.screenshot(type="jpeg", quality=85)
         return "data:image/jpeg;base64," + base64.b64encode(raw).decode("ascii")
     except Exception:
         return ""
@@ -123,7 +128,14 @@ def _hitl_worker(session: HITLSession, acc: dict) -> None:
     try:
         with lock:
             with sync_playwright() as p:
-                ctx = launch_account_browser(p, acc["profile_dir"], visible=False, viewport_size=HITL_VIEWPORT)
+                ctx = launch_account_browser(
+                    p,
+                    acc["profile_dir"],
+                    visible=False,
+                    viewport_size=session.viewport,
+                    mobile=(session.mode == "mobile"),
+                    proxy=acc.get("proxy"),
+                )
                 try:
                     page = ctx.pages[0] if ctx.pages else ctx.new_page()
                     page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=45000)
@@ -190,6 +202,7 @@ def _hitl_worker(session: HITLSession, acc: dict) -> None:
                             session.touch()
                             ev = cmd_obj.get("event")
                             ctype = cmd_obj.get("cmd")
+                            did_complete = False
                             try:
                                 if ctype == "close":
                                     session._stop_event.set()
@@ -197,10 +210,25 @@ def _hitl_worker(session: HITLSession, acc: dict) -> None:
                                         ev.set()
                                     break
                                 elif ctype == "click":
-                                    x = max(1.0, min(float(HITL_VIEWPORT[0] - 1), float(cmd_obj.get("x") or 0)))
-                                    y = max(1.0, min(float(HITL_VIEWPORT[1] - 1), float(cmd_obj.get("y") or 0)))
-                                    page.mouse.click(x, y)
+                                    vw, vh = session.viewport
+                                    x = max(1.0, min(float(vw - 1), float(cmd_obj.get("x") or 0)))
+                                    y = max(1.0, min(float(vh - 1), float(cmd_obj.get("y") or 0)))
+                                    if session.mode == "mobile":
+                                        try:
+                                            page.touchscreen.tap(x, y)
+                                        except Exception:
+                                            page.mouse.click(x, y)
+                                    else:
+                                        page.mouse.click(x, y)
                                     time.sleep(0.45)
+                                elif ctype == "set_mode":
+                                    new_mode = "desktop" if str(cmd_obj.get("mode") or "") == "desktop" else "mobile"
+                                    new_vp = HITL_DESKTOP_VIEWPORT if new_mode == "desktop" else HITL_MOBILE_VIEWPORT
+                                    with session.state_lock:
+                                        session.mode = new_mode
+                                        session.viewport = new_vp
+                                    page.set_viewport_size({"width": new_vp[0], "height": new_vp[1]})
+                                    time.sleep(0.5)
                                 elif ctype == "type":
                                     txt = str(cmd_obj.get("text") or "")[:300]
                                     if txt:
@@ -262,10 +290,23 @@ def _hitl_worker(session: HITLSession, acc: dict) -> None:
                                 with session.state_lock:
                                     session.error = f"تعذر تنفيذ الإجراء: {str(ce)[:120]}"
                             finally:
+                                try:
+                                    last_capture = time.time()
+                                    did_complete = _refresh_state()
+                                except Exception:
+                                    did_complete = False
                                 if ev:
                                     ev.set()
 
-                        if processed_cmd or (time.time() - last_capture) >= 1.35:
+                            if did_complete:
+                                save_account_storage_state(ctx, acc["profile_dir"])
+                                if _on_verified_callback:
+                                    _on_verified_callback(acc_id, session.fb_id, session.started_by)
+                                time.sleep(1.8)
+                                break
+                            continue
+
+                        if (time.time() - last_capture) >= 1.35:
                             last_capture = time.time()
                             if _refresh_state():
                                 save_account_storage_state(ctx, acc["profile_dir"])
@@ -298,11 +339,14 @@ def _prune_inactive_locked() -> None:
         _sessions.pop(aid, None)
 
 
-def start_hitl_session(acc_id: str, actor_uid: int) -> dict[str, Any]:
+def start_hitl_session(acc_id: str, actor_uid: int, mode: str = "mobile") -> dict[str, Any]:
     """بدء جلسة شاشة حية تفاعلية لحساب معين (يُفترض التحقق من الصلاحية والملكية قبل الاستدعاء)"""
     acc = next((a for a in acc_mgr.load_accounts() if a.get("id") == acc_id), None)
     if not acc:
         return {"ok": False, "error": "الحساب غير موجود."}
+
+    clean_mode = "desktop" if str(mode or "").strip().lower() == "desktop" else "mobile"
+    init_vp = HITL_DESKTOP_VIEWPORT if clean_mode == "desktop" else HITL_MOBILE_VIEWPORT
 
     with _hitl_lock:
         _prune_inactive_locked()
@@ -329,6 +373,8 @@ def start_hitl_session(acc_id: str, actor_uid: int) -> dict[str, Any]:
             acc_name=str(acc.get("name") or acc_id),
             owner_uid=int(acc.get("owner_id") or 0),
             started_by=int(actor_uid),
+            mode=clean_mode,
+            viewport=init_vp,
         )
         _sessions[acc_id] = sess
 
@@ -357,15 +403,18 @@ def send_hitl_input(acc_id: str, payload: dict[str, Any], wait_sec: float = 4.0)
     cmd: dict[str, Any] = {"event": ev}
 
     if action == "click":
+        vw, vh = sess.viewport
         try:
             nx = float(payload.get("x_norm"))
             ny = float(payload.get("y_norm"))
-            x = nx * HITL_VIEWPORT[0]
-            y = ny * HITL_VIEWPORT[1]
+            x = nx * vw
+            y = ny * vh
         except Exception:
             x = float(payload.get("x") or 0)
             y = float(payload.get("y") or 0)
         cmd.update({"cmd": "click", "x": x, "y": y})
+    elif action == "set_mode":
+        cmd.update({"cmd": "set_mode", "mode": str(payload.get("mode") or "mobile")})
     elif action == "type":
         cmd.update({"cmd": "type", "text": str(payload.get("text") or ""), "submit": bool(payload.get("submit"))})
     elif action == "otp":

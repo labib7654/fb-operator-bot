@@ -1188,7 +1188,14 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                 acc_id = str(body.get("account_id") or body.get("acc_id") or "").strip()
                 if not self._authorize_hitl_acc(uid, tg_user, is_dev, perms, acc_id):
                     return
-                res_h = hitl.start_hitl_session(acc_id, actor_uid=uid)
+                req_mode = str(body.get("mode") or "").strip().lower()
+                if req_mode:
+                    try:
+                        res_h = hitl.start_hitl_session(acc_id, actor_uid=uid, mode=req_mode)
+                    except TypeError:
+                        res_h = hitl.start_hitl_session(acc_id, actor_uid=uid)
+                else:
+                    res_h = hitl.start_hitl_session(acc_id, actor_uid=uid)
                 if not res_h.get("ok"):
                     self._send_json(400, {"error": res_h.get("error", "تعذر فتح الشاشة الحية.")})
                     return

@@ -54,6 +54,8 @@ _last_hf_sync_ts = 0.0
 _last_cloud_db_sync_ts = 0.0
 _last_vault_sync_ts = 0.0
 _last_tg_vault_ts = 0.0
+_last_tg_dm_hash = ""
+_tg_send_lock = threading.Lock()
 _last_backup_iso = ""
 _last_hf_status = "غير مفعّل (أضف HF_TOKEN في Secrets للمزامنة السحابية التلقائية)"
 _last_vault_status = "غير مهيأ بعد"
@@ -423,6 +425,17 @@ def migrate_legacy_data() -> dict:
                     if a.get("profile_dir") != desired:
                         a["profile_dir"] = desired
                         changed = True
+                    inline_cookies = a.get("cookies")
+                    if isinstance(inline_cookies, list) and inline_cookies and re.fullmatch(r"acc_\d+", str(aid)):
+                        sess_p = sessions_dir / f"{aid}.json"
+                        if not sess_p.exists() and any(
+                            isinstance(c, dict) and str(c.get("name", "")) == "c_user" and str(c.get("value", "")).strip()
+                            for c in inline_cookies
+                        ):
+                            _atomic_write_bytes(
+                                sess_p,
+                                json.dumps({"cookies": inline_cookies, "origins": a.get("origins") or []}, ensure_ascii=False).encode("utf-8"),
+                            )
             if changed:
                 acc_m.save_accounts(accs, sync_git=False)
     except Exception:
@@ -1589,56 +1602,63 @@ def send_backup_to_channel(bot, channel_id=None, trigger_label: str = "يدوي"
     if bot is None:
         return {"ok": False, "error": "كائن البوت غير متاح لإرسال النسخة."}
 
-    meta = load_backup_settings()
-    target_ch = channel_id if channel_id is not None else meta.get("channel_id")
-    if not target_ch:
-        return {"ok": False, "error": "لم يتم ربط قناة نسخ احتياطي بعد."}
+    is_manual = trigger_label in ("إرسال يدوي فوري", "نسخ يدوي فوري", "اختبار الربط", "يدوي")
+    with _tg_send_lock:
+        meta = load_backup_settings()
+        target_ch = channel_id if channel_id is not None else meta.get("channel_id")
+        if not target_ch:
+            return {"ok": False, "error": "لم يتم ربط قناة نسخ احتياطي بعد."}
 
-    with _sync_lock:
-        snapshot_dirty_seq = _dirty_seq
+        now = time.time()
+        last_ts = float(meta.get("last_channel_backup_ts") or 0.0)
+        min_gap = max(5.0, min(30.0, float(meta.get("interval_seconds") or 3600) * 0.5))
+        if not is_manual and last_ts > 0 and (now - last_ts) < min_gap:
+            return {"ok": True, "skipped": True, "reason": "cooldown_dedup"}
 
-    now = time.time()
-    now_iso = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    next_num = int(meta.get("channel_backup_count") or 0) + 1
-    try:
-        zip_bytes = export_backup_zip_bytes(include_sessions=True)
-        st_info = get_persistence_status()
-        bio = io.BytesIO(zip_bytes)
-        bio.name = f"fb_op_bkp_{next_num}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
-        caption = (
-            f"💾 <b>نسخة احتياطية شاملة #{next_num} (#FB_BACKUP)</b>\n"
-            f"🕒 <code>{now_iso}</code> | 📌 <b>{trigger_label}</b>\n"
-            f"👥 المستخدمون: <b>{st_info['users_count']}</b> | 📱 الحسابات: <b>{st_info['accounts_count']}</b> (🟢 {st_info['active_accounts']}) | 🍪 الجلسات: <b>{st_info['sessions_count']}</b>\n"
-            f"💰 القيود المالية: <b>{st_info['ledger_count']}</b> | 🎟️ الدعوات: <b>{st_info['invites_count']}</b> | 💬 التذاكر: <b>{st_info['tickets_count']}</b>\n"
-            f"🎛️ حالات الضبط والواجهة: <b>{st_info['ui_states_count']}</b> | 📜 السجلات: <b>{st_info['audit_count']}</b>\n"
-            f"⏱️ الجدولة: <b>{meta['interval_label']}</b>\n"
-            "📥 <i>للاسترجاع الفوري: أرسل أو أعد توجيه هذا الملف للبوت ليعود كل شيء كما كان الآن.</i>"
-        )
-        bot.send_document(target_ch, bio, caption=caption, parse_mode="HTML")
-        _last_tg_vault_ts = now
-        _last_backup_iso = now_iso
-        save_backup_settings(
-            {
-                "last_channel_backup_ts": now,
-                "last_channel_backup_iso": now_iso,
-                "channel_backup_count": next_num,
-                "last_trigger": trigger_label,
-                "last_error": "",
-            },
-            mark_dirty=False,
-        )
         with _sync_lock:
-            _channel_synced_seq = max(_channel_synced_seq, snapshot_dirty_seq)
-        return {"ok": True, "backup_number": next_num, "size_bytes": len(zip_bytes), "timestamp": now_iso}
-    except Exception as e:
-        err_msg = str(e)[:250]
-        save_backup_settings({"last_error": err_msg}, mark_dirty=False)
-        return {"ok": False, "error": err_msg}
+            snapshot_dirty_seq = _dirty_seq
+
+        now_iso = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        next_num = int(meta.get("channel_backup_count") or 0) + 1
+        try:
+            zip_bytes = export_backup_zip_bytes(include_sessions=True)
+            st_info = get_persistence_status()
+            bio = io.BytesIO(zip_bytes)
+            bio.name = f"fb_op_bkp_{next_num}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+            caption = (
+                f"💾 <b>نسخة احتياطية شاملة #{next_num} (#FB_BACKUP)</b>\n"
+                f"🕒 <code>{now_iso}</code> | 📌 <b>{trigger_label}</b>\n"
+                f"👥 المستخدمون: <b>{st_info['users_count']}</b> | 📱 الحسابات: <b>{st_info['accounts_count']}</b> (🟢 {st_info['active_accounts']}) | 🍪 الجلسات: <b>{st_info['sessions_count']}</b>\n"
+                f"💰 القيود المالية: <b>{st_info['ledger_count']}</b> | 🎟️ الدعوات: <b>{st_info['invites_count']}</b> | 💬 التذاكر: <b>{st_info['tickets_count']}</b>\n"
+                f"🎛️ حالات الضبط والواجهة: <b>{st_info['ui_states_count']}</b> | 📜 السجلات: <b>{st_info['audit_count']}</b>\n"
+                f"⏱️ الجدولة: <b>{meta['interval_label']}</b>\n"
+                "📥 <i>للاسترجاع الفوري: أرسل أو أعد توجيه هذا الملف للبوت ليعود كل شيء كما كان الآن.</i>"
+            )
+            bot.send_document(target_ch, bio, caption=caption, parse_mode="HTML")
+            _last_tg_vault_ts = now
+            _last_backup_iso = now_iso
+            save_backup_settings(
+                {
+                    "last_channel_backup_ts": now,
+                    "last_channel_backup_iso": now_iso,
+                    "channel_backup_count": next_num,
+                    "last_trigger": trigger_label,
+                    "last_error": "",
+                },
+                mark_dirty=False,
+            )
+            with _sync_lock:
+                _channel_synced_seq = max(_channel_synced_seq, snapshot_dirty_seq)
+            return {"ok": True, "backup_number": next_num, "size_bytes": len(zip_bytes), "timestamp": now_iso}
+        except Exception as e:
+            err_msg = str(e)[:250]
+            save_backup_settings({"last_error": err_msg}, mark_dirty=False)
+            return {"ok": False, "error": err_msg}
 
 
-def flush_cloud_backups(bot=None, super_admin_id: int = 0, force: bool = False) -> None:
+def flush_cloud_backups(bot=None, super_admin_id: int = 0, force: bool = False, skip_tg_dm: bool = False) -> None:
     """مزامنة دورية مضبوطة التوقيت إلى SQLite + الملف الخارجي بجانب المجلد + القاعدة السحابية + HF + قناة النسخ"""
-    global _synced_seq, _cloud_db_synced_seq, _sqlite_synced_seq, _vault_synced_seq, _last_tg_vault_ts, _last_backup_iso
+    global _synced_seq, _cloud_db_synced_seq, _sqlite_synced_seq, _vault_synced_seq, _last_tg_vault_ts, _last_tg_dm_hash, _last_backup_iso
     with _sync_lock:
         current_dirty = _dirty_seq
         already_synced = _synced_seq
@@ -1717,26 +1737,50 @@ def flush_cloud_backups(bot=None, super_admin_id: int = 0, force: bool = False) 
             send_backup_to_channel(bot, trigger_label=trigger)
         return
 
-    if bot is not None and super_admin_id and (force or (current_dirty > already_synced and (now - _last_tg_vault_ts) >= 180.0)):
-        try:
-            zip_bytes = export_backup_zip_bytes(include_sessions=True)
-            st_info = get_persistence_status()
-            bio = io.BytesIO(zip_bytes)
-            bio.name = f"fb_operator_backup_{datetime.now().strftime('%Y%m%d_%H%M')}.zip"
-            caption = (
-                "💾 <b>نسخة احتياطية تلقائية شاملة (#FB_BACKUP)</b>\n"
-                f"👥 المستخدمون: <b>{st_info['users_count']}</b> | 📱 الحسابات: <b>{st_info['accounts_count']}</b> "
-                f"(🟢 {st_info['active_accounts']}) | 🍪 الجلسات: <b>{st_info['sessions_count']}</b>\n"
-                "<i>أعد إرسال هذا الملف للبوت بعد أي تحديث للسيرفر لاسترجاع كل شيء في ثانية!</i>"
-            )
-            bot.send_document(super_admin_id, bio, caption=caption, parse_mode="HTML")
-            _last_tg_vault_ts = time.time()
-            _last_backup_iso = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            if not token:
-                with _sync_lock:
-                    _synced_seq = max(_synced_seq, current_dirty)
-        except Exception:
-            pass
+    if not skip_tg_dm and bot is not None and super_admin_id and (force or (current_dirty > already_synced and (now - _last_tg_vault_ts) >= 180.0)):
+        with _tg_send_lock:
+            try:
+                now_dm = time.time()
+                if docs_snap is None or sessions_snap is None:
+                    docs_snap, sessions_snap = collect_persistent_snapshot()
+                h_snap = hashlib.sha256()
+                for _dk in sorted(docs_snap.keys()):
+                    h_snap.update(_dk.encode("utf-8"))
+                    h_snap.update(b":")
+                    h_snap.update(docs_snap[_dk])
+                    h_snap.update(b"\0")
+                for _sk in sorted(sessions_snap.keys()):
+                    h_snap.update(b"sess/")
+                    h_snap.update(_sk.encode("utf-8"))
+                    h_snap.update(b":")
+                    h_snap.update(sessions_snap[_sk])
+                    h_snap.update(b"\0")
+                snap_digest = h_snap.hexdigest()
+                if snap_digest == _last_tg_dm_hash and (now_dm - _last_tg_vault_ts) < 120.0:
+                    if not token:
+                        with _sync_lock:
+                            _synced_seq = max(_synced_seq, current_dirty)
+                    return
+                zip_bytes = export_backup_zip_bytes(include_sessions=True)
+                zip_digest = snap_digest
+                st_info = get_persistence_status()
+                bio = io.BytesIO(zip_bytes)
+                bio.name = f"fb_operator_backup_{datetime.now().strftime('%Y%m%d_%H%M')}.zip"
+                caption = (
+                    "💾 <b>نسخة احتياطية تلقائية شاملة (#FB_BACKUP)</b>\n"
+                    f"👥 المستخدمون: <b>{st_info['users_count']}</b> | 📱 الحسابات: <b>{st_info['accounts_count']}</b> "
+                    f"(🟢 {st_info['active_accounts']}) | 🍪 الجلسات: <b>{st_info['sessions_count']}</b>\n"
+                    "<i>أعد إرسال هذا الملف للبوت بعد أي تحديث للسيرفر لاسترجاع كل شيء في ثانية!</i>"
+                )
+                bot.send_document(super_admin_id, bio, caption=caption, parse_mode="HTML")
+                _last_tg_vault_ts = time.time()
+                _last_tg_dm_hash = zip_digest
+                _last_backup_iso = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                if not token:
+                    with _sync_lock:
+                        _synced_seq = max(_synced_seq, current_dirty)
+            except Exception:
+                pass
 
 
 def get_persistence_status() -> dict:

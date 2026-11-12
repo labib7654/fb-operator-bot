@@ -249,9 +249,9 @@ def get_miniapp_html() -> str:
             margin-top: 24px;
         }
         dialog.hitl-dialog {
-            width: min(760px, 96vw);
-            max-width: 96vw;
-            max-height: 92dvh;
+            width: min(820px, 98vw);
+            max-width: 98vw;
+            max-height: 95dvh;
             margin: auto;
             padding: 0;
             border: 1px solid var(--border);
@@ -276,54 +276,102 @@ def get_miniapp_html() -> str:
             align-items: center;
             justify-content: space-between;
             gap: 10px;
-            padding: 12px 14px;
+            padding: 10px 14px;
             border-bottom: 1px solid var(--border);
         }
         .hitl-head h2 {
             margin: 0;
             font-size: 15px;
             font-weight: 700;
+            text-wrap: balance;
         }
         .hitl-body {
-            padding: 12px 14px;
+            padding: 10px 12px max(12px, env(safe-area-inset-bottom, 12px)) 12px;
             overflow-y: auto;
             display: flex;
             flex-direction: column;
-            gap: 10px;
+            gap: 8px;
+        }
+        .hitl-zoom-bar {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            justify-content: space-between;
+            gap: 6px;
+        }
+        .hitl-zoom-group {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 5px;
+        }
+        .hitl-zoom-badge {
+            font-size: 12px;
+            font-weight: 700;
+            padding: 4px 8px;
+            border-radius: 6px;
+            background: rgba(88, 166, 255, 0.12);
+            color: var(--accent);
+            border: 1px solid var(--border);
+            min-inline-size: 46px;
+            text-align: center;
         }
         .hitl-stage {
             position: relative;
             width: 100%;
-            aspect-ratio: 16 / 10;
+            max-height: 58dvh;
             background: #0d1117;
             border: 1px solid var(--border);
             border-radius: 8px;
-            overflow: hidden;
-            cursor: crosshair;
-            touch-action: manipulation;
+            overflow: auto;
+            -webkit-overflow-scrolling: touch;
+            overscroll-behavior: contain;
+            touch-action: pan-x pan-y pinch-zoom;
         }
-        .hitl-stage img {
+        .hitl-canvas-wrap {
+            position: relative;
+            width: 100%;
+            margin: 0 auto;
+            aspect-ratio: 430 / 780;
+            cursor: crosshair;
+        }
+        .hitl-canvas-wrap.pan-mode {
+            cursor: grab;
+        }
+        .hitl-canvas-wrap.pan-mode:active {
+            cursor: grabbing;
+        }
+        .hitl-canvas-wrap img {
             display: block;
             width: 100%;
             height: 100%;
-            object-fit: contain;
+            object-fit: fill;
             user-select: none;
             -webkit-user-drag: none;
         }
         .hitl-tap-dot {
             position: absolute;
-            width: 18px;
-            height: 18px;
-            margin: -9px 0 0 -9px;
+            width: 22px;
+            height: 22px;
+            margin: -11px 0 0 -11px;
             border-radius: 50%;
             border: 2px solid #3fb950;
-            background: rgba(63, 185, 80, 0.25);
+            background: rgba(63, 185, 80, 0.30);
             pointer-events: none;
+            z-index: 3;
         }
         .hitl-toolbar {
             display: flex;
             flex-wrap: wrap;
             gap: 6px;
+        }
+        @media (pointer: coarse) {
+            .hitl-toolbar .btn,
+            .hitl-zoom-bar .btn {
+                min-block-size: 44px;
+                min-inline-size: 44px;
+                padding: 8px 11px;
+            }
         }
     </style>
 </head>
@@ -625,9 +673,23 @@ def get_miniapp_html() -> str:
     </div>
     <div class="hitl-body">
         <div id="hitlLiveStatus" role="status" aria-live="polite" class="status-banner" style="margin-top:0;">جاري تجهيز المتصفح...</div>
+        <div class="hitl-zoom-bar">
+            <div class="hitl-zoom-group">
+                <button type="button" class="btn btn-muted btn-sm" aria-label="تصغير الشاشة" onclick="hitlZoom(-0.5)">🔍-</button>
+                <span class="hitl-zoom-badge" id="hitlZoomBadge">1.0x</span>
+                <button type="button" class="btn btn-muted btn-sm" aria-label="تكبير الشاشة" onclick="hitlZoom(0.5)">🔍+</button>
+                <button type="button" class="btn btn-muted btn-sm" onclick="hitlResetZoom()">إعادة</button>
+            </div>
+            <div class="hitl-zoom-group">
+                <button type="button" class="btn btn-muted btn-sm" id="btnHitlPanMode" onclick="hitlTogglePanMode()">👆 اللمس: نقر</button>
+                <button type="button" class="btn btn-muted btn-sm" id="btnHitlViewportMode" onclick="hitlToggleViewportMode()">🖥️ وضع الكمبيوتر</button>
+            </div>
+        </div>
         <div class="hitl-stage" id="hitlStage">
-            <img id="hitlScreenImg" alt="شاشة متصفح الحساب الحية — انقر مباشرة في موضع زر التحقق أو مربع الإدخال">
-            <div id="hitlTapDot" class="hitl-tap-dot hidden"></div>
+            <div class="hitl-canvas-wrap" id="hitlCanvasWrap">
+                <img id="hitlScreenImg" alt="شاشة متصفح الحساب الحية — انقر مباشرة في موضع زر التحقق أو مربع الإدخال">
+                <div id="hitlTapDot" class="hitl-tap-dot hidden"></div>
+            </div>
         </div>
         <div class="hitl-toolbar">
             <button type="button" class="btn btn-muted btn-sm" onclick="hitlScroll(-320)">أعلى</button>
@@ -2149,13 +2211,92 @@ document.getElementById("inpAccLimit")?.addEventListener("input", renderMissionC
 let hitlActiveAccId = null;
 let hitlPollTimer = null;
 let hitlLastFrameSeq = -1;
+let hitlZoomScale = 1.0;
+let hitlPanMode = false;
+let hitlViewportMode = "mobile";
+
+function hitlSyncControls() {
+    const badge = document.getElementById("hitlZoomBadge");
+    if (badge) badge.textContent = hitlZoomScale.toFixed(1) + "x";
+    const panBtn = document.getElementById("btnHitlPanMode");
+    if (panBtn) panBtn.textContent = hitlPanMode ? "✋ تحريك الشاشة (بدون نقر)" : "👆 اللمس: نقر";
+    const modeBtn = document.getElementById("btnHitlViewportMode");
+    if (modeBtn) modeBtn.textContent = hitlViewportMode === "desktop" ? "📱 وضع الجوال (خط كبير)" : "🖥️ وضع الكمبيوتر";
+    const wrap = document.getElementById("hitlCanvasWrap");
+    if (wrap) {
+        wrap.classList.toggle("pan-mode", hitlPanMode);
+        wrap.style.touchAction = hitlPanMode ? "none" : "pan-x pan-y pinch-zoom";
+    }
+}
+
+function hitlSetZoom(nextScale) {
+    const stage = document.getElementById("hitlStage");
+    const wrap = document.getElementById("hitlCanvasWrap");
+    const clamped = Math.max(1.0, Math.min(3.0, Math.round((Number(nextScale) || 1.0) * 100) / 100));
+    let cx = 0.5, cy = 0.5;
+    if (stage && wrap && wrap.clientWidth > 0 && wrap.clientHeight > 0) {
+        cx = (stage.scrollLeft + stage.clientWidth / 2) / wrap.clientWidth;
+        cy = (stage.scrollTop + stage.clientHeight / 2) / wrap.clientHeight;
+    }
+    hitlZoomScale = clamped;
+    if (wrap) {
+        wrap.style.width = Math.round(hitlZoomScale * 100) + "%";
+    }
+    if (stage && wrap && wrap.clientWidth > 0 && wrap.clientHeight > 0) {
+        stage.scrollLeft = Math.max(0, cx * wrap.clientWidth - stage.clientWidth / 2);
+        stage.scrollTop = Math.max(0, cy * wrap.clientHeight - stage.clientHeight / 2);
+    }
+    hitlSyncControls();
+}
+
+function hitlZoom(delta) {
+    hitlSetZoom(hitlZoomScale + Number(delta || 0));
+}
+
+function hitlResetZoom() {
+    const stage = document.getElementById("hitlStage");
+    hitlSetZoom(1.0);
+    if (stage) {
+        stage.scrollLeft = 0;
+        stage.scrollTop = 0;
+    }
+}
+
+function hitlTogglePanMode() {
+    hitlPanMode = !hitlPanMode;
+    hitlSyncControls();
+}
+
+async function hitlToggleViewportMode() {
+    if (!hitlActiveAccId) return;
+    const targetMode = hitlViewportMode === "mobile" ? "desktop" : "mobile";
+    try {
+        const res = await apiCall("/api/hitl/input", "POST", {
+            account_id: hitlActiveAccId,
+            action: "set_mode",
+            mode: targetMode
+        });
+        hitlResetZoom();
+        applyHitlSnapshot(res);
+    } catch (e) {
+        showToast(e.message);
+    }
+}
 
 function applyHitlSnapshot(st) {
     if (!st) return;
     const statusEl = document.getElementById("hitlLiveStatus");
     const prefillBtn = document.getElementById("btnHitlPrefill");
     const imgEl = document.getElementById("hitlScreenImg");
+    const wrap = document.getElementById("hitlCanvasWrap");
 
+    if (st.viewport && st.viewport.width && st.viewport.height && wrap) {
+        wrap.style.aspectRatio = st.viewport.width + " / " + st.viewport.height;
+    }
+    if (st.mode) {
+        hitlViewportMode = st.mode === "desktop" ? "desktop" : "mobile";
+        hitlSyncControls();
+    }
     if (st.frame_b64 && st.frame_b64.startsWith("data:image/jpeg;base64,") && st.frame_seq !== hitlLastFrameSeq) {
         imgEl.src = st.frame_b64;
         hitlLastFrameSeq = st.frame_seq;
@@ -2200,6 +2341,9 @@ async function openHitlLive(accId, accName) {
     if (!dlg) return;
     hitlActiveAccId = accId;
     hitlLastFrameSeq = -1;
+    hitlPanMode = false;
+    hitlViewportMode = "mobile";
+    hitlResetZoom();
     const titleEl = document.getElementById("hitlDialogTitle");
     if (titleEl) {
         titleEl.textContent = "الشاشة الحية: " + (accName ? (accName + " (" + accId + ")") : accId);
@@ -2213,7 +2357,7 @@ async function openHitlLive(accId, accName) {
         dlg.showModal();
     }
     try {
-        const res = await apiCall("/api/hitl/start", "POST", { account_id: accId });
+        const res = await apiCall("/api/hitl/start", "POST", { account_id: accId, mode: "mobile" });
         applyHitlSnapshot(res);
         if (res && !res.completed && (res.running || !res.ready)) {
             scheduleNextHitlFrame(accId);
@@ -2311,6 +2455,7 @@ async function hitlAction(act) {
     const dlg = document.getElementById("hitlDialog");
     const closeBtn = document.getElementById("btnHitlClose");
     const stage = document.getElementById("hitlStage");
+    const wrap = document.getElementById("hitlCanvasWrap");
     const dot = document.getElementById("hitlTapDot");
 
     if (closeBtn && dlg) {
@@ -2322,10 +2467,42 @@ async function hitlAction(act) {
             stopHitlLive();
         });
     }
-    if (stage) {
-        stage.addEventListener("click", async (ev) => {
-            if (!hitlActiveAccId) return;
-            const rect = stage.getBoundingClientRect();
+    if (wrap && stage) {
+        let dragState = null;
+        wrap.addEventListener("pointerdown", (ev) => {
+            dragState = {
+                id: ev.pointerId,
+                startX: ev.clientX,
+                startY: ev.clientY,
+                lastX: ev.clientX,
+                lastY: ev.clientY,
+                moved: false
+            };
+            if (hitlPanMode) {
+                try { wrap.setPointerCapture(ev.pointerId); } catch (_) {}
+            }
+        });
+        wrap.addEventListener("pointermove", (ev) => {
+            if (!dragState || dragState.id !== ev.pointerId) return;
+            if (Math.hypot(ev.clientX - dragState.startX, ev.clientY - dragState.startY) > 8) {
+                dragState.moved = true;
+            }
+            if (hitlPanMode) {
+                stage.scrollLeft -= (ev.clientX - dragState.lastX);
+                stage.scrollTop -= (ev.clientY - dragState.lastY);
+                ev.preventDefault();
+            }
+            dragState.lastX = ev.clientX;
+            dragState.lastY = ev.clientY;
+        });
+        wrap.addEventListener("pointercancel", () => { dragState = null; });
+        wrap.addEventListener("pointerup", async (ev) => {
+            if (!dragState || dragState.id !== ev.pointerId) return;
+            const wasMoved = dragState.moved;
+            dragState = null;
+            if (hitlPanMode || wasMoved || !hitlActiveAccId) return;
+
+            const rect = wrap.getBoundingClientRect();
             if (!rect.width || !rect.height) return;
             const xNorm = Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width));
             const yNorm = Math.max(0, Math.min(1, (ev.clientY - rect.top) / rect.height));
@@ -2333,7 +2510,7 @@ async function hitlAction(act) {
                 dot.style.left = (xNorm * 100).toFixed(2) + "%";
                 dot.style.top = (yNorm * 100).toFixed(2) + "%";
                 dot.classList.remove("hidden");
-                setTimeout(() => dot.classList.add("hidden"), 550);
+                setTimeout(() => dot.classList.add("hidden"), 650);
             }
             try {
                 const res = await apiCall("/api/hitl/input", "POST", {
