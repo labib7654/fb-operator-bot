@@ -1162,6 +1162,32 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                 if not (is_dev or cap_pool or perms.get("can_add_accounts") or perms.get("can_use_accounts")):
                     self._deny_perm(uid, tg_user, "محاولة فحص الجلسات عبر Mini App بدون صلاحية")
                     return
+                acc_id = str(body.get("account_id") or body.get("acc_id") or "").strip()
+                force_relogin = bool(body.get("force_relogin"))
+                if acc_id:
+                    acc = hooks["get_account_by_id"](acc_id)
+                    if not acc:
+                        self._send_json(404, {"error": "الحساب غير موجود."})
+                        return
+                    is_pool_user = bool(perms.get("can_use_accounts") and not perms.get("can_add_accounts"))
+                    if not (is_dev or cap_pool or int(acc.get("owner_id") or 0) == uid or is_pool_user):
+                        self._deny_perm(uid, tg_user, f"محاولة IDOR فحص حساب لا يملكه ({acc_id})", "لا يمكنك فحص أو إعادة تسجيل دخول حساب لا يخصك.")
+                        return
+                    hooks["record_audit_log"](
+                        uid, user_label, "CHECK_SINGLE_SESSION",
+                        f"{'إعادة الدخول بالبيانات المحفوظة' if force_relogin else 'فحص جلسة'} للحساب {acc_id} من Mini App"
+                    )
+                    threading.Thread(
+                        target=hooks["check_all_sessions_worker"],
+                        args=(uid, uid, acc_id, force_relogin),
+                        daemon=True,
+                    ).start()
+                    self._send_json(200, {
+                        "ok": True,
+                        "account_id": acc_id,
+                        "message": f"{'بدأت محاولة إعادة تسجيل الدخول' if force_relogin else 'بدأ فحص'} الحساب ({acc.get('name', acc_id)}) بالبيانات المحفوظة!"
+                    })
+                    return
                 hooks["record_audit_log"](uid, user_label, "CHECK_SESSIONS", "تشغيل فحص الجلسات من Mini App")
                 threading.Thread(target=hooks["check_all_sessions_worker"], args=(uid, uid), daemon=True).start()
                 self._send_json(200, {"ok": True, "message": "بدأ فحص حالة الجلسات في المتصفح الخلفي!"})

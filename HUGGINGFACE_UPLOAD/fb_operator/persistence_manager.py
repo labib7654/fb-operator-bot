@@ -1847,7 +1847,7 @@ def flush_cloud_backups(bot=None, super_admin_id: int = 0, force: bool = False, 
             send_backup_to_channel(bot, trigger_label=trigger)
         return
 
-    if not skip_tg_dm and bot is not None and super_admin_id and (force or (current_dirty > already_synced and (now - _last_tg_vault_ts) >= 180.0)):
+    if not skip_tg_dm and bot is not None and super_admin_id and _is_dm_backup_due(meta, now, current_dirty, already_synced, force, _last_tg_vault_ts):
         with _tg_send_lock:
             try:
                 now_dm = time.time()
@@ -1866,7 +1866,8 @@ def flush_cloud_backups(bot=None, super_admin_id: int = 0, force: bool = False, 
                     h_snap.update(sessions_snap[_sk])
                     h_snap.update(b"\0")
                 snap_digest = h_snap.hexdigest()
-                if snap_digest == _last_tg_dm_hash and (now_dm - _last_tg_vault_ts) < 120.0:
+                if snap_digest == _last_tg_dm_hash and (not force or (now_dm - _last_tg_vault_ts) < 120.0):
+                    _last_tg_vault_ts = now_dm
                     if not token:
                         with _sync_lock:
                             _synced_seq = max(_synced_seq, current_dirty)

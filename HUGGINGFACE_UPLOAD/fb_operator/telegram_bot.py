@@ -1748,6 +1748,75 @@ def _render_audit_logs_view() -> tuple[str, types.InlineKeyboardMarkup]:
     return txt, markup
 
 
+def _user_can_inspect_account(user_id: int, acc: dict) -> tuple[bool, bool, bool]:
+    """فحص صلاحية (الاطلاع/الفحص، الحذف، التنفيذ) لحساب محدد وفق عزل الملكية."""
+    is_pool = has_admin_capability(user_id, "accounts_pool")
+    uid = int(user_id)
+    is_owner = int(acc.get("owner_id") or 0) == uid
+    can_del = is_pool or (is_owner and has_permission(uid, "can_delete_accounts"))
+    usable_list = get_usable_accounts_for_user(uid)
+    in_usable = any(x.get("id") == acc.get("id") for x in usable_list)
+    can_inspect = (
+        is_pool
+        or (is_owner and (has_permission(uid, "can_add_accounts") or has_permission(uid, "can_delete_accounts") or has_permission(uid, "can_use_accounts")))
+        or (in_usable and has_permission(uid, "can_use_accounts") and not has_permission(uid, "can_add_accounts"))
+    )
+    can_use = in_usable and (is_super_admin(uid) or has_permission(uid, "can_use_accounts") or has_permission(uid, "can_execute"))
+    return can_inspect, can_del, can_use
+
+
+def _render_account_detail_view(user_id: int, acc: dict) -> tuple[str, types.InlineKeyboardMarkup]:
+    """بطاقة إدارة الحساب الفردية: فحص، إعادة دخول بالبيانات المحفوظة، الشاشة الحية، وتنفيذ مباشر."""
+    acc_id = str(acc.get("id") or "")
+    _, can_del, can_use = _user_can_inspect_account(user_id, acc)
+    is_act = "نشط" in str(acc.get("status") or "")
+    has_creds = bool(acc.get("email") and acc.get("password") and acc.get("password") != "[SESSION_COOKIES]")
+    st_badge = "🟢 نشط ومسجل" if is_act else "🔴 غير نشط / يتطلب دخول"
+    cred_badge = "🔑 محفوظة ومؤمّنة على السيرفر (جاهز لإعادة الدخول)" if has_creds else "🍪 جلسة كوكيز فقط"
+    reason = str(acc.get("diagnostic_reason") or ("الجلسة مثبتة" if is_act else "انتهت الجلسة أو يتطلب تحققاً"))
+    proxy_txt = str(acc.get("bound_proxy") or "افتراضي / مباشر")
+    cc_txt = f" [{acc.get('bound_proxy_country')}]" if acc.get("bound_proxy_country") else ""
+    pq = acc.get("profile_quality") if isinstance(acc.get("profile_quality"), dict) else {}
+    pq_txt = f"{pq.get('score', 0)}/7 ✅" if pq.get("checked") else "لم يُفحص بعد"
+
+    lines = [
+        f"📱 <b>بطاقة الحساب: {esc(acc.get('name') or acc_id)}</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"🆔 <b>المعرّف:</b> <code>{esc(acc_id)}</code> | <b>الحالة:</b> {st_badge}",
+        f"📧 <b>البريد:</b> <code>{esc(acc.get('email') or '—')}</code>",
+        f"🔐 <b>بيانات الدخول:</b> {cred_badge}",
+        f"🌐 <b>البروكسي المثبت:</b> <code>{esc(proxy_txt)}{esc(cc_txt)}</code>",
+        f"🧬 <b>معرّف فيسبوك:</b> <code>{esc(acc.get('fb_id') or 'غير مستخرج بعد')}</code> | <b>البروفايل:</b> {esc(pq_txt)}",
+        f"🩺 <b>آخر تشخيص:</b> {esc(reason)}",
+    ]
+
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    if has_creds:
+        markup.row(
+            types.InlineKeyboardButton("🔍 فحص الجلسة الآن", callback_data=f"acc_check_{acc_id}"),
+            types.InlineKeyboardButton("🔑 إعادة تسجيل الدخول", callback_data=f"acc_relogin_{acc_id}"),
+        )
+    else:
+        markup.row(types.InlineKeyboardButton("🔍 فحص الجلسة الآن", callback_data=f"acc_check_{acc_id}"))
+
+    w_url = get_public_webapp_url()
+    if w_url:
+        sep = "&" if "?" in w_url else "?"
+        markup.row(types.InlineKeyboardButton("🖥️ الشاشة الحية (حل التحقق وحفظ الجلسة)", web_app=types.WebAppInfo(url=f"{w_url}{sep}hitl={acc_id}")))
+    else:
+        markup.row(types.InlineKeyboardButton("🖥️ كيف أفتح الشاشة الحية؟", callback_data=f"hitl_help_{acc_id}"))
+
+    if can_use:
+        markup.row(types.InlineKeyboardButton("⚡ التفاعل / تنفيذ مهمة بهذا الحساب فقط", callback_data=f"acc_mission_{acc_id}"))
+    if can_del:
+        markup.row(types.InlineKeyboardButton("🗑️ حذف الحساب الآن", callback_data=f"del_acc_{acc_id}"))
+    markup.row(
+        types.InlineKeyboardButton("🔙 قائمة الحسابات", callback_data="menu_manage_accs"),
+        types.InlineKeyboardButton("🏠 الرئيسية", callback_data="back_to_main"),
+    )
+    return "\n".join(lines), markup
+
+
 def _render_manage_accs_view(user_id: int) -> tuple[str, types.InlineKeyboardMarkup]:
     is_dev = has_admin_capability(user_id, "accounts_pool")
     accs = get_manageable_accounts_for_user(user_id)
@@ -1759,11 +1828,15 @@ def _render_manage_accs_view(user_id: int) -> tuple[str, types.InlineKeyboardMar
         st_icon = "🟢" if "نشط" in a.get("status", "") else "🔴"
         if can_del:
             markup.row(
-                types.InlineKeyboardButton(f"{st_icon} {a['name']}", callback_data="noop"),
+                types.InlineKeyboardButton(f"{st_icon} {a['name']}", callback_data=f"acc_view_{a['id']}"),
+                types.InlineKeyboardButton("🔍 فحص/تحكم", callback_data=f"acc_view_{a['id']}"),
                 types.InlineKeyboardButton("🗑️ حذف", callback_data=f"del_acc_{a['id']}")
             )
         else:
-            markup.row(types.InlineKeyboardButton(f"{st_icon} {a['name']}", callback_data="noop"))
+            markup.row(
+                types.InlineKeyboardButton(f"{st_icon} {a['name']}", callback_data=f"acc_view_{a['id']}"),
+                types.InlineKeyboardButton("🔍 فحص/تحكم", callback_data=f"acc_view_{a['id']}"),
+            )
 
     if can_add:
         markup.row(
@@ -1773,12 +1846,12 @@ def _render_manage_accs_view(user_id: int) -> tuple[str, types.InlineKeyboardMar
     if can_del:
         markup.row(types.InlineKeyboardButton("🧹 تنظيف وحذف الحسابات التالفة", callback_data="act_purge_broken"))
     markup.row(
-        types.InlineKeyboardButton("🔄 فحص الجلسات", callback_data="act_check_sessions"),
+        types.InlineKeyboardButton("🔄 فحص كل الجلسات", callback_data="act_check_sessions"),
         types.InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main")
     )
 
-    title = "👥 <b>إدارة كافة حسابات النظام:</b>\n\n" if is_dev else "📋 <b>حساباتك التي قمت بإضافتها للبوت:</b>\n\n"
-    txt = title
+    title = "👥 <b>إدارة كافة حسابات النظام:</b>\n" if is_dev else "📋 <b>حساباتك التي قمت بإضافتها للبوت:</b>\n"
+    txt = title + "💡 <i>اضغط على اسم أي حساب لإدارته منفرداً (فحص / إعادة دخول بالبيانات المحفوظة / الشاشة الحية / تنفيذ مهمة به فقط).</i>\n\n"
     now_ts = time.time()
     for i, a in enumerate(accs, 1):
         is_act = "نشط" in a.get("status", "")
@@ -1905,11 +1978,14 @@ def _handle_backup_channel_binding(message, user_id: int) -> None:
 
 def _render_backup_schedule_view() -> tuple[str, types.InlineKeyboardMarkup]:
     bkp = load_backup_settings()
+    en_flag = bool(bkp.get("enabled", True))
+    dm_flag = bool(bkp.get("dm_enabled", True))
     lines = [
-        "⏱️ <b>جدولة النسخ الاحتياطي التلقائي للقناة</b>",
+        "⏱️ <b>جدولة النسخ الاحتياطي التلقائي (للقناة والخاص)</b>",
         "━━━━━━━━━━━━━━━━━━━━",
         f"🕒 <b>التكرار الحالي:</b> {esc(bkp.get('interval_label', 'كل 1 ساعة'))} (<code>{bkp.get('interval_seconds', 3600)}</code> ثانية)",
-        f"🔄 <b>حالة الجدولة:</b> {'🟢 مفعلة' if bkp.get('enabled') else '🔴 متوقفة'}",
+        f"🔄 <b>الجدولة التلقائية بالوقت:</b> {'🟢 مفعلة' if en_flag else '🔴 متوقفة'}",
+        f"📬 <b>إرسال ملف ZIP للخاص تلقائياً:</b> {'🟢 مفعل' if (en_flag and dm_flag) else '🔴 متوقف'}",
         f"⚡ <b>نسخ إضافي عند أي تعديل:</b> {'🟢 مفعل' if bkp.get('on_change') else '⚪ معطل'}",
         "━━━━━━━━━━━━━━━━━━━━",
         "اختر من الأوقات الجاهزة أو اضغط <b>وقت مخصص</b> لكتابة أي مدة (ثانية / دقيقة / ساعة / يوم / أسبوع / شهر / سنة):",
@@ -1932,6 +2008,7 @@ def _render_backup_schedule_view() -> tuple[str, types.InlineKeyboardMarkup]:
         types.InlineKeyboardButton("🌍 سنوياً (1 سنة)", callback_data="bkp_iv_31536000"),
     )
     markup.row(types.InlineKeyboardButton("✏️ إدخال وقت مخصص (ثانية..سنة)", callback_data="bkp_set_interval_custom"))
+    markup.row(types.InlineKeyboardButton("🛑 إيقاف النسخ التلقائي بالكامل (يدوي فقط)", callback_data="bkp_stop_auto"))
     markup.row(types.InlineKeyboardButton("🔙 العودة لخزنة النسخ", callback_data="menu_backup_vault"))
     return "\n".join(lines), markup
 
@@ -2126,13 +2203,16 @@ def _render_backup_vault_view() -> tuple[str, types.InlineKeyboardMarkup]:
     ch_badge = f"🟢 مرتبطة: <b>{esc(ch_title)}</b> (<code>{esc(ch_id)}</code>)" if ch_id else "🔴 غير مرتبطة بعد"
 
     en_flag = bool(bkp.get("enabled", True))
+    dm_flag = bool(bkp.get("dm_enabled", True))
     och_flag = bool(bkp.get("on_change", False))
     iv_sec = int(bkp.get("interval_seconds") or 3600)
     last_ts = float(bkp.get("last_channel_backup_ts") or 0.0)
-    if not ch_id:
-        eta_txt = "اربط القناة أولاً"
-    elif not en_flag:
-        eta_txt = "الجدولة متوقفة مؤقتاً"
+    if not en_flag:
+        eta_txt = "متوقفة مؤقتاً"
+    elif not ch_id and not dm_flag:
+        eta_txt = "إرسال الخاص متوقف (يدوي فقط)"
+    elif not ch_id:
+        eta_txt = f"للخاص حسب التوقيت ({bkp.get('interval_label', 'كل 1 ساعة')})"
     elif last_ts <= 0:
         eta_txt = "مستحقة الآن"
     else:
@@ -2155,8 +2235,8 @@ def _render_backup_vault_view() -> tuple[str, types.InlineKeyboardMarkup]:
         ext_line,
         f"📡 <b>قناة النسخ الاحتياطي:</b> {ch_badge}",
         f"🗄️ <b>قاعدة البيانات السحابية (بلا فيزا):</b> {esc(cdb_badge)}",
-        f"⏱️ <b>التوقيت المجدول:</b> {esc(bkp.get('interval_label', 'كل 1 ساعة'))} | {'🟢 مفعّل' if en_flag else '🔴 متوقف'} ({esc(eta_txt)})",
-        f"⚡ <b>النسخ الفوري عند التعديل:</b> {'🟢 مفعّل' if och_flag else '⚪ معطل'} | <b>المُرسل للقناة:</b> {bkp.get('channel_backup_count', 0)} نسخة",
+        f"⏱️ <b>التوقيت المجدول (القناة والخاص):</b> {esc(bkp.get('interval_label', 'كل 1 ساعة'))} | {'🟢 مفعّل' if en_flag else '🔴 متوقف'} ({esc(eta_txt)})",
+        f"📬 <b>نسخ ZIP التلقائي للخاص (DM):</b> {'🟢 مفعّل' if (en_flag and dm_flag) else '🔴 متوقف'} | ⚡ <b>عند التعديل:</b> {'🟢' if och_flag else '⚪'} | <b>للقناة:</b> {bkp.get('channel_backup_count', 0)}",
         f"🕒 <b>آخر نسخة/استعادة:</b> {esc(st_info.get('last_backup_iso'))}",
     ]
     if bkp.get("last_error"):
@@ -2187,7 +2267,11 @@ def _render_backup_vault_view() -> tuple[str, types.InlineKeyboardMarkup]:
     )
     markup.row(
         types.InlineKeyboardButton(f"🔄 تلقائي بالوقت: {'✅' if en_flag else '❌'}", callback_data="bkp_tog_enabled"),
+        types.InlineKeyboardButton(f"📬 إرسال للخاص تلقائياً: {'✅' if dm_flag else '❌'}", callback_data="bkp_tog_dm"),
+    )
+    markup.row(
         types.InlineKeyboardButton(f"⚡ عند التعديل: {'✅' if och_flag else '❌'}", callback_data="bkp_tog_onchange"),
+        types.InlineKeyboardButton("🛑 إيقاف التلقائي الآن", callback_data="bkp_stop_auto"),
     )
     markup.row(
         types.InlineKeyboardButton("📦 تصدير نسخة هنا (.zip)", callback_data="act_export_backup"),
@@ -4207,6 +4291,32 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
         return
 
+    elif data == "bkp_tog_dm":
+        if not has_admin_capability(user_id, "backups"):
+            record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", "محاولة تبديل إرسال النسخ للخاص بدون صلاحية")
+            safe_answer(call.id, "⛔ خاص بالمطور والأدمن غير المقيد فقط.", show_alert=True)
+            return
+        bkp = load_backup_settings()
+        new_dm = not bool(bkp.get("dm_enabled", True))
+        save_backup_settings({"dm_enabled": new_dm}, mark_dirty=False)
+        record_audit_log(user_id, call.from_user.first_name or "", "BACKUP_DM_TOGGLED", f"نسخ الخاص التلقائي: {'مفعل' if new_dm else 'متوقف'}")
+        safe_answer(call.id, "📬 تم تفعيل إرسال النسخ للخاص حسب الجدول." if new_dm else "🔕 تم إيقاف إرسال ملفات ZIP للخاص تلقائياً!")
+        txt, markup = _render_backup_vault_view()
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+        return
+
+    elif data == "bkp_stop_auto":
+        if not has_admin_capability(user_id, "backups"):
+            record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", "محاولة إيقاف النسخ التلقائي بدون صلاحية")
+            safe_answer(call.id, "⛔ خاص بالمطور والأدمن غير المقيد فقط.", show_alert=True)
+            return
+        save_backup_settings({"enabled": False, "dm_enabled": False, "on_change": False}, mark_dirty=False)
+        record_audit_log(user_id, call.from_user.first_name or "", "BACKUP_AUTO_STOPPED", "إيقاف كافة النسخ التلقائية للخاص والقناة")
+        safe_answer(call.id, "🛑 تم إيقاف كل النسخ التلقائي للبوت والقناة! لن يرسل أي ZIP إلا يدوياً أو عند إعادة تفعيله.", show_alert=True)
+        txt, markup = _render_backup_vault_view()
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+        return
+
     elif data == "bkp_set_interval_custom":
         if not has_admin_capability(user_id, "backups"):
             record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", "محاولة تعديل توقيت النسخ بدون صلاحية")
@@ -5142,6 +5252,62 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
         _track_view(user_id, call.message.chat.id, call.message.message_id, "manage_accs")
 
+    elif data.startswith("acc_view_"):
+        acc_id = data.replace("acc_view_", "", 1)
+        target_acc = get_account_by_id(acc_id)
+        if not target_acc:
+            safe_answer(call.id, "الحساب غير موجود.", show_alert=True)
+            return
+        can_inspect, _, _ = _user_can_inspect_account(user_id, target_acc)
+        if not can_inspect:
+            record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", f"محاولة استعراض بطاقة حساب غير مصرح {acc_id}")
+            safe_answer(call.id, "⛔ لا تملك صلاحية عرض أو إدارة هذا الحساب!", show_alert=True)
+            return
+        txt, markup = _render_account_detail_view(user_id, target_acc)
+        safe_answer(call.id)
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+        _track_view(user_id, call.message.chat.id, call.message.message_id, f"acc_view_{acc_id}")
+
+    elif data.startswith("acc_check_") or data.startswith("acc_relogin_"):
+        is_relogin = data.startswith("acc_relogin_")
+        acc_id = data.replace("acc_relogin_" if is_relogin else "acc_check_", "", 1)
+        target_acc = get_account_by_id(acc_id)
+        if not target_acc:
+            safe_answer(call.id, "الحساب غير موجود.", show_alert=True)
+            return
+        can_inspect, _, _ = _user_can_inspect_account(user_id, target_acc)
+        if not can_inspect:
+            record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", f"محاولة فحص/إعادة دخول حساب غير مصرح {acc_id}")
+            safe_answer(call.id, "⛔ لا تملك صلاحية فحص أو إعادة تسجيل دخول هذا الحساب!", show_alert=True)
+            return
+        if is_relogin and (not target_acc.get("email") or not target_acc.get("password") or target_acc.get("password") == "[SESSION_COOKIES]"):
+            safe_answer(call.id, "🍪 هذا الحساب مضاف بالكوكيز فقط بدون كلمة مرور محفوظة — استخدم الشاشة الحية أو أعد إضافته.", show_alert=True)
+            return
+        safe_answer(call.id, f"{'🔑 جاري إعادة تسجيل الدخول' if is_relogin else '🔍 جاري فحص'} {target_acc.get('name', acc_id)}...")
+        threading.Thread(
+            target=check_all_sessions_worker,
+            args=(call.message.chat.id, user_id, acc_id, is_relogin),
+            daemon=True,
+        ).start()
+
+    elif data.startswith("acc_mission_"):
+        acc_id = data.replace("acc_mission_", "", 1)
+        target_acc = get_account_by_id(acc_id)
+        if not target_acc:
+            safe_answer(call.id, "الحساب غير موجود.", show_alert=True)
+            return
+        _, _, can_use = _user_can_inspect_account(user_id, target_acc)
+        if not can_use:
+            record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", f"محاولة تفعيل مهمة على حساب غير مصرح {acc_id}")
+            safe_answer(call.id, "⛔ لا تملك صلاحية استخدام هذا الحساب في المهام!", show_alert=True)
+            return
+        st["selected_acc"] = acc_id
+        st["selected_accs"] = [acc_id]
+        persist_user_states()
+        safe_answer(call.id, f"⚡ تم تحديد ({target_acc.get('name', acc_id)}) للتنفيذ! اختر الإجراء المطلوب ثم ابدأ.")
+        safe_edit_message(get_dashboard_text(user_id), call.message.chat.id, call.message.message_id, reply_markup=get_main_dashboard_markup(user_id))
+        _track_view(user_id, call.message.chat.id, call.message.message_id, "main")
+
     elif data.startswith("del_acc_"):
         if not (has_admin_capability(user_id, "accounts_pool") or has_permission(user_id, "can_delete_accounts")):
             record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", f"محاولة حذف حساب بدون صلاحية: {data}")
@@ -5260,15 +5426,28 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
 
 # ----------------- معالجة فحص الجلسات بالخلفية -----------------
 
-def check_all_sessions_worker(chat_id: int, requester_id: int):
+def check_all_sessions_worker(chat_id: int, requester_id: int, target_acc_id: str = "", force_relogin: bool = False):
+    clean_tid = str(target_acc_id or "").strip()
     try:
-        status_msg = bot.send_message(chat_id, "⏳ <b>بدء فحص حالة الجلسات في المتصفح...</b>")
+        start_lbl = (
+            f"⏳ <b>{'جاري إعادة تسجيل الدخول بالبيانات المحفوظة' if force_relogin else 'جاري فحص الجلسة في المتصفح'}...</b>"
+            if clean_tid
+            else "⏳ <b>بدء فحص حالة الجلسات في المتصفح...</b>"
+        )
+        status_msg = bot.send_message(chat_id, start_lbl)
         status_msg_id = status_msg.message_id if status_msg else None
     except Exception:
         status_msg_id = None
 
-    is_dev = is_super_admin(requester_id)
-    if is_dev:
+    is_dev = is_super_admin(requester_id) or has_admin_capability(requester_id, "accounts_pool")
+    if clean_tid:
+        t_acc = get_account_by_id(clean_tid)
+        if t_acc:
+            can_inspect, _, _ = _user_can_inspect_account(requester_id, t_acc)
+            accs = [t_acc] if can_inspect else []
+        else:
+            accs = []
+    elif is_dev:
         accs = load_accounts()
     elif has_permission(requester_id, "can_use_accounts") and not has_permission(requester_id, "can_add_accounts"):
         accs = load_accounts()
@@ -5285,39 +5464,64 @@ def check_all_sessions_worker(chat_id: int, requester_id: int):
         )
         return
 
+    report_lines: list[str] = []
+    hitl_needed: list[dict] = []
+
     for idx, a in enumerate(accs, 1):
         try:
             safe_edit_message(f"🔄 <b>جاري فحص الحساب ({idx}/{total}):</b> {esc(a['name'])}...", chat_id, status_msg_id)
             lock = get_profile_lock(a["id"])
             proxy_uri = _account_proxy_guard_uri(a)
+            live_reason = ""
+            diag_code = ""
+            can_otp_flag = False
+            is_active = False
+            fb_id = ""
+            prof_quality = None
+            real_pwd = str(a.get("password") or "")
+            has_saved_creds = bool(a.get("email") and real_pwd and real_pwd != "[SESSION_COOKIES]")
+
             with lock, proxy_execution_guard(proxy_uri, min_gap_sec=1.5), _browser_semaphore:
                 with sync_playwright() as p:
                     ctx = launch_account_browser(p, a["profile_dir"], visible=False)
                     try:
                         page = ctx.pages[0] if ctx.pages else ctx.new_page()
-                        page.goto("https://www.facebook.com/", timeout=25000, wait_until="domcontentloaded")
-                        human_delay(1.5, 2.5)
+                        page.goto("https://www.facebook.com/", timeout=30000, wait_until="domcontentloaded")
+                        human_delay(1.8, 2.8)
+                        dismiss_dialogs(page)
                         diag_chk = diagnose_facebook_challenge(page)
                         ok_live = bool(diag_chk.get("is_ok"))
+                        diag_code = str(diag_chk.get("code") or "")
                         live_reason = str(diag_chk.get("message") or "")
+                        can_otp_flag = bool(diag_chk.get("can_otp"))
                         is_logged, fb_id = check_facebook_login_cookies(ctx)
                         is_active = bool(is_logged and ok_live)
-                        # إعادة دخول ذكية تلقائية إذا انتهت الكوكيز فقط ولدينا كلمة مرور حقيقية
-                        real_pwd = a.get("password", "")
-                        if not is_active and diag_chk.get("code") in ("full_login", "password_only") and real_pwd and real_pwd != "[SESSION_COOKIES]":
-                            safe_edit_message(f"🔑 <b>إعادة تسجيل الدخول تلقائياً ({idx}/{total}):</b> {esc(a['name'])}...", chat_id, status_msg_id)
-                            relog_ok = auto_login_facebook(ctx, page, a.get("email", ""), real_pwd, max_wait=28)
+
+                        # إعادة دخول ذكية بالبيانات المحفوظة متى ما لم يكن هناك تحدٍّ مانع (أو عند طلب إعادة الدخول)
+                        blocked_codes = ("recaptcha", "arkose", "suspended", "wrong_password", "2fa_otp", "device_approval", "identity_check")
+                        if has_saved_creds and (force_relogin or (not is_active and diag_code not in blocked_codes)):
+                            safe_edit_message(f"🔑 <b>إعادة تسجيل الدخول بالبيانات المحفوظة ({idx}/{total}):</b> {esc(a['name'])}...", chat_id, status_msg_id)
+                            relog_ok = auto_login_facebook(ctx, page, a.get("email", ""), real_pwd, max_wait=34)
                             is_logged, fb_id = check_facebook_login_cookies(ctx)
                             diag_after = diagnose_facebook_challenge(page)
+                            diag_code = str(diag_after.get("code") or diag_code)
+                            can_otp_flag = bool(diag_after.get("can_otp"))
                             is_active = bool(relog_ok and is_logged and diag_after.get("is_ok"))
                             if not is_active:
                                 live_reason = get_login_error(ctx) or diag_after.get("message") or live_reason
-                        prof_quality = None
+
                         if is_active:
                             prof_quality = a.get("profile_quality")
                             if not (isinstance(prof_quality, dict) and prof_quality.get("checked")):
                                 prof_quality = inspect_facebook_profile_quality(page, navigate=True)
                             save_account_storage_state(ctx, a["profile_dir"])
+                        else:
+                            # حفظ كوكيز التحدي المعلقة ورابط التحقق لتفتح الشاشة الحية مباشرة عند نفس النقطة
+                            try:
+                                record_hitl_challenge_url(a["id"], str(getattr(page, "url", "") or ""))
+                            except Exception:
+                                pass
+                            save_account_storage_state(ctx, a["profile_dir"], save_pending=True)
                     finally:
                         try:
                             ctx.close()
@@ -5332,6 +5536,7 @@ def check_all_sessions_worker(chat_id: int, requester_id: int):
                     upd["profile_quality"] = prof_quality
                 update_account(a["id"], upd, sync_git=False)
                 active_cnt += 1
+                report_lines.append(f"• 🟢 <b>{esc(a['name'])}:</b> نشط وجلسته محفوظة")
                 a_owner = int(a.get("owner_id") or 0)
                 if a_owner > 0 and not is_super_admin(a_owner):
                     rew = reward_account_activation(
@@ -5352,23 +5557,61 @@ def check_all_sessions_worker(chat_id: int, requester_id: int):
                             f"🎁 <b>مكافأة إحالة!</b> تم إضافة <b>+{rew['referral_awarded']}</b> نقاط لرصيدك بعد تفعيل أول حساب نشط للمدعو!"
                         )
             else:
+                fail_msg = live_reason or "انتهت الجلسة أو يتطلب تحققاً"
                 update_account(a["id"], {
                     "status": "يتطلب تسجيل الدخول",
-                    "diagnostic_reason": live_reason or "انتهت الجلسة أو يتطلب تحققاً"
+                    "diagnostic_reason": fail_msg
                 }, sync_git=False)
-        except Exception:
-            pass
+                report_lines.append(f"• 🔴 <b>{esc(a['name'])}:</b> {esc(fail_msg[:90])}")
+                hitl_needed.append({
+                    "id": a["id"],
+                    "name": a.get("name", a["id"]),
+                    "reason": fail_msg,
+                    "can_otp": can_otp_flag,
+                    "has_creds": has_saved_creds,
+                    "code": diag_code,
+                })
+        except Exception as _exc:
+            report_lines.append(f"• ⚠️ <b>{esc(a['name'])}:</b> تعذر الفحص ({esc(str(_exc)[:60])})")
 
     git_sync_save(async_mode=True)
-    safe_edit_message(
-        f"✅ <b>اكتمل فحص الجلسات!</b>\n"
+    summary_header = (
+        f"✅ <b>اكتمل فحص الحساب!</b>\n" if clean_tid else "✅ <b>اكتمل فحص الجلسات!</b>\n"
+    )
+    summary_txt = (
+        f"{summary_header}"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"🟢 <b>الحسابات النشطة:</b> {active_cnt}\n"
-        f"🔴 <b>غير نشط / يتطلب دخول:</b> {total - active_cnt}\n"
-        f"━━━━━━━━━━━━━━━━━━━━",
-        chat_id, status_msg_id,
-        reply_markup=_back_home_markup("menu_manage_accs")
+        f"🔴 <b>غير نشط / يتطلب دخول أو تحقق:</b> {total - active_cnt}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        + "\n".join(report_lines[:15])
     )
+    if hitl_needed:
+        summary_txt += "\n\n🖥️ <i>الحسابات التي تطلب تحققاً: اضغط زر الشاشة الحية بالأسفل لإكماله يدوياً وسُتحفظ الكوكيز تلقائياً فور نجاحك.</i>"
+
+    res_mk = types.InlineKeyboardMarkup(row_width=2)
+    w_url = get_public_webapp_url()
+    for hn in hitl_needed[:5]:
+        hid = hn["id"]
+        hname = str(hn["name"])[:16]
+        if w_url:
+            sep = "&" if "?" in w_url else "?"
+            res_mk.row(
+                types.InlineKeyboardButton(f"🖥️ الشاشة الحية: {hname}", web_app=types.WebAppInfo(url=f"{w_url}{sep}hitl={hid}")),
+                types.InlineKeyboardButton(f"⚙️ إدارة {hname}", callback_data=f"acc_view_{hid}"),
+            )
+        else:
+            res_mk.row(
+                types.InlineKeyboardButton(f"🔑 إعادة الدخول: {hname}", callback_data=f"acc_relogin_{hid}"),
+                types.InlineKeyboardButton(f"⚙️ إدارة {hname}", callback_data=f"acc_view_{hid}"),
+            )
+    if clean_tid:
+        res_mk.row(types.InlineKeyboardButton("🔙 بطاقة الحساب", callback_data=f"acc_view_{clean_tid}"))
+    res_mk.row(
+        types.InlineKeyboardButton("📋 إدارة الحسابات", callback_data="menu_manage_accs"),
+        types.InlineKeyboardButton("🏠 الرئيسية", callback_data="back_to_main"),
+    )
+    safe_edit_message(summary_txt[:4050], chat_id, status_msg_id, reply_markup=res_mk)
 
 
 # ----------------- معالجة مدخلات النصوص التفاعلية -----------------

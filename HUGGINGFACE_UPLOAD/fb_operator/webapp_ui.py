@@ -1946,12 +1946,28 @@ function renderAccountsList() {
         btnRow.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;margin-top:6px;";
 
         if (isDev || p.can_add_accounts || p.can_use_accounts) {
+            const chkBtn = document.createElement("button");
+            chkBtn.type = "button";
+            chkBtn.className = "btn btn-muted btn-sm";
+            chkBtn.textContent = "فحص / إعادة دخول";
+            chkBtn.onclick = () => checkSingleAccount(a.id, true);
+            btnRow.appendChild(chkBtn);
+
             const hitlBtn = document.createElement("button");
             hitlBtn.type = "button";
             hitlBtn.className = a.is_active ? "btn btn-muted btn-sm" : "btn btn-primary btn-sm";
             hitlBtn.textContent = a.is_active ? "الشاشة الحية (فحص/تثبيت)" : "الشاشة الحية لحل التحقق";
             hitlBtn.onclick = () => openHitlLive(a.id, a.name);
             btnRow.appendChild(hitlBtn);
+        }
+
+        if (isDev || p.can_use_accounts || p.can_execute) {
+            const useBtn = document.createElement("button");
+            useBtn.type = "button";
+            useBtn.className = "btn btn-ok btn-sm";
+            useBtn.textContent = "تنفيذ بهذا الحساب";
+            useBtn.onclick = () => useSingleAccountInMission(a.id, a.name);
+            btnRow.appendChild(useBtn);
         }
 
         if (isDev || p.can_delete_accounts) {
@@ -2022,6 +2038,39 @@ async function triggerCheckSessions() {
     } catch (e) {
         showToast(e.message);
     }
+}
+
+async function checkSingleAccount(accId, forceRelogin = true) {
+    try {
+        const res = await apiCall("/api/accounts/check", "POST", {
+            account_id: accId,
+            force_relogin: !!forceRelogin,
+        });
+        showToast(res.message || "بدأ فحص وإعادة تسجيل دخول الحساب...");
+    } catch (e) {
+        showToast(e.message);
+    }
+}
+
+function useSingleAccountInMission(accId, accName) {
+    if (!appState) return;
+    if (!appState.mission_state) appState.mission_state = {};
+    appState.mission_state.selected_acc = accId;
+    appState.mission_state.selected_accs = [accId];
+    const sel = document.getElementById("inpSelectedAcc");
+    if (sel) {
+        if (!Array.from(sel.options).some((o) => o.value === accId)) {
+            const opt = document.createElement("option");
+            opt.value = accId;
+            opt.textContent = accName || accId;
+            sel.appendChild(opt);
+        }
+        sel.value = accId;
+    }
+    renderMultiAccPicker();
+    renderMissionCostBadge();
+    switchTab("tab-control", false);
+    showToast("تم اختيار (" + (accName || accId) + ") للتنفيذ الفردي — اضغط حفظ وتشغيل الآن");
 }
 
 async function loadAdminRadar() {
