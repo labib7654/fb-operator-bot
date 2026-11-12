@@ -402,6 +402,11 @@ def delete_account(account_id: str) -> bool:
         deleted = True
 
     if deleted:
+        try:
+            from fb_operator.proxy_manager import unbind_accounts
+            unbind_accounts([account_id])
+        except Exception:
+            pass
         publish_event("accounts", owner_id, "account_delete")
     return True
 
@@ -426,6 +431,7 @@ def get_accounts_breakdown_by_owner(owner_id: int) -> dict:
 
 def delete_accounts_by_owner(owner_id: int) -> int:
     """مسح كافة الحسابات التابعة لمستخدم معين ومسح مجلدات جلساتها"""
+    deleted_ids: list[str] = []
     with _accounts_lock:
         accounts = load_accounts()
         remaining = []
@@ -434,7 +440,10 @@ def delete_accounts_by_owner(owner_id: int) -> int:
         for a in accounts:
             if a.get("owner_id") == uid_int:
                 deleted_count += 1
-                _cleanup_session_file(a.get("id", ""))
+                aid = str(a.get("id") or "")
+                if aid:
+                    deleted_ids.append(aid)
+                _cleanup_session_file(aid)
                 p_dir = a.get("profile_dir")
                 if p_dir:
                     acc_folder = Path(p_dir).name
@@ -448,6 +457,12 @@ def delete_accounts_by_owner(owner_id: int) -> int:
                 remaining.append(a)
         if deleted_count > 0:
             save_accounts(remaining, sync_git=True)
+    if deleted_ids:
+        try:
+            from fb_operator.proxy_manager import unbind_accounts
+            unbind_accounts(deleted_ids)
+        except Exception:
+            pass
     if deleted_count > 0:
         publish_event("accounts", uid_int, "delete_accounts_by_owner")
     return deleted_count
@@ -459,6 +474,7 @@ def purge_broken_accounts(owner_id: int | None = None) -> tuple[int, list[str]]:
     إذا تم تمرير owner_id يتم تنظيف حسابات هذا المستخدم فقط لضمان عدم المساس بحسابات المطور أو الآخرين.
     """
     purged_names: list[str] = []
+    purged_ids: list[str] = []
     with _accounts_lock:
         accounts = load_accounts()
         remaining = []
@@ -467,8 +483,11 @@ def purge_broken_accounts(owner_id: int | None = None) -> tuple[int, list[str]]:
             status = acc.get("status", "")
             in_scope = True if owner_id is None else (acc.get("owner_id") == int(owner_id))
             if in_scope and ("نشط" not in status):
-                purged_names.append(acc.get("name", acc.get("id")))
-                _cleanup_session_file(acc.get("id", ""))
+                aid = str(acc.get("id") or "")
+                if aid:
+                    purged_ids.append(aid)
+                purged_names.append(acc.get("name", aid))
+                _cleanup_session_file(aid)
                 p_dir = acc.get("profile_dir")
                 if p_dir:
                     acc_folder = Path(p_dir).name
@@ -484,6 +503,12 @@ def purge_broken_accounts(owner_id: int | None = None) -> tuple[int, list[str]]:
         if purged_names:
             save_accounts(remaining, sync_git=True)
 
+    if purged_ids:
+        try:
+            from fb_operator.proxy_manager import unbind_accounts
+            unbind_accounts(purged_ids)
+        except Exception:
+            pass
     if purged_names:
         publish_event("accounts", int(owner_id) if owner_id else 0, "purge_broken")
     return len(purged_names), purged_names
@@ -497,6 +522,7 @@ def purge_expired_broken_accounts(max_age_hours: int = 24, now_ts: float | None 
     now_val = float(now_ts if now_ts is not None else time.time())
     ttl_seconds = max(60, int(max_age_hours) * 3600)
     purged_names: list[str] = []
+    purged_ids: list[str] = []
     backfilled = False
 
     with _accounts_lock:
@@ -529,8 +555,11 @@ def purge_expired_broken_accounts(max_age_hours: int = 24, now_ts: float | None 
                 backfilled = True
 
             if (now_val - f_ts) >= ttl_seconds:
-                purged_names.append(f"{acc.get('name', acc.get('id'))} ({acc.get('id')})")
-                _cleanup_session_file(acc.get("id", ""))
+                aid = str(acc.get("id") or "")
+                if aid:
+                    purged_ids.append(aid)
+                purged_names.append(f"{acc.get('name', aid)} ({aid})")
+                _cleanup_session_file(aid)
                 p_dir = acc.get("profile_dir")
                 if p_dir:
                     acc_folder = Path(p_dir).name
@@ -546,6 +575,12 @@ def purge_expired_broken_accounts(max_age_hours: int = 24, now_ts: float | None 
         if purged_names or backfilled:
             save_accounts(remaining, sync_git=bool(purged_names))
 
+    if purged_ids:
+        try:
+            from fb_operator.proxy_manager import unbind_accounts
+            unbind_accounts(purged_ids)
+        except Exception:
+            pass
     if purged_names:
         publish_event("accounts", 0, "purge_expired_24h")
     return len(purged_names), purged_names

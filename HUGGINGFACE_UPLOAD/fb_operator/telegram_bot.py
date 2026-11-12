@@ -74,7 +74,8 @@ from fb_operator.browser_manager import (
     launch_account_browser, auto_login_facebook, check_facebook_login_cookies,
     human_delay, human_warmup_after_login, get_login_error, check_facebook_page_access,
     diagnose_facebook_challenge, inspect_facebook_profile_quality,
-    save_account_storage_state, get_profile_lock, detect_and_report_proxy_error,
+    save_account_storage_state, clear_account_storage_state, _resolve_session_file,
+    dismiss_dialogs, get_profile_lock, detect_and_report_proxy_error,
 )
 from fb_operator.proxy_manager import (
     add_proxies_bulk,
@@ -1766,35 +1767,72 @@ def _user_can_inspect_account(user_id: int, acc: dict) -> tuple[bool, bool, bool
 
 
 def _render_account_detail_view(user_id: int, acc: dict) -> tuple[str, types.InlineKeyboardMarkup]:
-    """بطاقة إدارة الحساب الفردية: فحص، إعادة دخول بالبيانات المحفوظة، الشاشة الحية، وتنفيذ مباشر."""
+    """بطاقة إدارة الحساب الفردية: عرض التفاصيل الكاملة للمطور، فحص، حذف الجلسة وإعادة الدخول، الشاشة الحية، وتنفيذ مباشر."""
     acc_id = str(acc.get("id") or "")
     _, can_del, can_use = _user_can_inspect_account(user_id, acc)
+    is_dev_view = is_super_admin(user_id) or has_admin_capability(user_id, "accounts_pool")
     is_act = "نشط" in str(acc.get("status") or "")
-    has_creds = bool(acc.get("email") and acc.get("password") and acc.get("password") != "[SESSION_COOKIES]")
+    raw_pwd = str(acc.get("password") or "")
+    has_creds = bool(acc.get("email") and raw_pwd and raw_pwd != "[SESSION_COOKIES]")
     st_badge = "🟢 نشط ومسجل" if is_act else "🔴 غير نشط / يتطلب دخول"
     cred_badge = "🔑 محفوظة ومؤمّنة على السيرفر (جاهز لإعادة الدخول)" if has_creds else "🍪 جلسة كوكيز فقط"
     reason = str(acc.get("diagnostic_reason") or ("الجلسة مثبتة" if is_act else "انتهت الجلسة أو يتطلب تحققاً"))
+
     proxy_txt = str(acc.get("bound_proxy") or "افتراضي / مباشر")
+    if is_super_admin(user_id):
+        try:
+            raw_bind = str((load_proxy_state().get("bindings") or {}).get(acc_id) or "").strip()
+            if not raw_bind:
+                prof_key = os.path.basename(str(acc.get("profile_dir") or acc_id).replace("\\", "/").rstrip("/")) or acc_id
+                raw_bind = str((load_proxy_state().get("bindings") or {}).get(prof_key) or "").strip()
+            if raw_bind:
+                proxy_txt = raw_bind
+        except Exception:
+            pass
     cc_txt = f" [{acc.get('bound_proxy_country')}]" if acc.get("bound_proxy_country") else ""
     pq = acc.get("profile_quality") if isinstance(acc.get("profile_quality"), dict) else {}
     pq_txt = f"{pq.get('score', 0)}/7 ✅" if pq.get("checked") else "لم يُفحص بعد"
+
+    sess_badge = "❌ لا يوجد ملف جلسة"
+    try:
+        sf = _resolve_session_file(acc.get("profile_dir") or acc_id)
+        if sf.exists():
+            sess_badge = "✅ ملف جلسة محفوظ"
+        elif sf.with_suffix(".pending.json").exists():
+            sess_badge = "⏳ كوكيز تحقق معلقة"
+    except Exception:
+        pass
 
     lines = [
         f"📱 <b>بطاقة الحساب: {esc(acc.get('name') or acc_id)}</b>",
         "━━━━━━━━━━━━━━━━━━━━",
         f"🆔 <b>المعرّف:</b> <code>{esc(acc_id)}</code> | <b>الحالة:</b> {st_badge}",
-        f"📧 <b>البريد:</b> <code>{esc(acc.get('email') or '—')}</code>",
-        f"🔐 <b>بيانات الدخول:</b> {cred_badge}",
+        f"📧 <b>البريد/الهاتف:</b> <code>{esc(acc.get('email') or '—')}</code>",
+    ]
+    if is_dev_view:
+        pwd_disp = (
+            f"<code>{esc(raw_pwd)}</code>"
+            if has_creds
+            else ("🍪 جلسة كوكيز فقط (بدون كلمة مرور)" if raw_pwd == "[SESSION_COOKIES]" else "غير محفوظة")
+        )
+        owner_lbl = f"{acc.get('owner_name') or 'النظام'} ({acc.get('owner_id') or '0'})"
+        lines.append(f"🔑 <b>كلمة المرور:</b> {pwd_disp}")
+        lines.append(f"👤 <b>أضافه:</b> {esc(owner_lbl)} | 📅 <b>بتاريخ:</b> <code>{esc(acc.get('added_at') or 'سابقاً')}</code>")
+    else:
+        lines.append(f"🔐 <b>بيانات الدخول:</b> {cred_badge}")
+
+    lines.extend([
+        f"🍪 <b>الجلسة:</b> {sess_badge}",
         f"🌐 <b>البروكسي المثبت:</b> <code>{esc(proxy_txt)}{esc(cc_txt)}</code>",
         f"🧬 <b>معرّف فيسبوك:</b> <code>{esc(acc.get('fb_id') or 'غير مستخرج بعد')}</code> | <b>البروفايل:</b> {esc(pq_txt)}",
         f"🩺 <b>آخر تشخيص:</b> {esc(reason)}",
-    ]
+    ])
 
     markup = types.InlineKeyboardMarkup(row_width=2)
     if has_creds:
         markup.row(
             types.InlineKeyboardButton("🔍 فحص الجلسة الآن", callback_data=f"acc_check_{acc_id}"),
-            types.InlineKeyboardButton("🔑 إعادة تسجيل الدخول", callback_data=f"acc_relogin_{acc_id}"),
+            types.InlineKeyboardButton("🔑 حذف الجلسة وإعادة الدخول", callback_data=f"acc_relogin_{acc_id}"),
         )
     else:
         markup.row(types.InlineKeyboardButton("🔍 فحص الجلسة الآن", callback_data=f"acc_check_{acc_id}"))
@@ -5480,35 +5518,67 @@ def check_all_sessions_worker(chat_id: int, requester_id: int, target_acc_id: st
             prof_quality = None
             real_pwd = str(a.get("password") or "")
             has_saved_creds = bool(a.get("email") and real_pwd and real_pwd != "[SESSION_COOKIES]")
+            use_fresh_login = bool(force_relogin and has_saved_creds)
+
+            if force_relogin and not has_saved_creds:
+                msg_no_creds = "🍪 هذا الحساب مضاف بالكوكيز فقط بدون كلمة مرور محفوظة — افتح الشاشة الحية لتثبيت الجلسة."
+                report_lines.append(f"• 🔴 <b>{esc(a['name'])}:</b> {esc(msg_no_creds)}")
+                hitl_needed.append({
+                    "id": a["id"],
+                    "name": a.get("name", a["id"]),
+                    "reason": msg_no_creds,
+                    "can_otp": False,
+                    "has_creds": False,
+                    "code": "cookie_only",
+                })
+                continue
 
             with lock, proxy_execution_guard(proxy_uri, min_gap_sec=1.5), _browser_semaphore:
+                if use_fresh_login:
+                    safe_edit_message(
+                        f"🗑️ <b>حذف الجلسة السابقة وإعادة تسجيل الدخول ({idx}/{total}):</b> {esc(a['name'])}...",
+                        chat_id, status_msg_id
+                    )
                 with sync_playwright() as p:
-                    ctx = launch_account_browser(p, a["profile_dir"], visible=False)
+                    ctx = launch_account_browser(p, a["profile_dir"], visible=False, fresh_session=use_fresh_login)
                     try:
                         page = ctx.pages[0] if ctx.pages else ctx.new_page()
                         page.goto("https://www.facebook.com/", timeout=30000, wait_until="domcontentloaded")
                         human_delay(1.8, 2.8)
                         dismiss_dialogs(page)
-                        diag_chk = diagnose_facebook_challenge(page)
-                        ok_live = bool(diag_chk.get("is_ok"))
-                        diag_code = str(diag_chk.get("code") or "")
-                        live_reason = str(diag_chk.get("message") or "")
-                        can_otp_flag = bool(diag_chk.get("can_otp"))
-                        is_logged, fb_id = check_facebook_login_cookies(ctx)
-                        is_active = bool(is_logged and ok_live)
 
-                        # إعادة دخول ذكية بالبيانات المحفوظة متى ما لم يكن هناك تحدٍّ مانع (أو عند طلب إعادة الدخول)
-                        blocked_codes = ("recaptcha", "arkose", "suspended", "wrong_password", "2fa_otp", "device_approval", "identity_check")
-                        if has_saved_creds and (force_relogin or (not is_active and diag_code not in blocked_codes)):
-                            safe_edit_message(f"🔑 <b>إعادة تسجيل الدخول بالبيانات المحفوظة ({idx}/{total}):</b> {esc(a['name'])}...", chat_id, status_msg_id)
-                            relog_ok = auto_login_facebook(ctx, page, a.get("email", ""), real_pwd, max_wait=34)
+                        if use_fresh_login:
+                            relog_ok = auto_login_facebook(
+                                ctx, page, a.get("email", ""), real_pwd, max_wait=40, force_fresh=True
+                            )
                             is_logged, fb_id = check_facebook_login_cookies(ctx)
                             diag_after = diagnose_facebook_challenge(page)
-                            diag_code = str(diag_after.get("code") or diag_code)
+                            diag_code = str(diag_after.get("code") or "")
                             can_otp_flag = bool(diag_after.get("can_otp"))
                             is_active = bool(relog_ok and is_logged and diag_after.get("is_ok"))
                             if not is_active:
-                                live_reason = get_login_error(ctx) or diag_after.get("message") or live_reason
+                                live_reason = get_login_error(ctx) or diag_after.get("message") or "تعذر إتمام إعادة الدخول بالبيانات المحفوظة"
+                        else:
+                            diag_chk = diagnose_facebook_challenge(page)
+                            ok_live = bool(diag_chk.get("is_ok"))
+                            diag_code = str(diag_chk.get("code") or "")
+                            live_reason = str(diag_chk.get("message") or "")
+                            can_otp_flag = bool(diag_chk.get("can_otp"))
+                            is_logged, fb_id = check_facebook_login_cookies(ctx)
+                            is_active = bool(is_logged and ok_live)
+
+                            # إعادة دخول ذكية بالبيانات المحفوظة متى ما لم يكن هناك تحدٍّ مانع
+                            blocked_codes = ("recaptcha", "arkose", "suspended", "wrong_password", "2fa_otp", "device_approval", "identity_check")
+                            if has_saved_creds and (not is_active and diag_code not in blocked_codes):
+                                safe_edit_message(f"🔑 <b>إعادة تسجيل الدخول بالبيانات المحفوظة ({idx}/{total}):</b> {esc(a['name'])}...", chat_id, status_msg_id)
+                                relog_ok = auto_login_facebook(ctx, page, a.get("email", ""), real_pwd, max_wait=34)
+                                is_logged, fb_id = check_facebook_login_cookies(ctx)
+                                diag_after = diagnose_facebook_challenge(page)
+                                diag_code = str(diag_after.get("code") or diag_code)
+                                can_otp_flag = bool(diag_after.get("can_otp"))
+                                is_active = bool(relog_ok and is_logged and diag_after.get("is_ok"))
+                                if not is_active:
+                                    live_reason = get_login_error(ctx) or diag_after.get("message") or live_reason
 
                         if is_active:
                             prof_quality = a.get("profile_quality")

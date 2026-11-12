@@ -1920,6 +1920,13 @@ function renderAccountsList() {
         emailLine.textContent = "البريد: " + (a.email || "-");
         row.appendChild(emailLine);
 
+        if (isDev && a.password) {
+            const pwdLine = document.createElement("div");
+            pwdLine.className = "mono";
+            pwdLine.textContent = "كلمة المرور: " + (a.password === "[SESSION_COOKIES]" ? "جلسة كوكيز فقط" : a.password);
+            row.appendChild(pwdLine);
+        }
+
         if (isDev && a.owner_label) {
             const ownLine = document.createElement("div");
             ownLine.className = "mono";
@@ -1949,9 +1956,18 @@ function renderAccountsList() {
             const chkBtn = document.createElement("button");
             chkBtn.type = "button";
             chkBtn.className = "btn btn-muted btn-sm";
-            chkBtn.textContent = "فحص / إعادة دخول";
-            chkBtn.onclick = () => checkSingleAccount(a.id, true);
+            chkBtn.textContent = "فحص الجلسة";
+            chkBtn.onclick = () => checkSingleAccount(a.id, false);
             btnRow.appendChild(chkBtn);
+
+            if (!a.password || a.password !== "[SESSION_COOKIES]") {
+                const relogBtn = document.createElement("button");
+                relogBtn.type = "button";
+                relogBtn.className = "btn btn-muted btn-sm";
+                relogBtn.textContent = "حذف الجلسة وإعادة الدخول";
+                relogBtn.onclick = () => checkSingleAccount(a.id, true);
+                btnRow.appendChild(relogBtn);
+            }
 
             const hitlBtn = document.createElement("button");
             hitlBtn.type = "button";

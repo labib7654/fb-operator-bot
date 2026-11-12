@@ -261,6 +261,34 @@ def start_public_tunnel_discovery(port: int, on_url_ready: Callable[[str], None]
     ).start()
 
 
+def _serialize_manageable_account(
+    a: dict,
+    include_secrets: bool = False,
+    is_dev: bool = False,
+    px_bindings: dict | None = None,
+) -> dict[str, Any]:
+    """تنسيق بيانات الحساب للوحة Mini App مع حجب كلمات المرور والبروكسي الخام عن غير المطور."""
+    owner_lbl = f"{a.get('owner_name', '')} ({a.get('owner_id', '')})" if a.get("owner_id") else "حساب نظام"
+    item: dict[str, Any] = {
+        "id": a["id"],
+        "name": a.get("name", a["id"]),
+        "email": a.get("email", ""),
+        "is_active": "نشط" in str(a.get("status", "")),
+        "owner_label": owner_lbl,
+        "diagnostic_reason": a.get("diagnostic_reason", ""),
+        "bound_proxy": str(a.get("bound_proxy") or ""),
+        "bound_proxy_country": str(a.get("bound_proxy_country") or ""),
+    }
+    if include_secrets:
+        item["password"] = a.get("password", "")
+        item["added_at"] = a.get("added_at", "")
+        if is_dev and px_bindings:
+            raw_b = str(px_bindings.get(str(a.get("id") or "")) or "").strip()
+            if raw_b:
+                item["bound_proxy"] = raw_b
+    return item
+
+
 def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
     """إنشاء Handler خادم HTTP متعدد الخيوط ومحصّن ببوابة HMAC-SHA256 وصلاحيات RBAC."""
 
@@ -479,18 +507,11 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
 
                 manageable_safe = []
                 if cap_pool or perms.get("can_add_accounts") or perms.get("can_delete_accounts"):
+                    px_bindings = (prx.load_proxy_state().get("bindings") or {}) if is_dev else {}
                     for a in hooks["get_manageable_accounts_for_user"](uid):
-                        owner_lbl = f"{a.get('owner_name', '')} ({a.get('owner_id', '')})" if a.get("owner_id") else "حساب نظام"
-                        manageable_safe.append({
-                            "id": a["id"],
-                            "name": a.get("name", a["id"]),
-                            "email": a.get("email", ""),
-                            "is_active": "نشط" in str(a.get("status", "")),
-                            "owner_label": owner_lbl,
-                            "diagnostic_reason": a.get("diagnostic_reason", ""),
-                            "bound_proxy": str(a.get("bound_proxy") or ""),
-                            "bound_proxy_country": str(a.get("bound_proxy_country") or ""),
-                        })
+                        manageable_safe.append(_serialize_manageable_account(
+                            a, include_secrets=cap_pool, is_dev=is_dev, px_bindings=px_bindings
+                        ))
 
                 st = hooks["get_user_state"](uid)
                 mission_state = {
@@ -827,16 +848,11 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                             })
                 else:
                     if is_dev or cap_pool or perms.get("can_add_accounts") or perms.get("can_delete_accounts"):
+                        px_bindings = (prx.load_proxy_state().get("bindings") or {}) if is_dev else {}
                         for a in hooks["get_manageable_accounts_for_user"](uid):
-                            owner_lbl = f"{a.get('owner_name', '')} ({a.get('owner_id', '')})" if a.get("owner_id") else "حساب نظام"
-                            items.append({
-                                "id": a["id"],
-                                "name": a.get("name", a["id"]),
-                                "email": a.get("email", ""),
-                                "is_active": "نشط" in str(a.get("status", "")),
-                                "owner_label": owner_lbl,
-                                "diagnostic_reason": a.get("diagnostic_reason", ""),
-                            })
+                            items.append(_serialize_manageable_account(
+                                a, include_secrets=(is_dev or cap_pool), is_dev=is_dev, px_bindings=px_bindings
+                            ))
 
                 if q_str:
                     items = [

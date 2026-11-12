@@ -1147,6 +1147,25 @@ def delete_single_proxy(selector: str | int, auto_rebind: bool = True) -> dict[s
     }
 
 
+def unbind_accounts(account_ids: list[str] | tuple[str, ...] | set[str]) -> int:
+    """فك ربط حسابات محذوفة من سجل البروكسيات لتحرير خاناتها فوراً دون حذف البروكسي نفسه من التجمع."""
+    clean_ids = {str(aid or "").strip() for aid in (account_ids or []) if str(aid or "").strip()}
+    if not clean_ids:
+        return 0
+    removed = 0
+    with _proxy_lock:
+        state = load_proxy_state()
+        bindings = state.get("bindings")
+        if isinstance(bindings, dict):
+            for aid in list(bindings.keys()):
+                if str(aid) in clean_ids:
+                    bindings.pop(aid, None)
+                    removed += 1
+        if removed > 0:
+            save_proxy_state(state, notify=True)
+    return removed
+
+
 def run_scheduled_proxy_watchdog(force: bool = False) -> dict[str, Any]:
     """مراقب آلي دوري يفحص جميع البروكسيات ويرسل تنبيهاً فورياً عند سقوط أو تعافي أي IP."""
     if not _watchdog_run_lock.acquire(blocking=False):

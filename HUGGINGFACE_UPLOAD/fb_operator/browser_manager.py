@@ -9,6 +9,7 @@ import re
 import sys
 import json
 import time
+import shutil
 import random
 import hashlib
 import threading
@@ -153,6 +154,51 @@ def save_account_storage_state(
         return True
     except Exception:
         return False
+
+
+def clear_account_storage_state(profile_dir_or_id: str | Path, account_id: str = "") -> bool:
+    """حذف الجلسة السابقة بالكامل (ملف الكوكيز وملف التحقق المعلق وبيانات الجلسة في المتصفح) مع الإبقاء على بصمة الجهاز."""
+    session_file = _resolve_session_file(profile_dir_or_id)
+    for target in (
+        session_file,
+        session_file.with_suffix(".pending.json"),
+        session_file.with_suffix(".tmp"),
+        session_file.with_suffix(".pending.tmp"),
+    ):
+        try:
+            if target.exists():
+                target.unlink()
+        except Exception:
+            pass
+
+    profile_path = resolve_cross_platform_profile(profile_dir_or_id)
+    for rel in (
+        "Default/Cookies",
+        "Default/Cookies-journal",
+        "Default/Network/Cookies",
+        "Default/Network/Cookies-journal",
+        "Default/Local Storage",
+        "Default/Session Storage",
+        "Default/IndexedDB",
+        "Default/Storage",
+    ):
+        sub = profile_path / rel
+        try:
+            if sub.is_dir():
+                shutil.rmtree(sub, ignore_errors=True)
+            elif sub.exists():
+                sub.unlink()
+        except Exception:
+            pass
+
+    try:
+        from fb_operator.hitl_manager import pop_hitl_challenge_url
+        key = str(account_id or profile_path.name or "").strip()
+        if key:
+            pop_hitl_challenge_url(key)
+    except Exception:
+        pass
+    return True
 
 
 def restore_account_storage_state(context: BrowserContext, profile_dir_or_id: str | Path) -> bool:
@@ -505,6 +551,7 @@ def launch_account_browser(
     viewport_size: tuple[int, int] | None = None,
     mobile: bool = False,
     proxy: str | None = None,
+    fresh_session: bool = False,
 ) -> BrowserContext:
     """
     تشغيل متصفح كروم حقيقي ببروفايل مستمر وبصمة متسقة لكل حساب
@@ -513,6 +560,8 @@ def launch_account_browser(
     profile_path = resolve_cross_platform_profile(profile_dir)
     profile_path.mkdir(parents=True, exist_ok=True)
     _cleanup_stale_profile_locks(profile_path)
+    if fresh_session:
+        clear_account_storage_state(profile_path)
 
     is_linux = sys.platform.startswith("linux")
     fp = _get_account_fingerprint(profile_path, is_linux)
@@ -735,7 +784,13 @@ def launch_account_browser(
     _CTX_PROFILES[id(context)] = profile_path
     if proxy_srv:
         _CTX_PROXIES[id(context)] = proxy_srv
-    restore_account_storage_state(context, profile_path)
+    if fresh_session:
+        try:
+            context.clear_cookies()
+        except Exception:
+            pass
+    else:
+        restore_account_storage_state(context, profile_path)
     return context
 
 
@@ -901,7 +956,15 @@ def _warmup_human_presence(page: Page, feed_browse: bool = False) -> None:
         pass
 
 
-def auto_login_facebook(context: BrowserContext, page: Page, email: str, password: str, status_callback=None, max_wait: int = 90) -> bool:
+def auto_login_facebook(
+    context: BrowserContext,
+    page: Page,
+    email: str,
+    password: str,
+    status_callback=None,
+    max_wait: int = 90,
+    force_fresh: bool = False,
+) -> bool:
     """
     تسجيل الدخول وإعادة الدخول التلقائي في فيسبوك بمحاكاة بشرية متدرجة،
     مع دعم نماذج (البريد + كلمة المرور) أو (إعادة إدخال كلمة المرور للحساب المحفوظ) أو (المتابعة بحساب مسجل).
@@ -915,8 +978,14 @@ def auto_login_facebook(context: BrowserContext, page: Page, email: str, passwor
     clean_email = str(email or "").strip()
     clean_pass = "" if str(password or "").strip() == "[SESSION_COOKIES]" else str(password or "")
 
-    # 1. التحقق الحي من الجلسة الحالية
-    is_logged, _ = check_facebook_login_cookies(context)
+    if force_fresh:
+        try:
+            context.clear_cookies()
+        except Exception:
+            pass
+
+    # 1. التحقق الحي من الجلسة الحالية (يُتخطى عند طلب إعادة الدخول الجديدة بالكامل)
+    is_logged, _ = (False, "") if force_fresh else check_facebook_login_cookies(context)
     if is_logged:
         curr_now = (getattr(page, "url", "") or "").lower()
         if "facebook.com" not in curr_now:
@@ -970,28 +1039,29 @@ def auto_login_facebook(context: BrowserContext, page: Page, email: str, passwor
         log(f"تنبيه: {reason}")
         return False
 
-    # دعم بطاقة "المتابعة باسم ..." في حال ظهورها قبل النموذج
-    try:
-        for cont_sel in (
-            'div[role="button"]:has-text("متابعة")',
-            'button:has-text("متابعة")',
-            'div[role="button"]:has-text("Continue")',
-            'button:has-text("Continue")',
-        ):
-            cloc = page.locator(cont_sel).first
-            if cloc.is_visible(timeout=450):
-                human_click(page, cloc, timeout=2500)
-                time.sleep(random.uniform(1.5, 2.5))
-                dismiss_dialogs(page)
-                d_cont = diagnose_facebook_challenge(page)
-                logged_now, _ = check_facebook_login_cookies(context)
-                if logged_now and d_cont["is_ok"]:
-                    save_account_storage_state(context)
-                    log("تم تسجيل الدخول عبر بطاقة المتابعة المحفوظة.")
-                    return True
-                break
-    except Exception:
-        pass
+    # دعم بطاقة "المتابعة باسم ..." في حال ظهورها قبل النموذج (يُتخطى عند فرض إعادة دخول جديدة بالكامل)
+    if not force_fresh:
+        try:
+            for cont_sel in (
+                'div[role="button"]:has-text("متابعة")',
+                'button:has-text("متابعة")',
+                'div[role="button"]:has-text("Continue")',
+                'button:has-text("Continue")',
+            ):
+                cloc = page.locator(cont_sel).first
+                if cloc.is_visible(timeout=450):
+                    human_click(page, cloc, timeout=2500)
+                    time.sleep(random.uniform(1.5, 2.5))
+                    dismiss_dialogs(page)
+                    d_cont = diagnose_facebook_challenge(page)
+                    logged_now, _ = check_facebook_login_cookies(context)
+                    if logged_now and d_cont["is_ok"]:
+                        save_account_storage_state(context)
+                        log("تم تسجيل الدخول عبر بطاقة المتابعة المحفوظة.")
+                        return True
+                    break
+        except Exception:
+            pass
 
     _warmup_human_presence(page)
 
