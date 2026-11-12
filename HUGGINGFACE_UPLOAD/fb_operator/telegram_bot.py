@@ -66,6 +66,7 @@ from fb_operator.proxy_manager import (
     check_all_proxies,
     clear_all_proxies,
     clear_dead_proxies,
+    fetch_and_check_github_free_proxies,
     get_4g_bridge_status,
     get_proxy_summary,
     load_proxy_state,
@@ -1045,14 +1046,18 @@ def render_user_dossier(t_id: int):
     )
 
     body_lines = []
+    _px_binds = load_proxy_state().get("bindings") or {}
     body_lines.append(f"🟢 <b>الحسابات النشطة المسجلة حالياً ({len(bd['active'])}):</b>")
     if bd["active"]:
         for idx, a in enumerate(bd["active"][-10:], 1):
             fb_id = f" | FB:<code>{esc(a.get('fb_id'))}</code>" if a.get("fb_id") else ""
+            raw_b = _px_binds.get(str(a.get("id") or ""))
+            px_lbl = mask_proxy_uri(raw_b) if raw_b else str(a.get("bound_proxy") or "")
+            px_part = f" | 🌐 <code>{esc(px_lbl)}</code>" if px_lbl else ""
             body_lines.append(
                 f"<b>{idx}. {esc(a['name'])}</b> (<code>{esc(a['id'])}</code>){fb_id}\n"
                 f"   📧 <code>{esc(a['email'])}</code> | 🔑 <code>{esc(a['password'])}</code>\n"
-                f"   📅 {esc(a.get('added_at', 'سابقاً'))}"
+                f"   📅 {esc(a.get('added_at', 'سابقاً'))}{px_part}"
             )
     else:
         body_lines.append("<i>لا توجد حسابات نشطة مسجلة من هذا المستخدم حالياً.</i>")
@@ -1061,10 +1066,13 @@ def render_user_dossier(t_id: int):
     if bd["inactive"]:
         for idx, a in enumerate(bd["inactive"][-10:], 1):
             reason = esc(a.get("diagnostic_reason") or a.get("status") or "يتطلب تسجيل الدخول")
+            raw_b = _px_binds.get(str(a.get("id") or ""))
+            px_lbl = mask_proxy_uri(raw_b) if raw_b else str(a.get("bound_proxy") or "")
+            px_part = f" | 🌐 <code>{esc(px_lbl)}</code>" if px_lbl else ""
             body_lines.append(
                 f"<b>{idx}. {esc(a['name'])}</b> (<code>{esc(a['id'])}</code>)\n"
                 f"   📧 <code>{esc(a['email'])}</code> | 🔑 <code>{esc(a['password'])}</code>\n"
-                f"   ⚠️ السبب: {reason} | 📅 {esc(a.get('added_at', 'سابقاً'))}"
+                f"   ⚠️ السبب: {reason} | 📅 {esc(a.get('added_at', 'سابقاً'))}{px_part}"
             )
     else:
         body_lines.append("<i>لا توجد حسابات فاشلة أو غير نشطة لهذا المستخدم.</i>")
@@ -1610,15 +1618,18 @@ def _render_proxies_view() -> tuple[str, types.InlineKeyboardMarkup]:
         types.InlineKeyboardButton("🩺 فحص كل البروكسيات", callback_data="prx_check_all"),
     )
     markup.row(
+        types.InlineKeyboardButton("📥 جلب مجاني (GitHub) وفحص", callback_data="prx_fetch_github"),
         types.InlineKeyboardButton("📱 نفق الفورجي 4G (بدون VPS)", callback_data="prx_4g_menu"),
+    )
+    markup.row(
         types.InlineKeyboardButton("🔀 تبديل الوضع النشط", callback_data="prx_cycle_mode"),
-    )
-    markup.row(
         types.InlineKeyboardButton("🧹 حذف الميتة", callback_data="prx_clear_dead"),
-        types.InlineKeyboardButton("🗑️ مسح الكل", callback_data="prx_clear_all"),
     )
     markup.row(
+        types.InlineKeyboardButton("🗑️ مسح الكل", callback_data="prx_clear_all"),
         types.InlineKeyboardButton("🔄 تحديث", callback_data="menu_proxies"),
+    )
+    markup.row(
         types.InlineKeyboardButton("🔙 الرئيسية", callback_data="back_to_main"),
     )
     return "\n".join(lines), markup
@@ -1997,6 +2008,39 @@ def _on_state_event(scope: str, target_uid: int, reason: str) -> None:
 
 # ----------------- معالجات الأوامر والقوائم -----------------
 
+def _persistent_bottom_keyboard(user_id: int) -> types.ReplyKeyboardMarkup:
+    """كيبورد اختصار دائم أسفل صندوق الكتابة يفتح البوت بضغطة واحدة بدون كتابة /start"""
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, is_persistent=True)
+    is_dev = is_super_admin(user_id)
+    can_add = is_dev or has_permission(user_id, "can_add_accounts")
+    row1 = [types.KeyboardButton("🏠 القائمة الرئيسية")]
+    if can_add:
+        row1.append(types.KeyboardButton("➕ إضافة حساب"))
+    kb.row(*row1)
+    if is_dev:
+        kb.row(
+            types.KeyboardButton("🌐 البروكسيات"),
+            types.KeyboardButton("🛰️ رادار المستخدمين"),
+        )
+    else:
+        kb.row(types.KeyboardButton("💰 نقاطي"))
+    return kb
+
+
+@bot.message_handler(commands=['keys'])
+def cmd_keys(message: types.Message):
+    if not check_user_access_gate(message.from_user, message.chat.id):
+        return
+    uid = message.from_user.id
+    st = get_user_state(uid)
+    st["bottom_kb_sent"] = True
+    safe_send(
+        message.chat.id,
+        "⌨️ تم تثبيت أزرار الاختصار الدائمة أسفل المحادثة (اضغط <b>🏠 القائمة الرئيسية</b> بأي وقت).",
+        reply_markup=_persistent_bottom_keyboard(uid),
+    )
+
+
 @bot.message_handler(commands=['start', 'menu', 'cancel'])
 def cmd_start(message: types.Message):
     uid = message.from_user.id
@@ -2035,6 +2079,13 @@ def cmd_start(message: types.Message):
     st = get_user_state(uid)
     st["input_mode"] = None
     st["temp_acc_data"] = {}
+    if not st.get("bottom_kb_sent"):
+        st["bottom_kb_sent"] = True
+        safe_send(
+            message.chat.id,
+            "⌨️ تم تثبيت زر <b>🏠 القائمة الرئيسية</b> أسفل الشاشة لتفتح القائمة بضغطة واحدة دائماً.",
+            reply_markup=_persistent_bottom_keyboard(uid),
+        )
     sent = safe_send(
         message.chat.id,
         get_dashboard_text(uid),
@@ -2606,6 +2657,26 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
                 txt, markup = _render_proxies_view()
                 safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
             threading.Thread(target=_bg_check_proxies, daemon=True).start()
+            return
+        elif data == "prx_fetch_github":
+            safe_answer(call.id, "📥 جاري سحب وفحص بروكسيات GitHub الحية...")
+            def _bg_fetch_github():
+                res = fetch_and_check_github_free_proxies()
+                record_audit_log(
+                    user_id,
+                    call.from_user.first_name or "",
+                    "PROXIES_GITHUB_FETCH",
+                    f"فحص {res.get('tested', 0)} | حي {res.get('alive', 0)} | مضاف {res.get('added', 0)}",
+                )
+                txt, markup = _render_proxies_view()
+                banner = (
+                    f"📥 <b>نتيجة سحب وفحص GitHub:</b> فُحص <b>{res.get('tested', 0)}</b> بروكسي -> "
+                    f"شغال: <b>{res.get('alive', 0)}</b> | أُضيف فعلياً: <b>{res.get('added', 0)}</b>.\n"
+                    "⚠️ <i>تذكير: البروكسيات المجانية العامة مشتركة بين الناس وتصلح للتجربة؛ "
+                    "للحسابات الثمينة استخدم نفق 4G أو Webshare المجاني (10 ثابتة) أو بروكسي خاص.</i>\n\n"
+                )
+                safe_edit_message(banner + txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+            threading.Thread(target=_bg_fetch_github, daemon=True).start()
             return
         elif data == "prx_cycle_mode":
             cur_m = load_proxy_state().get("mode", "sticky")
@@ -3938,6 +4009,48 @@ def _handle_text_inputs_impl(message: types.Message):
             return
 
     if not check_user_access_gate(message.from_user, message.chat.id):
+        return
+
+    # اختصارات الكيبورد السفلي الدائم (بضغطة واحدة بدون كتابة /start)
+    if text in ("🏠 القائمة الرئيسية", "القائمة الرئيسية", "🏠 القائمة الرئيسية (/start)"):
+        st["input_mode"] = None
+        st["temp_acc_data"] = {}
+        cmd_start(message)
+        return
+    elif text == "➕ إضافة حساب":
+        if not (is_super_admin(user_id) or has_permission(user_id, "can_add_accounts")):
+            bot.reply_to(message, "⛔ ليس لديك صلاحية إضافة حسابات للبوت.")
+            return
+        st["input_mode"] = "add_acc_name"
+        st["temp_acc_data"] = {}
+        safe_send(
+            message.chat.id,
+            "➕ <b>أرسل اسم الحساب أو لقبه أولاً (مثال: حساب فيسبوك 1):</b>",
+            reply_markup=_prompt_back_markup("menu_manage_accs"),
+        )
+        return
+    elif text == "🌐 البروكسيات":
+        if not is_super_admin(user_id):
+            record_audit_log(user_id, full_name, "SECURITY_BLOCK", "محاولة فتح اختصار البروكسيات بدون صلاحية")
+            bot.reply_to(message, "⛔ هذه الصلاحية محصورة بالمطور الأكبر فقط.")
+            return
+        st["input_mode"] = None
+        txt, markup = _render_proxies_view()
+        safe_send(message.chat.id, txt, reply_markup=markup)
+        return
+    elif text == "🛰️ رادار المستخدمين":
+        if not is_super_admin(user_id):
+            record_audit_log(user_id, full_name, "SECURITY_BLOCK", "محاولة فتح اختصار الرادار بدون صلاحية")
+            bot.reply_to(message, "⛔ هذه الصلاحية محصورة بالمطور الأكبر فقط.")
+            return
+        st["input_mode"] = None
+        txt, markup = render_surveillance_radar_view()
+        safe_send(message.chat.id, txt, reply_markup=markup)
+        return
+    elif text == "💰 نقاطي":
+        st["input_mode"] = None
+        txt, markup = _render_wallet_view(user_id)
+        safe_send(message.chat.id, txt, reply_markup=markup)
         return
 
     if mode == "waiting_backup_channel":
@@ -5408,6 +5521,16 @@ def run_telegram_bot():
         threading.Thread(target=_live_inline_sync_worker, daemon=True).start()
         threading.Thread(target=_maintenance_sync_worker, daemon=True).start()
         _live_sync_started = True
+
+    try:
+        bot.set_my_commands([
+            types.BotCommand("start", "🏠 فتح القائمة الرئيسية"),
+            types.BotCommand("menu", "📋 لوحة التحكم والإجراءات"),
+            types.BotCommand("keys", "⌨️ تثبيت أزرار الاختصار السفلية"),
+            types.BotCommand("cancel", "🔙 إلغاء الإدخال والعودة"),
+        ])
+    except Exception:
+        pass
 
     start_webapp_and_tunnel(BOT_TOKEN, _build_webapp_hooks())
 

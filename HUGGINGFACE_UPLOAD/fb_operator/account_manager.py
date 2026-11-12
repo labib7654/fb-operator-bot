@@ -322,6 +322,26 @@ def add_account(name: str, email: str, password: str, owner_id: int = 0, owner_n
         accounts.append(new_acc)
         save_accounts(accounts, sync_git=False)
 
+    # ربط البروكسي المثبت (Sticky) فور إنشاء الحساب وحفظه في القاعدة المحلية والسحابية مباشرة
+    try:
+        from fb_operator.proxy_manager import resolve_proxy_for_account, mask_proxy_uri
+        px_res = resolve_proxy_for_account(account_id=account_id)
+        if px_res.get("source") in ("sticky_pool", "4g_bridge", "env_proxy") and px_res.get("raw_uri"):
+            masked_px = mask_proxy_uri(px_res["raw_uri"])
+            cc = str((px_res.get("geo_hints") or {}).get("country_code") or "").upper()
+            new_acc["bound_proxy"] = masked_px
+            if cc:
+                new_acc["bound_proxy_country"] = cc
+            update_account(account_id, {"bound_proxy": masked_px, "bound_proxy_country": cc}, sync_git=False)
+    except Exception:
+        pass
+
+    try:
+        from fb_operator.persistence_manager import notify_data_changed
+        notify_data_changed("account_add")
+    except Exception:
+        pass
+
     publish_event("accounts", int(owner_id) if owner_id else 0, "account_add")
     return dict(new_acc)
 

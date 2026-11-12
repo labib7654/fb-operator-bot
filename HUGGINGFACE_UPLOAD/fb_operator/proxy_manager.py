@@ -640,6 +640,111 @@ def check_all_proxies(max_workers: int = 12, timeout: float = 8.0) -> dict[str, 
     return {"checked": len(items), "alive": alive_cnt, "dead": dead_cnt}
 
 
+GITHUB_FREE_PROXY_SOURCES: tuple[tuple[str, str], ...] = (
+    ("socks5", "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/socks5/data.txt"),
+    ("http", "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/http/data.txt"),
+    ("socks5", "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt"),
+    ("socks5", "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt"),
+)
+
+
+def fetch_and_check_github_free_proxies(
+    limit_candidates: int = 36,
+    max_keep: int = 12,
+    timeout: float = 4.5,
+    max_workers: int = 12,
+    sources: tuple[tuple[str, str], ...] | None = None,
+) -> dict[str, Any]:
+    """
+    جلب قائمة بروكسيات مجانية مفتوحة من GitHub وفلترتها بفحص اتصال HTTPS حقيقي قبل إضافتها للتجمع.
+    تنبيه: القوائم العامة مشتركة ولا تُقارن ببروكسيات 4G أو الخاصة للحسابات الحساسة.
+    """
+    feed_list = sources or GITHUB_FREE_PROXY_SOURCES
+    candidates: list[str] = []
+    seen_cand: set[str] = set()
+    sources_ok = 0
+
+    for scheme, url in feed_list:
+        if len(candidates) >= limit_candidates:
+            break
+        try:
+            resp = requests.get(url, timeout=6.0)
+            if resp.status_code != 200 or not resp.text:
+                continue
+            sources_ok += 1
+            for raw_line in resp.text.splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "://" not in line:
+                    line = f"{scheme}://{line}"
+                norm = normalize_proxy_uri(line)
+                if norm and norm not in seen_cand:
+                    seen_cand.add(norm)
+                    candidates.append(norm)
+                    if len(candidates) >= limit_candidates:
+                        break
+        except Exception:
+            continue
+
+    if not candidates:
+        return {
+            "ok": False,
+            "sources_ok": sources_ok,
+            "fetched": 0,
+            "tested": 0,
+            "alive": 0,
+            "added": 0,
+            "error": "تعذر سحب قوائم البروكسيات من GitHub حالياً.",
+        }
+
+    verified: list[dict[str, Any]] = []
+    workers = max(1, min(max_workers, len(candidates)))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(check_proxy_health, uri, timeout): uri for uri in candidates}
+        for fut in as_completed(futs):
+            try:
+                res = fut.result()
+                # للمجاني المشترك نُشترط عبور اتصال HTTPS فعلي وعودة exit_ip حقيقي (لا نكتفي بفحص منفذ TCP)
+                if res.get("alive") and res.get("exit_ip"):
+                    verified.append(res)
+            except Exception:
+                pass
+
+    verified.sort(key=lambda r: int(r.get("latency_ms") or 9999))
+    chosen = verified[:max(1, max_keep)] if verified else []
+    added_cnt = 0
+    if chosen:
+        bulk_res = add_proxies_bulk("\n".join(r["uri"] for r in chosen))
+        added_cnt = int(bulk_res.get("added") or 0)
+        by_uri = {r["uri"]: r for r in chosen}
+        now_iso = datetime.now().isoformat(timespec="seconds")
+        with _proxy_lock:
+            fresh = load_proxy_state()
+            for p in fresh["proxies"]:
+                r = by_uri.get(p.get("uri", ""))
+                if r:
+                    p["alive"] = True
+                    p["latency_ms"] = r.get("latency_ms")
+                    p["last_checked"] = now_iso
+                    p["fail_count"] = 0
+                    p["source_tag"] = "github_free"
+                    for gk in ("exit_ip", "country_code", "country_name", "timezone"):
+                        if r.get(gk):
+                            p[gk] = r[gk]
+            save_proxy_state(fresh, notify=True)
+
+    return {
+        "ok": True,
+        "sources_ok": sources_ok,
+        "fetched": len(candidates),
+        "tested": len(candidates),
+        "alive": len(verified),
+        "added": added_cnt,
+        "kept": len(chosen),
+    }
+
+
 def mark_proxy_failure(proxy_uri: str) -> None:
     target = normalize_proxy_uri(proxy_uri) or str(proxy_uri or "").strip()
     if not target:
@@ -773,7 +878,7 @@ def resolve_proxy_for_account(
                 chosen = _pick_least_loaded_proxy(state)
                 if chosen and acc_key:
                     state["bindings"][acc_key] = chosen["uri"]
-                    save_proxy_state(state, notify=False)
+                    save_proxy_state(state, notify=True)
 
             if chosen:
                 pw_cfg = build_playwright_proxy_config(chosen["uri"])

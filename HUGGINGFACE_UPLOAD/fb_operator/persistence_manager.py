@@ -851,6 +851,11 @@ def _merge_staged_payload(staged_json: dict[str, bytes], staged_sessions: dict[s
                     if inc_a.get("owner_name"):
                         cur_a["owner_name"] = inc_a["owner_name"]
                     upgraded = True
+                if not cur_a.get("bound_proxy") and inc_a.get("bound_proxy"):
+                    cur_a["bound_proxy"] = str(inc_a["bound_proxy"])
+                    if inc_a.get("bound_proxy_country"):
+                        cur_a["bound_proxy_country"] = str(inc_a["bound_proxy_country"])
+                    upgraded = True
 
                 cur_sf = sessions_dir / f"{cur_id}.json"
                 cur_has_valid_sess = _session_bytes_has_c_user(cur_sf.read_bytes() if cur_sf.exists() else None)
@@ -1105,8 +1110,9 @@ def _merge_staged_payload(staged_json: dict[str, bytes], staged_sessions: dict[s
             cur_binds = cur_proxies.get("bindings") if isinstance(cur_proxies.get("bindings"), dict) else {}
             inc_binds = inc_proxies.get("bindings") if isinstance(inc_proxies.get("bindings"), dict) else {}
             for acc_k, p_uri in inc_binds.items():
-                if acc_k not in cur_binds and p_uri:
-                    cur_binds[str(acc_k)] = str(p_uri)
+                mapped_k = id_remap.get(str(acc_k), str(acc_k))
+                if mapped_k and mapped_k not in cur_binds and p_uri:
+                    cur_binds[mapped_k] = str(p_uri)
             cur_proxies["bindings"] = cur_binds
             if not cur_proxies.get("mode") and inc_proxies.get("mode"):
                 cur_proxies["mode"] = str(inc_proxies.get("mode"))
