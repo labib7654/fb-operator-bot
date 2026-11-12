@@ -153,6 +153,11 @@ def navigate_to_target(page: Page, target_url: str) -> bool:
             return False
         return True
     except Exception as e:
+        try:
+            from fb_operator.browser_manager import detect_and_report_proxy_error
+            detect_and_report_proxy_error(getattr(page, "context", None), e)
+        except Exception:
+            pass
         set_page_diag(page, f"خطأ أثناء فتح الرابط: {e}")
         print(f"[-] تعذر فتح الرابط المستهدف: {e}")
         return False

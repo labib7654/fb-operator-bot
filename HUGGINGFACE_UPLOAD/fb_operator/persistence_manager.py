@@ -1119,15 +1119,26 @@ def _merge_staged_payload(staged_json: dict[str, bytes], staged_sessions: dict[s
             if not isinstance(cur_proxies, dict):
                 cur_proxies = {}
             cur_list = cur_proxies.get("proxies") if isinstance(cur_proxies.get("proxies"), list) else []
-            seen_uris = {str(p.get("uri", "")).strip() for p in cur_list if isinstance(p, dict) and p.get("uri")}
+            by_uri_existing = {
+                str(p.get("uri", "")).strip(): p
+                for p in cur_list
+                if isinstance(p, dict) and p.get("uri")
+            }
             for item in (inc_proxies.get("proxies") or []):
                 if not isinstance(item, dict):
                     continue
                 u = str(item.get("uri", "")).strip()
-                if u and u not in seen_uris:
-                    cur_list.append(dict(item))
-                    seen_uris.add(u)
+                if not u:
+                    continue
+                if u not in by_uri_existing:
+                    copied = dict(item)
+                    cur_list.append(copied)
+                    by_uri_existing[u] = copied
                     stats["proxies_added"] += 1
+                else:
+                    ex = by_uri_existing[u]
+                    for cnt_k in ("uses_count", "success_count", "total_fail_count"):
+                        ex[cnt_k] = max(int(ex.get(cnt_k) or 0), int(item.get(cnt_k) or 0))
             cur_proxies["proxies"] = cur_list
             cur_binds = cur_proxies.get("bindings") if isinstance(cur_proxies.get("bindings"), dict) else {}
             inc_binds = inc_proxies.get("bindings") if isinstance(inc_proxies.get("bindings"), dict) else {}
@@ -1138,6 +1149,10 @@ def _merge_staged_payload(staged_json: dict[str, bytes], staged_sessions: dict[s
             cur_proxies["bindings"] = cur_binds
             if not cur_proxies.get("mode") and inc_proxies.get("mode"):
                 cur_proxies["mode"] = str(inc_proxies.get("mode"))
+            if "auto_check_enabled" not in cur_proxies and "auto_check_enabled" in inc_proxies:
+                cur_proxies["auto_check_enabled"] = bool(inc_proxies.get("auto_check_enabled"))
+            if not cur_proxies.get("auto_check_interval_sec") and inc_proxies.get("auto_check_interval_sec"):
+                cur_proxies["auto_check_interval_sec"] = int(inc_proxies.get("auto_check_interval_sec"))
             _atomic_write_bytes(json_map["proxies.json"], json.dumps(cur_proxies, ensure_ascii=False, indent=2).encode("utf-8"))
 
         if inc_ann and isinstance(inc_ann, dict):

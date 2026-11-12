@@ -583,6 +583,67 @@ def get_miniapp_html() -> str:
                 padding: 8px 11px;
             }
         }
+        .multi-acc-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+            gap: 6px;
+            margin-top: 8px;
+        }
+        .multi-acc-chip {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 6px;
+            padding: 8px 10px;
+            border-radius: 6px;
+            border: 1px solid var(--border);
+            background: var(--bg);
+            color: var(--text);
+            font-size: 12px;
+            font-weight: 600;
+            cursor: pointer;
+            text-align: right;
+        }
+        .multi-acc-chip.picked {
+            border-color: var(--accent);
+            background: rgba(31, 111, 235, 0.14);
+        }
+        .proxy-kpi-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+            gap: 8px;
+            margin-bottom: 12px;
+        }
+        .proxy-kpi-box {
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 8px 10px;
+        }
+        .proxy-kpi-val {
+            font-size: 16px;
+            font-weight: 700;
+            color: var(--text);
+            font-variant-numeric: tabular-nums;
+        }
+        .proxy-kpi-lbl {
+            font-size: 11px;
+            color: var(--muted);
+            margin-top: 2px;
+        }
+        .proxy-acc-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            padding: 3px 8px;
+            border-radius: 999px;
+            font-size: 11px;
+            font-weight: 600;
+            border: 1px solid var(--border);
+            background: var(--panel);
+            color: var(--text);
+            cursor: pointer;
+        }
     </style>
 </head>
 <body>
@@ -623,8 +684,9 @@ def get_miniapp_html() -> str:
             <div class="panel">
                 <div class="panel-title">إعدادات الهدف والمنفذ</div>
                 <div class="field" id="grpExecutor">
-                    <label>الحساب المنفذ</label>
-                    <select id="inpSelectedAcc"></select>
+                    <label>الحسابات المنفذة</label>
+                    <select id="inpSelectedAcc" onchange="onSelectedAccChange()"></select>
+                    <div id="multiAccPicker" class="multi-acc-grid hidden"></div>
                 </div>
                 <div class="field">
                     <label>الرابط المستهدف (صفحة، حساب، أو منشور)</label>
@@ -776,9 +838,14 @@ def get_miniapp_html() -> str:
             </div>
 
             <div class="panel" id="secExecute">
+                <div class="panel-title" style="margin-bottom:8px;">
+                    <span>انتظار الشاشة الحية عند طلب التحقق</span>
+                    <button type="button" class="switch-btn" id="btnTogWaitHitl" onclick="toggleWaitHitl()"></button>
+                </div>
                 <div id="missionCostBadge" class="mono" style="margin-bottom:8px;"></div>
                 <button type="button" class="btn btn-ok" id="btnLaunchMission" onclick="launchMission()">بدء تنفيذ المهمة في الخلفية الآن</button>
                 <div id="missionLiveBanner" class="status-banner hidden"></div>
+                <div id="missionHitlBox" class="status-banner hidden" style="margin-top:8px;border-color:rgba(210,153,34,0.6);"></div>
             </div>
         </div>
 
@@ -902,6 +969,20 @@ def get_miniapp_html() -> str:
                 </div>
                 <div class="row-2">
                     <div class="field">
+                        <label for="annDeliveryMode">نمط بطاقة تلغرام</label>
+                        <select id="annDeliveryMode"></select>
+                    </div>
+                    <div class="field">
+                        <label for="annRepeatBehavior">سلوك التكرار (منع التكدس)</label>
+                        <select id="annRepeatBehavior"></select>
+                    </div>
+                </div>
+                <div class="field">
+                    <label for="annEffect">التأثير التفاعلي بالرسالة</label>
+                    <select id="annEffect"></select>
+                </div>
+                <div class="row-2">
+                    <div class="field">
                         <label for="annDuration">مدة البقاء (إلغاء تلقائي عند الانتهاء)</label>
                         <select id="annDuration"></select>
                     </div>
@@ -927,8 +1008,8 @@ def get_miniapp_html() -> str:
                 </div>
                 <div class="item-row" style="margin-bottom:10px;">
                     <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:6px;text-transform:none;color:var(--text);">
-                        <input type="checkbox" id="annPinChat" checked style="width:auto;">
-                        <span>تثبيت كبطاقة عائمة أعلى محادثات المستخدمين في تلغرام</span>
+                        <input type="checkbox" id="annPinChat" style="width:auto;">
+                        <span>تثبيت أعلى المحادثة (اختياري — اتركه متوقفاً لمنع تكرار إشعارات التثبيت)</span>
                     </label>
                     <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:6px;text-transform:none;color:var(--text);">
                         <input type="checkbox" id="annPushNow" checked style="width:auto;">
@@ -939,11 +1020,60 @@ def get_miniapp_html() -> str:
                         <span>إبراز البطاقة العائمة تلقائياً عند فتح لوحة التحكم</span>
                     </label>
                 </div>
-                <button type="button" class="btn btn-primary" id="btnCreateAnn" onclick="createAnnouncementSubmit()">نشر وتثبيت الإعلان العائم الآن</button>
+                <button type="button" class="btn btn-primary" id="btnCreateAnn" onclick="createAnnouncementSubmit()">نشر وبث البطاقة الذكية الآن</button>
             </div>
             <div class="panel">
                 <div class="panel-title">الإعلانات المنشورة</div>
                 <div id="announcementsAdminList"></div>
+            </div>
+        </div>
+
+        <!-- تبويب البروكسيات والمراقبة الحية -->
+        <div id="tab-proxies" class="tab-view hidden">
+            <div class="panel">
+                <div class="panel-title">
+                    <span>مراقبة البروكسيات والاستخدام التفصيلي</span>
+                    <div style="display:flex;gap:6px;">
+                        <button type="button" class="btn btn-muted btn-sm" onclick="loadProxiesTab()">تحديث</button>
+                        <button type="button" class="btn btn-muted btn-sm" onclick="goHomeTab()">رجوع</button>
+                    </div>
+                </div>
+                <div id="proxyKpiGrid" class="proxy-kpi-grid"></div>
+                <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px;">
+                    <button type="button" class="btn btn-primary btn-sm" onclick="proxyAction('check_all')">فحص كل البروكسيات</button>
+                    <button type="button" class="btn btn-ok btn-sm" onclick="proxyAction('bind_existing')">توزيع وربط الحسابات</button>
+                    <button type="button" class="btn btn-muted btn-sm" onclick="proxyAction('fetch_github')">سحب وفحص GitHub</button>
+                    <button type="button" class="btn btn-muted btn-sm" id="btnProxyWatchToggle" onclick="proxyAction('toggle_watch')">المراقب التلقائي</button>
+                    <button type="button" class="btn btn-danger btn-sm" onclick="proxyAction('clear_dead')">حذف الميتة</button>
+                </div>
+                <div class="row-2" style="margin-bottom:10px;">
+                    <div class="field">
+                        <label for="inpProxyCap">الحد الآمن للحسابات لكل IP</label>
+                        <select id="inpProxyCap" onchange="proxyAction('set_cap', {limit: parseInt(this.value, 10)})">
+                            <option value="3">3 حسابات لكل IP (موصى به)</option>
+                            <option value="5">5 حسابات لكل IP (أقصى حد)</option>
+                            <option value="0">غير محدود</option>
+                        </select>
+                    </div>
+                    <div class="field">
+                        <label for="inpProxyInterval">فترة الفحص التلقائي المستمر</label>
+                        <select id="inpProxyInterval" onchange="proxyAction('set_interval', {seconds: parseInt(this.value, 10)})">
+                            <option value="60">كل 60 ثانية</option>
+                            <option value="120">كل دقيقتين</option>
+                            <option value="300">كل 5 دقائق</option>
+                            <option value="600">كل 10 دقائق</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="field">
+                    <label for="inpProxiesBulk">إضافة بروكسيات (socks5 / http / ip:port:user:pass)</label>
+                    <textarea id="inpProxiesBulk" rows="3" placeholder="45.38.107.97:6014:user:pass"></textarea>
+                </div>
+                <button type="button" class="btn btn-primary" onclick="submitBulkProxies()">حفظ البروكسيات وربط الحسابات فوراً</button>
+            </div>
+            <div class="panel">
+                <div class="panel-title">تفاصيل كل IP (عدد الاستخدامات + الحسابات المربوطة به)</div>
+                <div id="proxiesDetailList"></div>
             </div>
         </div>
     </div>
@@ -1210,6 +1340,9 @@ async function applyLiveSyncUpdate(scopes) {
     if ((fresh.is_super_admin || caps.announcements) && scList.includes("announcements") && activeTab === "announcements") {
         renderAnnouncementsList();
     }
+    if ((fresh.is_super_admin || caps.proxies) && (scList.includes("proxies") || scList.includes("accounts")) && activeTab === "proxies") {
+        await loadProxiesTab();
+    }
     if (scList.includes("announcements")) {
         const latestAnns = fresh.announcements || [];
         const newItem = latestAnns.find(a => !prevAnnIds.has(a.id)) || latestAnns[0];
@@ -1366,6 +1499,7 @@ function renderApp() {
         tabs.push({ id: "support", label: (isDev || caps.payment_notices) ? "صندوق الدعم والبيع" : "الدعم وبيع الحسابات" });
     }
     if (isDev || caps.radar_users) tabs.push({ id: "radar", label: "الرادار والصلاحيات" });
+    if (isDev || caps.proxies) tabs.push({ id: "proxies", label: "البروكسيات" });
     if (isDev || caps.announcements) tabs.push({ id: "announcements", label: "الإعلانات العائمة" });
     if (isDev || caps.points_economy) tabs.push({ id: "economy", label: "تسعيرة النقاط والوضع العام" });
     if (isDev || caps.audit_logs) tabs.push({ id: "audit", label: "سجل الرقابة" });
@@ -1417,6 +1551,7 @@ function renderApp() {
         populateAnnouncementFormMeta();
         renderAnnouncementsList();
     }
+    if (isDev || caps.proxies) renderProxiesTab(appState.proxy_report);
     syncPromoTicker();
 }
 
@@ -1434,6 +1569,7 @@ function switchTab(tabId, reloadData = true) {
 
     if (reloadData) {
         if (tabId === "radar") loadAdminRadar();
+        if (tabId === "proxies") loadProxiesTab();
         if (tabId === "announcements") loadAnnouncementsTab();
         if (tabId === "audit") loadAuditLogs();
         if (tabId === "economy") renderEconomyTab();
@@ -1485,6 +1621,10 @@ function populateMissionForm() {
     optAll.value = "all";
     optAll.textContent = "جميع الحسابات المتاحة النشطة";
     sel.appendChild(optAll);
+    const optMulti = document.createElement("option");
+    optMulti.value = "multi";
+    optMulti.textContent = "تحديد حسابات معينة (متعدد)";
+    sel.appendChild(optMulti);
     for (const a of (appState.usable_accounts || [])) {
         const opt = document.createElement("option");
         opt.value = a.id;
@@ -1492,6 +1632,7 @@ function populateMissionForm() {
         sel.appendChild(opt);
     }
     sel.value = ms.selected_acc || "all";
+    renderMultiAccPicker();
 
     document.getElementById("inpTargetUrl").value = ms.target_url || "";
     document.getElementById("inpAccLimit").value = ms.acc_count_limit || 0;
@@ -1520,9 +1661,60 @@ function populateMissionForm() {
     setToggleBtn("btnTogRepPost", !!ms.report_post);
     setToggleBtn("btnTogRepProf", !!ms.report_profile);
     setToggleBtn("btnTogBlock", !!ms.block);
+    setToggleBtn("btnTogWaitHitl", ms.wait_for_hitl !== false);
 
     renderMissionBanner();
     renderMissionCostBadge();
+}
+
+function onSelectedAccChange() {
+    if (!appState || !appState.mission_state) return;
+    const val = document.getElementById("inpSelectedAcc").value || "all";
+    appState.mission_state.selected_acc = val;
+    if (val === "multi" && (!Array.isArray(appState.mission_state.selected_accs) || !appState.mission_state.selected_accs.length)) {
+        appState.mission_state.selected_accs = [];
+    }
+    renderMultiAccPicker();
+    renderMissionCostBadge();
+}
+
+function renderMultiAccPicker() {
+    const box = document.getElementById("multiAccPicker");
+    if (!box || !appState || !appState.mission_state) return;
+    const ms = appState.mission_state;
+    const selVal = document.getElementById("inpSelectedAcc")?.value || ms.selected_acc || "all";
+    box.classList.toggle("hidden", selVal !== "multi");
+    if (selVal !== "multi") return;
+
+    const picked = new Set(Array.isArray(ms.selected_accs) ? ms.selected_accs : []);
+    box.innerHTML = "";
+    for (const a of (appState.usable_accounts || [])) {
+        const chip = document.createElement("button");
+        chip.type = "button";
+        chip.className = "multi-acc-chip" + (picked.has(a.id) ? " picked" : "");
+        const left = document.createElement("span");
+        left.textContent = (picked.has(a.id) ? "☑ " : "☐ ") + a.name;
+        const badge = document.createElement("span");
+        badge.className = a.is_active ? "badge-ok" : "badge-bad";
+        badge.textContent = a.is_active ? "نشط" : "متوقف";
+        chip.appendChild(left);
+        chip.appendChild(badge);
+        chip.onclick = () => {
+            const arr = new Set(Array.isArray(ms.selected_accs) ? ms.selected_accs : []);
+            if (arr.has(a.id)) arr.delete(a.id);
+            else arr.add(a.id);
+            ms.selected_accs = Array.from(arr);
+            renderMultiAccPicker();
+            renderMissionCostBadge();
+        };
+        box.appendChild(chip);
+    }
+}
+
+function toggleWaitHitl() {
+    if (!appState || !appState.mission_state) return;
+    appState.mission_state.wait_for_hitl = !(appState.mission_state.wait_for_hitl !== false);
+    setToggleBtn("btnTogWaitHitl", !!appState.mission_state.wait_for_hitl);
 }
 
 function renderMissionCostBadge() {
@@ -1544,7 +1736,12 @@ function renderMissionCostBadge() {
     const activePool = usable.filter(a => a.is_active);
     const poolLen = activePool.length || usable.length || 1;
     const lim = parseInt(document.getElementById("inpAccLimit")?.value || ms.acc_count_limit || "0", 10) || 0;
-    const estAccs = selAcc !== "all" ? 1 : (lim > 0 ? Math.min(poolLen, lim) : poolLen);
+    let estAccs = 1;
+    if (selAcc === "multi") {
+        estAccs = Math.max(1, (ms.selected_accs || []).length);
+    } else if (selAcc === "all") {
+        estAccs = lim > 0 ? Math.min(poolLen, lim) : poolLen;
+    }
     const totalCost = perAcc * estAccs;
     const bal = (appState.wallet && appState.wallet.points) || 0;
     if (appState.points_enforced) {
@@ -1560,17 +1757,75 @@ function renderMissionBanner() {
     const ms = appState.mission_state || {};
     const banner = document.getElementById("missionLiveBanner");
     const btn = document.getElementById("btnLaunchMission");
+    const hitlBox = document.getElementById("missionHitlBox");
     if (btn) btn.disabled = !!ms.is_running;
     if (ms.live_status_text) {
         banner.classList.remove("hidden");
         banner.textContent = ms.live_status_text;
     }
+    if (hitlBox) {
+        if (ms.waiting_hitl_acc_id) {
+            hitlBox.classList.remove("hidden");
+            hitlBox.innerHTML = "";
+            const title = document.createElement("div");
+            title.style.fontWeight = "700";
+            title.style.marginBottom = "6px";
+            title.textContent = "المهمة متوقفة مؤقتاً بانتظار إكمال التحقق للحساب: " + ms.waiting_hitl_acc_id;
+            const reasonEl = document.createElement("div");
+            reasonEl.className = "mono";
+            reasonEl.style.marginBottom = "8px";
+            reasonEl.textContent = ms.waiting_hitl_reason || "افتح الشاشة الحية لحل التحقق وسيُستكمل التنفيذ تلقائياً.";
+            const actions = document.createElement("div");
+            actions.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;";
+            const bOpen = document.createElement("button");
+            bOpen.type = "button";
+            bOpen.className = "btn btn-primary btn-sm";
+            bOpen.textContent = "فتح الشاشة الحية الآن";
+            bOpen.onclick = () => openHitlLive(ms.waiting_hitl_acc_id, ms.waiting_hitl_acc_id);
+            const bResume = document.createElement("button");
+            bResume.type = "button";
+            bResume.className = "btn btn-ok btn-sm";
+            bResume.textContent = "أكملت التحقق — تابع";
+            bResume.onclick = () => sendMissionHitlDecision(ms.waiting_hitl_acc_id, "verified");
+            const bSkip = document.createElement("button");
+            bSkip.type = "button";
+            bSkip.className = "btn btn-muted btn-sm";
+            bSkip.textContent = "تخطي الحساب";
+            bSkip.onclick = () => sendMissionHitlDecision(ms.waiting_hitl_acc_id, "skip");
+            const bAbort = document.createElement("button");
+            bAbort.type = "button";
+            bAbort.className = "btn btn-danger btn-sm";
+            bAbort.textContent = "إيقاف المهمة";
+            bAbort.onclick = () => sendMissionHitlDecision(ms.waiting_hitl_acc_id, "abort");
+            actions.appendChild(bOpen);
+            actions.appendChild(bResume);
+            actions.appendChild(bSkip);
+            actions.appendChild(bAbort);
+            hitlBox.appendChild(title);
+            hitlBox.appendChild(reasonEl);
+            hitlBox.appendChild(actions);
+        } else {
+            hitlBox.classList.add("hidden");
+        }
+    }
+}
+
+async function sendMissionHitlDecision(accId, decision) {
+    try {
+        await apiCall("/api/mission/hitl_decision", "POST", { account_id: accId, decision: decision });
+        showToast(decision === "verified" ? "سيتم استئناف المهمة فوراً!" : "تم إرسال القرار.");
+    } catch (e) {
+        showToast(e.message);
+    }
 }
 
 async function launchMission() {
     const ms = appState.mission_state;
+    const selVal = document.getElementById("inpSelectedAcc").value || "all";
     const payload = {
-        selected_acc: document.getElementById("inpSelectedAcc").value || "all",
+        selected_acc: selVal,
+        selected_accs: selVal === "multi" ? (ms.selected_accs || []) : [],
+        wait_for_hitl: ms.wait_for_hitl !== false,
         target_url: document.getElementById("inpTargetUrl").value.trim(),
         acc_count_limit: parseInt(document.getElementById("inpAccLimit").value || "0", 10) || 0,
         like: !!ms.like,
@@ -1665,6 +1920,13 @@ function renderAccountsList() {
             row.appendChild(ownLine);
         }
 
+        if (a.bound_proxy) {
+            const pLine = document.createElement("div");
+            pLine.className = "mono";
+            pLine.textContent = "البروكسي المثبت: " + a.bound_proxy + (a.bound_proxy_country ? " [" + a.bound_proxy_country + "]" : "");
+            row.appendChild(pLine);
+        }
+
         if (!a.is_active && a.diagnostic_reason) {
             const reasonLine = document.createElement("div");
             reasonLine.className = "badge-bad";
@@ -1676,11 +1938,11 @@ function renderAccountsList() {
         const btnRow = document.createElement("div");
         btnRow.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;margin-top:6px;";
 
-        if (!a.is_active && (isDev || p.can_add_accounts || p.can_use_accounts)) {
+        if (isDev || p.can_add_accounts || p.can_use_accounts) {
             const hitlBtn = document.createElement("button");
             hitlBtn.type = "button";
-            hitlBtn.className = "btn btn-primary btn-sm";
-            hitlBtn.textContent = "الشاشة الحية لحل التحقق";
+            hitlBtn.className = a.is_active ? "btn btn-muted btn-sm" : "btn btn-primary btn-sm";
+            hitlBtn.textContent = a.is_active ? "الشاشة الحية (فحص/تثبيت)" : "الشاشة الحية لحل التحقق";
             hitlBtn.onclick = () => openHitlLive(a.id, a.name);
             btnRow.appendChild(hitlBtn);
         }
@@ -3040,6 +3302,7 @@ function showPromoToast(ann) {
     } else {
         card.classList.add(":popover-open");
     }
+    try { tg?.HapticFeedback?.notificationOccurred("success"); } catch (_) {}
     schedulePromoToastAutoHide();
 }
 
@@ -3075,6 +3338,7 @@ function openPromoModal(ann) {
     if (!modal.open && typeof modal.showModal === "function") {
         modal.showModal();
     }
+    try { tg?.HapticFeedback?.impactOccurred("medium"); } catch (_) {}
 }
 
 function closePromoModalAnimated() {
@@ -3204,6 +3468,36 @@ function populateAnnouncementFormMeta() {
             selRep.appendChild(o);
         }
     }
+    const selDm = document.getElementById("annDeliveryMode");
+    if (selDm && !selDm.options.length) {
+        for (const [k, v] of Object.entries(meta.delivery_modes || {})) {
+            const o = document.createElement("option");
+            o.value = k;
+            o.textContent = v;
+            if (k === "animated_card") o.selected = true;
+            selDm.appendChild(o);
+        }
+    }
+    const selRb = document.getElementById("annRepeatBehavior");
+    if (selRb && !selRb.options.length) {
+        for (const [k, v] of Object.entries(meta.repeat_behaviors || {})) {
+            const o = document.createElement("option");
+            o.value = k;
+            o.textContent = v;
+            if (k === "replace") o.selected = true;
+            selRb.appendChild(o);
+        }
+    }
+    const selEff = document.getElementById("annEffect");
+    if (selEff && !selEff.options.length) {
+        for (const [k, v] of Object.entries(meta.effect_presets || {})) {
+            const o = document.createElement("option");
+            o.value = k;
+            o.textContent = v;
+            if (k === "none") o.selected = true;
+            selEff.appendChild(o);
+        }
+    }
 }
 
 async function loadAnnouncementsTab() {
@@ -3254,11 +3548,14 @@ function renderAnnouncementsList() {
         const metaLine = document.createElement("div");
         metaLine.className = "mono";
         metaLine.style.marginBottom = "8px";
+        const dmLabel = (appState.ann_meta && appState.ann_meta.delivery_modes && appState.ann_meta.delivery_modes[a.delivery_mode || "animated_card"]) || (a.delivery_mode || "animated_card");
+        const rbLabel = (appState.ann_meta && appState.ann_meta.repeat_behaviors && appState.ann_meta.repeat_behaviors[a.repeat_behavior || "replace"]) || (a.repeat_behavior || "replace");
         metaLine.textContent =
             "المدة: " + formatAnnRemainingAr(a) +
             " | التكرار: " + ((a.repeat_interval_sec || 0) > 0 ? ("كل " + Math.round(a.repeat_interval_sec / 60) + " د") : "مرة واحدة") +
-            " | تلقائي بالفتح: " + (a.repeat_on_open ? "نعم" : "لا") +
-            " | مثبت بالدردشة: " + (a.pin_in_chat ? "نعم" : "لا");
+            " | النمط: " + dmLabel +
+            " | السلوك: " + rbLabel +
+            " | تثبيت: " + (a.pin_in_chat ? "نعم" : "لا (بدون إزعاج)");
         row.appendChild(metaLine);
 
         const actRow = document.createElement("div");
@@ -3274,7 +3571,7 @@ function renderAnnouncementsList() {
         const bPush = document.createElement("button");
         bPush.type = "button";
         bPush.className = "btn btn-primary btn-sm";
-        bPush.textContent = "تثبيت وبث للجميع الآن";
+        bPush.textContent = "بث وإرسال للجميع الآن";
         bPush.onclick = () => manageAnnouncementAction(a.id, "push_now");
         actRow.appendChild(bPush);
 
@@ -3288,7 +3585,7 @@ function renderAnnouncementsList() {
         const bDel = document.createElement("button");
         bDel.type = "button";
         bDel.className = "btn btn-danger btn-sm";
-        bDel.textContent = "حذف وفك التثبيت";
+        bDel.textContent = "حذف الإعلان";
         bDel.onclick = () => manageAnnouncementAction(a.id, "delete");
         actRow.appendChild(bDel);
 
@@ -3313,6 +3610,9 @@ async function createAnnouncementSubmit() {
             body,
             badge: document.getElementById("annBadge")?.value || "ميزة جديدة",
             display_style: document.getElementById("annStyle")?.value || "floating_card",
+            delivery_mode: document.getElementById("annDeliveryMode")?.value || "animated_card",
+            repeat_behavior: document.getElementById("annRepeatBehavior")?.value || "replace",
+            effect_preset: document.getElementById("annEffect")?.value || "none",
             duration_sec: parseInt(document.getElementById("annDuration")?.value || "86400", 10) || 0,
             repeat_interval_sec: parseInt(document.getElementById("annRepeat")?.value || "3600", 10) || 0,
             cta_label: document.getElementById("annCtaLabel")?.value || "فتح الميزة الآن",
@@ -3433,6 +3733,170 @@ async function manageAnnouncementAction(annId, action) {
         });
     }
 })();
+
+async function loadProxiesTab() {
+    try {
+        const res = await apiCall("/api/proxies/status", "GET");
+        appState.proxy_report = res;
+        renderProxiesTab(res);
+    } catch (e) {
+        showToast(e.message);
+    }
+}
+
+async function proxyAction(act, extra) {
+    try {
+        const res = await apiCall("/api/proxies/manage", "POST", Object.assign({ action: act }, extra || {}));
+        showToast(res.message || "تم التحديث");
+        if (res.proxy_report) {
+            appState.proxy_report = res.proxy_report;
+            renderProxiesTab(res.proxy_report);
+        }
+    } catch (e) {
+        showToast(e.message);
+    }
+}
+
+async function submitBulkProxies() {
+    const inp = document.getElementById("inpProxiesBulk");
+    const txt = (inp && inp.value || "").trim();
+    if (!txt) {
+        showToast("ألصق قائمة البروكسيات أولاً");
+        return;
+    }
+    await proxyAction("add", { text: txt });
+    if (inp) inp.value = "";
+}
+
+function renderProxiesTab(report) {
+    const rep = report || (appState && appState.proxy_report);
+    const kpiBox = document.getElementById("proxyKpiGrid");
+    const listBox = document.getElementById("proxiesDetailList");
+    if (!kpiBox || !listBox) return;
+    if (!rep || !rep.summary) {
+        kpiBox.innerHTML = "";
+        listBox.textContent = "جاري التحميل...";
+        return;
+    }
+    const s = rep.summary;
+    const capSel = document.getElementById("inpProxyCap");
+    if (capSel) capSel.value = String(s.configured_max_per_proxy || 0);
+    const ivSel = document.getElementById("inpProxyInterval");
+    if (ivSel) ivSel.value = String(s.auto_check_interval_sec || 120);
+    const watchBtn = document.getElementById("btnProxyWatchToggle");
+    if (watchBtn) {
+        watchBtn.textContent = s.auto_check_enabled ? "المراقب الآلي: شغال" : "المراقب الآلي: متوقف";
+    }
+
+    const kpis = [
+        { val: String(s.total || 0), lbl: "إجمالي البروكسيات" },
+        { val: String(s.alive || 0) + " / " + String(s.dead || 0), lbl: "حي / متعطل" },
+        { val: String(s.bindings_count || 0) + (s.safe_capacity ? " / " + s.safe_capacity : ""), lbl: "حسابات مربوطة" },
+        { val: String(s.total_uses || 0), lbl: "إجمالي مرات التشغيل" },
+    ];
+    kpiBox.innerHTML = "";
+    for (const k of kpis) {
+        const box = document.createElement("div");
+        box.className = "proxy-kpi-box";
+        const vEl = document.createElement("div");
+        vEl.className = "proxy-kpi-val";
+        vEl.textContent = k.val;
+        const lEl = document.createElement("div");
+        lEl.className = "proxy-kpi-lbl";
+        lEl.textContent = k.lbl;
+        box.appendChild(vEl);
+        box.appendChild(lEl);
+        kpiBox.appendChild(box);
+    }
+
+    const items = rep.items || [];
+    listBox.innerHTML = "";
+    if (!items.length) {
+        const empty = document.createElement("div");
+        empty.className = "mono";
+        empty.textContent = "لا توجد بروكسيات مضافة بعد. ألصق بروكسيات Webshare أو اسحب من GitHub أعلاه.";
+        listBox.appendChild(empty);
+        return;
+    }
+
+    for (const it of items) {
+        const row = document.createElement("div");
+        row.className = "item-row";
+
+        const head = document.createElement("div");
+        head.className = "item-head";
+        const title = document.createElement("span");
+        title.className = "item-name";
+        title.textContent = "#" + (it.idx + 1) + "  " + (it.masked_uri || (it.host + ":" + it.port)) + (it.country_code ? " [" + it.country_code + "]" : "");
+        const badge = document.createElement("span");
+        badge.className = it.alive === true ? "badge-ok" : (it.alive === false ? "badge-bad" : "mono");
+        badge.textContent = it.alive === true ? ("يعمل" + (it.latency_ms ? " · " + it.latency_ms + "ms" : "")) : (it.alive === false ? "متعطل" : "لم يُفحص");
+        head.appendChild(title);
+        head.appendChild(badge);
+        row.appendChild(head);
+
+        const statsLine = document.createElement("div");
+        statsLine.className = "mono";
+        statsLine.textContent =
+            "الاستخدام: " + (it.uses_count || 0) +
+            " مرة (نجح " + (it.success_count || 0) + " · فشل " + (it.total_fail_count || 0) + ")" +
+            " | الحسابات: " + (it.bound_count || 0) + (it.max_per_proxy ? "/" + it.max_per_proxy : "");
+        row.appendChild(statsLine);
+
+        if (it.last_error) {
+            const errEl = document.createElement("div");
+            errEl.className = "badge-bad";
+            errEl.style.marginTop = "4px";
+            errEl.textContent = "سبب العطل: " + it.last_error;
+            row.appendChild(errEl);
+        }
+
+        const accWrap = document.createElement("div");
+        accWrap.style.cssText = "display:flex;gap:5px;flex-wrap:wrap;margin-top:6px;";
+        const bAccs = it.bound_accounts || [];
+        if (!bAccs.length) {
+            const noneChip = document.createElement("span");
+            noneChip.className = "mono";
+            noneChip.textContent = "لا توجد حسابات مربوطة بهذا الـ IP";
+            accWrap.appendChild(noneChip);
+        } else {
+            for (const b of bAccs) {
+                const chip = document.createElement("button");
+                chip.type = "button";
+                chip.className = "proxy-acc-chip";
+                const isAct = String(b.status || "").includes("نشط");
+                chip.textContent = (isAct ? "● " : "○ ") + b.name;
+                chip.onclick = () => openHitlLive(b.id, b.name);
+                accWrap.appendChild(chip);
+            }
+        }
+        row.appendChild(accWrap);
+
+        const btns = document.createElement("div");
+        btns.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;";
+        const bChk = document.createElement("button");
+        bChk.type = "button";
+        bChk.className = "btn btn-primary btn-sm";
+        bChk.textContent = "فحص هذا الـ IP";
+        bChk.onclick = () => proxyAction("check_one", { selector: it.id || it.idx });
+        const bRebind = document.createElement("button");
+        bRebind.type = "button";
+        bRebind.className = "btn btn-muted btn-sm";
+        bRebind.textContent = "نقل حساباته لـ IP سليم";
+        bRebind.onclick = () => proxyAction("rebind_one", { selector: it.id || it.idx });
+        const bDel = document.createElement("button");
+        bDel.type = "button";
+        bDel.className = "btn btn-danger btn-sm";
+        bDel.textContent = "حذف";
+        bDel.onclick = () => proxyAction("delete_one", { selector: it.id || it.idx });
+        btns.appendChild(bChk);
+        btns.appendChild(bRebind);
+        btns.appendChild(bDel);
+        row.appendChild(btns);
+
+        listBox.appendChild(row);
+    }
+}
 
 bootstrap();
 </script>

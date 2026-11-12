@@ -60,39 +60,50 @@ from fb_operator.admin_manager import (
 )
 from fb_operator.announcement_manager import (
     BADGE_OPTIONS, STYLE_OPTIONS, DURATION_PRESETS, REPEAT_PRESETS,
+    DELIVERY_MODES, REPEAT_BEHAVIORS, EFFECT_PRESETS, DEFAULT_THEME_EMOJIS,
     create_announcement, list_announcements, get_announcement_by_id,
-    toggle_announcement_active, update_announcement_timing, delete_announcement,
-    record_announcement_sent_chats, mark_announcement_repushed,
+    toggle_announcement_active, update_announcement_timing, update_announcement_delivery,
+    delete_announcement, record_announcement_sent_chats, mark_announcement_repushed,
     pop_expired_pinned_announcements, get_announcements_due_for_repeat,
     format_announcement_telegram_html, format_duration_ar,
+    get_theme_config, update_theme_config,
 )
+from fb_operator.banner_renderer import render_announcement_media
 from fb_operator.browser_manager import (
     sync_playwright, USING_PATCHRIGHT,
     launch_account_browser, auto_login_facebook, check_facebook_login_cookies,
     human_delay, human_warmup_after_login, get_login_error, check_facebook_page_access,
     diagnose_facebook_challenge, inspect_facebook_profile_quality,
-    save_account_storage_state, get_profile_lock
+    save_account_storage_state, get_profile_lock, detect_and_report_proxy_error,
 )
 from fb_operator.proxy_manager import (
     add_proxies_bulk,
     bind_existing_accounts,
     check_all_proxies,
+    check_single_proxy,
     clear_all_proxies,
     clear_dead_proxies,
+    delete_single_proxy,
     fetch_and_check_github_free_proxies,
     get_4g_bridge_status,
+    get_proxy_detailed_report,
     get_proxy_lock,
     get_proxy_summary,
     load_proxy_state,
     mask_proxy_uri,
     proxy_execution_guard,
+    rebind_proxy_accounts,
+    record_proxy_use,
     refresh_4g_client_geo,
+    register_proxy_alert_callback,
     resolve_proxy_for_account,
+    run_scheduled_proxy_watchdog,
     seed_env_proxies,
     set_max_per_proxy,
     set_proxy_mode,
     start_gost_4g_bridge,
     stop_gost_4g_bridge,
+    toggle_auto_check,
 )
 from fb_operator.actions import (
     navigate_to_target, comment_on_posts, react_to_posts,
@@ -119,7 +130,13 @@ from fb_operator.cloud_db import (
     test_cloud_db_connection, get_cloud_db_status_summary, get_provider_setup_guide
 )
 from fb_operator.hitl_manager import (
-    register_hitl_verified_callback, submit_telegram_otp_for_account
+    register_hitl_verified_callback,
+    submit_telegram_otp_for_account,
+    register_mission_hitl_waiter,
+    signal_mission_hitl_decision,
+    wait_for_mission_hitl,
+    get_mission_hitl_waiter,
+    clear_mission_hitl_waiter,
 )
 from fb_operator.economy_manager import (
     OP_COST_LABELS_AR, load_economy_settings, update_economy_settings,
@@ -245,6 +262,138 @@ def safe_answer(call_id: str, text: str | None = None, show_alert: bool = False)
         pass
 
 
+_BOT_CAP_CUSTOM_EMOJI_OK = True
+_BOT_CAP_STYLE_OK = True
+
+
+def _resolve_custom_emoji_id(icon_key: str | None = None, explicit_id: str | None = None) -> str | None:
+    if not _BOT_CAP_CUSTOM_EMOJI_OK:
+        return None
+    if explicit_id and str(explicit_id).strip().isdigit():
+        return str(explicit_id).strip()
+    if not icon_key:
+        return None
+    try:
+        tcfg = get_theme_config()
+        if not tcfg.get("custom_emojis_enabled", True):
+            return None
+        val = str((tcfg.get("emojis") or {}).get(icon_key) or "").strip()
+        if val.isdigit() and 15 <= len(val) <= 24:
+            return val
+    except Exception:
+        pass
+    return None
+
+
+def _btn(
+    text: str,
+    *,
+    style: str | None = None,
+    icon_key: str | None = None,
+    icon_custom_emoji_id: str | None = None,
+    **kwargs,
+) -> types.InlineKeyboardButton:
+    """بناء زر Inline بألوان Bot API 9.4 (success/primary/danger) وأيقونة اختيارية مع تراجع آمن"""
+    params = dict(kwargs)
+    if _BOT_CAP_STYLE_OK and style in ("primary", "success", "danger"):
+        params["style"] = style
+    ce_id = _resolve_custom_emoji_id(icon_key, icon_custom_emoji_id)
+    if ce_id:
+        params["icon_custom_emoji_id"] = ce_id
+    try:
+        return types.InlineKeyboardButton(text, **params)
+    except TypeError:
+        params.pop("style", None)
+        params.pop("icon_custom_emoji_id", None)
+        return types.InlineKeyboardButton(text, **params)
+
+
+def _kbtn(
+    text: str,
+    *,
+    style: str | None = None,
+    icon_key: str | None = None,
+    **kwargs,
+) -> types.KeyboardButton:
+    params = dict(kwargs)
+    if _BOT_CAP_STYLE_OK and style in ("primary", "success", "danger"):
+        params["style"] = style
+    ce_id = _resolve_custom_emoji_id(icon_key, None)
+    if ce_id:
+        params["icon_custom_emoji_id"] = ce_id
+    try:
+        return types.KeyboardButton(text, **params)
+    except TypeError:
+        params.pop("style", None)
+        params.pop("icon_custom_emoji_id", None)
+        return types.KeyboardButton(text, **params)
+
+
+def _strip_markup_cosmetics(reply_markup, drop_style: bool = False, drop_icon: bool = True):
+    if reply_markup is None or not hasattr(reply_markup, "keyboard"):
+        return reply_markup
+    try:
+        if isinstance(reply_markup, types.InlineKeyboardMarkup):
+            new_mk = types.InlineKeyboardMarkup(row_width=getattr(reply_markup, "row_width", 2))
+            for row in reply_markup.keyboard:
+                new_row = []
+                for btn in row:
+                    d = btn.to_dict() if hasattr(btn, "to_dict") else {}
+                    t = d.get("text") or getattr(btn, "text", "")
+                    kw = {k: v for k, v in d.items() if k != "text"}
+                    if drop_icon:
+                        kw.pop("icon_custom_emoji_id", None)
+                    if drop_style:
+                        kw.pop("style", None)
+                    if "web_app" in kw and isinstance(kw["web_app"], dict):
+                        kw["web_app"] = types.WebAppInfo(url=kw["web_app"].get("url", ""))
+                    new_row.append(types.InlineKeyboardButton(t, **kw))
+                new_mk.row(*new_row)
+            return new_mk
+    except Exception:
+        pass
+    return reply_markup
+
+
+def _strip_tg_emoji_tags(html_text: str) -> str:
+    return re.sub(r"</?tg-emoji\b[^>]*>", "", str(html_text or ""))
+
+
+def _safe_bot_send(fn, *args, **kwargs):
+    """مُرسل مرن يحافظ على ألوان الأزرار ويتجاوز تلقائياً فقط الميزات التي يرفضها السيرفر"""
+    global _BOT_CAP_CUSTOM_EMOJI_OK, _BOT_CAP_STYLE_OK
+    try:
+        return fn(*args, **kwargs)
+    except Exception as exc:
+        err_s = str(exc).lower()
+        retry_kw = dict(kwargs)
+        changed = False
+        if "effect" in err_s and "message_effect_id" in retry_kw:
+            retry_kw.pop("message_effect_id", None)
+            changed = True
+        if ("emoji" in err_s or "custom_emoji" in err_s or "icon" in err_s or "premium" in err_s):
+            _BOT_CAP_CUSTOM_EMOJI_OK = False
+            if "text" in retry_kw:
+                retry_kw["text"] = _strip_tg_emoji_tags(retry_kw["text"])
+            elif args and isinstance(args[1] if len(args) > 1 else None, str):
+                args = (args[0], _strip_tg_emoji_tags(args[1]), *args[2:])
+            if "caption" in retry_kw:
+                retry_kw["caption"] = _strip_tg_emoji_tags(retry_kw["caption"])
+            if retry_kw.get("reply_markup") is not None:
+                retry_kw["reply_markup"] = _strip_markup_cosmetics(retry_kw["reply_markup"], drop_style=False, drop_icon=True)
+            changed = True
+        if "style" in err_s and retry_kw.get("reply_markup") is not None:
+            _BOT_CAP_STYLE_OK = False
+            retry_kw["reply_markup"] = _strip_markup_cosmetics(retry_kw["reply_markup"], drop_style=True, drop_icon=True)
+            changed = True
+        if changed:
+            try:
+                return fn(*args, **retry_kw)
+            except Exception:
+                return None
+        return None
+
+
 def safe_edit_message(text: str, chat_id: int, message_id: int | None, reply_markup=None) -> None:
     if message_id is None:
         safe_send(chat_id, text, reply_markup=reply_markup)
@@ -252,12 +401,17 @@ def safe_edit_message(text: str, chat_id: int, message_id: int | None, reply_mar
     try:
         bot.edit_message_text(text, chat_id, message_id, reply_markup=reply_markup)
     except Exception as e:
-        if "message is not modified" in str(e).lower():
+        err_l = str(e).lower()
+        if "message is not modified" in err_l:
             return
-        try:
-            bot.send_message(chat_id, text, reply_markup=reply_markup)
-        except Exception:
-            pass
+        if "style" in err_l or "emoji" in err_l or "icon" in err_l:
+            try:
+                clean_mk = _strip_markup_cosmetics(reply_markup, drop_style=("style" in err_l), drop_icon=True)
+                bot.edit_message_text(_strip_tg_emoji_tags(text), chat_id, message_id, reply_markup=clean_mk)
+                return
+            except Exception:
+                pass
+        safe_send(chat_id, text, reply_markup=reply_markup)
 
 
 def safe_edit_reply_markup(chat_id: int, message_id: int, reply_markup) -> None:
@@ -267,11 +421,8 @@ def safe_edit_reply_markup(chat_id: int, message_id: int, reply_markup) -> None:
         pass
 
 
-def safe_send(chat_id: int, text: str, reply_markup=None):
-    try:
-        return bot.send_message(chat_id, text, reply_markup=reply_markup)
-    except Exception:
-        return None
+def safe_send(chat_id: int, text: str, reply_markup=None, **extra):
+    return _safe_bot_send(bot.send_message, chat_id, text, reply_markup=reply_markup, **extra)
 
 
 # متتبع الرسائل التفاعلية النشطة لتحديث لوحات تلغرام تلقائياً فور وقوع أي حدث (بدون Polling)
@@ -384,7 +535,11 @@ def default_user_state() -> dict:
     return {
         "target_url": "https://www.facebook.com/profile.php?id=61595626255487",
         "selected_acc": "all",
+        "selected_accs": [],
         "acc_count_limit": 0,
+        "wait_for_hitl": True,
+        "waiting_hitl_acc_id": "",
+        "waiting_hitl_reason": "",
         "like": False,
         "reaction_type": "like",
         "react_post_index": 1,
@@ -660,21 +815,30 @@ def _build_announcement_markup(ann: dict, include_ack: bool = True) -> types.Inl
     ann_id = str(ann.get("id") or "")
     cta_lbl = str(ann.get("cta_label") or "استعراض الميزة الآن").strip()[:36]
     w_url = get_public_webapp_url()
-    row_top = [types.InlineKeyboardButton("✨ عرض البطاقة العائمة", callback_data=f"promo_view_{ann_id}")]
     if w_url:
         sep = "&" if "?" in w_url else "?"
         tab_arg = f"&tab={ann.get('cta_tab')}" if ann.get("cta_tab") else ""
-        row_top.append(
-            types.InlineKeyboardButton(
-                f"🚀 {cta_lbl[:22]}",
-                web_app=types.WebAppInfo(url=f"{w_url}{sep}promo={ann_id}{tab_arg}")
+        mk.row(
+            _btn(
+                f"🚀 {cta_lbl[:28]}",
+                style="success",
+                icon_key="rocket",
+                web_app=types.WebAppInfo(url=f"{w_url}{sep}promo={ann_id}{tab_arg}"),
             )
         )
-    mk.row(*row_top)
+    else:
+        mk.row(
+            _btn(
+                f"✨ {cta_lbl[:28]}",
+                style="success",
+                icon_key="spark",
+                callback_data=f"promo_view_{ann_id}",
+            )
+        )
     if include_ack:
         mk.row(
-            types.InlineKeyboardButton("✅ تم الاطلاع", callback_data=f"promo_ack_{ann_id}"),
-            types.InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="back_to_main")
+            _btn("📋 التفاصيل السريعة", style="primary", callback_data=f"promo_view_{ann_id}"),
+            _btn("✅ إخفاء", callback_data=f"promo_ack_{ann_id}"),
         )
     return mk
 
@@ -694,8 +858,94 @@ def _unpin_announcement_chats(ann: dict) -> int:
     return unpinned
 
 
+def _send_announcement_to_chat(
+    cid: int,
+    ann: dict,
+    *,
+    is_repeat: bool = False,
+    rendered_media: dict | None = None,
+) -> tuple[int | None, bool]:
+    """إرسال أو تحديث بطاقة الإعلان لدردشة واحدة بأسلوب نظيف خالٍ من سبام التثبيت"""
+    ann_id = str(ann.get("id") or "")
+    d_mode = str(ann.get("delivery_mode") or "animated_card")
+    rep_beh = str(ann.get("repeat_behavior") or "replace")
+    pin_flag = bool(ann.get("pin_in_chat", False))
+    eff_preset = str(ann.get("effect_preset") or "none")
+    effect_id = (EFFECT_PRESETS.get(eff_preset) or ("", ""))[1]
+
+    html_txt = format_announcement_telegram_html(
+        ann, esc_fn=esc, is_repeat=is_repeat, use_custom_emojis=_BOT_CAP_CUSTOM_EMOJI_OK
+    )
+    markup = _build_announcement_markup(ann, include_ack=True)
+    old_mid = None
+    try:
+        raw_mid = (ann.get("sent_chats") or {}).get(str(int(cid)))
+        old_mid = int(raw_mid) if raw_mid else None
+    except Exception:
+        old_mid = None
+    had_media_before = str(int(cid)) in set(str(x) for x in (ann.get("media_chat_ids") or []))
+
+    # 1) وضع التحديث الحي بنفس الرسالة: لا يرسل رسالة مكررة ولا يعيد التثبيت إطلاقاً
+    if is_repeat and rep_beh == "edit_live" and old_mid:
+        try:
+            if had_media_before:
+                _safe_bot_send(
+                    bot.edit_message_caption,
+                    caption=html_txt[:1000],
+                    chat_id=cid,
+                    message_id=old_mid,
+                    reply_markup=markup,
+                )
+            else:
+                safe_edit_message(html_txt, cid, old_mid, reply_markup=markup)
+            return old_mid, False
+        except Exception:
+            pass
+
+    # 2) وضع الاستبدال النظيف (افتراضي للإعلان العائم): يحذف البطاقة غير المثبّتة القديمة قبل إرسال الجديدة
+    if is_repeat and rep_beh == "replace" and old_mid and not pin_flag:
+        try:
+            bot.delete_message(cid, old_mid)
+        except Exception:
+            pass
+
+    msg = None
+    is_media_msg = False
+    media_bytes = rendered_media.get("bytes") if isinstance(rendered_media, dict) else None
+    media_kind = rendered_media.get("kind") if isinstance(rendered_media, dict) else ""
+
+    if media_bytes and d_mode in ("animated_card", "photo_card"):
+        bio = io.BytesIO(media_bytes)
+        bio.name = f"promo_{ann_id}.{rendered_media.get('ext', 'png')}"
+        cap = html_txt[:1000]
+        send_kw: dict = {"caption": cap, "reply_markup": markup, "show_caption_above_media": False}
+        if effect_id and not is_repeat:
+            send_kw["message_effect_id"] = effect_id
+        if media_kind == "gif" and d_mode == "animated_card":
+            msg = _safe_bot_send(bot.send_animation, cid, bio, **send_kw)
+        else:
+            msg = _safe_bot_send(bot.send_photo, cid, bio, **send_kw)
+        if msg and hasattr(msg, "message_id"):
+            is_media_msg = True
+
+    if not msg:
+        if effect_id and not is_repeat:
+            msg = safe_send(cid, html_txt, reply_markup=markup, message_effect_id=effect_id)
+        else:
+            msg = safe_send(cid, html_txt, reply_markup=markup)
+
+    new_mid = int(msg.message_id) if (msg and hasattr(msg, "message_id")) else None
+    if new_mid and pin_flag and (not is_repeat or not old_mid):
+        # يُثبّت مرة واحدة فقط إذا فعّل المطور التثبيت صراحةً؛ ولا يعاد التثبيت أبداً عند التكرار
+        try:
+            bot.pin_chat_message(cid, new_mid, disable_notification=True)
+        except Exception:
+            pass
+    return new_mid, is_media_msg
+
+
 def _broadcast_announcement_to_users(ann: dict, is_repeat: bool = False) -> dict:
-    """دفع الإعلان العائم وتثبيته أعلى المحادثة لجميع المستخدمين المعتمدين والمطور"""
+    """دفع الإعلان العائم المتطور لجميع المستخدمين المعتمدين والمطور بدون سبام"""
     if not isinstance(ann, dict) or not ann.get("id"):
         return {"sent": 0, "pinned": 0}
     users = load_users()
@@ -706,61 +956,110 @@ def _broadcast_announcement_to_users(ann: dict, is_repeat: bool = False) -> dict
                 targets.add(int(u.get("id") or uid_s))
             except Exception:
                 pass
-    html_txt = format_announcement_telegram_html(ann, esc_fn=esc, is_repeat=is_repeat)
-    markup = _build_announcement_markup(ann, include_ack=True)
+
+    d_mode = str(ann.get("delivery_mode") or "animated_card")
+    rep_beh = str(ann.get("repeat_behavior") or "replace")
+    need_media = (
+        d_mode in ("animated_card", "photo_card")
+        and not (is_repeat and rep_beh == "edit_live")
+    )
+    rendered_media = None
+    if need_media:
+        try:
+            rendered_media = render_announcement_media(
+                ann, animated=(d_mode == "animated_card"), allow_browser=True
+            )
+        except Exception:
+            rendered_media = None
+
     sent_map: dict[int, int] = {}
+    media_cids: set[int] = set()
     pinned = 0
-    old_chats = ann.get("sent_chats") or {}
-    if is_repeat and ann.get("pin_in_chat") and old_chats:
-        _unpin_announcement_chats(ann)
     for cid in targets:
         try:
-            msg = safe_send(cid, html_txt, reply_markup=markup)
-            if msg and hasattr(msg, "message_id"):
-                sent_map[int(cid)] = int(msg.message_id)
-                if ann.get("pin_in_chat"):
-                    try:
-                        bot.pin_chat_message(cid, msg.message_id, disable_notification=bool(is_repeat))
-                        pinned += 1
-                    except Exception:
-                        pass
+            mid, is_m = _send_announcement_to_chat(
+                cid, ann, is_repeat=is_repeat, rendered_media=rendered_media
+            )
+            if mid:
+                sent_map[int(cid)] = int(mid)
+                if is_m:
+                    media_cids.add(int(cid))
+                if ann.get("pin_in_chat") and not is_repeat:
+                    pinned += 1
         except Exception:
             pass
     if sent_map:
-        record_announcement_sent_chats(ann["id"], sent_map)
-    return {"sent": len(sent_map), "pinned": pinned}
+        record_announcement_sent_chats(ann["id"], sent_map, media_cids=media_cids)
+    return {"sent": len(sent_map), "pinned": pinned, "media": bool(rendered_media)}
+
+
+def _render_theme_config_view() -> tuple[str, types.InlineKeyboardMarkup]:
+    tcfg = get_theme_config()
+    ce_on = bool(tcfg.get("custom_emojis_enabled", True))
+    ems = tcfg.get("emojis") or {}
+    slot_labels = {
+        "rocket": "🚀 أيقونة الميزة / الإطلاق",
+        "spark": "✨ أيقونة التوقيت / التمييز",
+        "check": "✅ أيقونة التأكيد",
+        "shield": "🛡️ أيقونة الحماية / الأمان",
+        "fb": "📘 أيقونة فيسبوك",
+        "proxy": "🌐 أيقونة البروكسي",
+        "alert": "⚡ أيقونة التنبيه",
+    }
+    lines = [
+        "🎨 <b>مظهر البوت وأيقونات Custom Emoji (Bot API 9.4)</b>",
+        "<blockquote>تعمل الألوان المدمجة (أخضر/أزرق/أحمر) والبطاقات المتحركة لجميع البوتات مجاناً.\n"
+        "أما أيقونات <code>custom_emoji_id</code> فتعمل تلقائياً إذا كان لدى مالك البوت Telegram Premium أو اسم مستخدم Fragment (ويتراجع البوت بأمان عند عدم توفرها).</blockquote>",
+        f"🧩 <b>الحالة:</b> {'🟢 مفعّلة' if ce_on else '⏸️ معطّلة'}",
+    ]
+    mk = types.InlineKeyboardMarkup(row_width=2)
+    mk.row(
+        _btn(
+            f"🧩 Custom Emoji: {'مفعّل ✅' if ce_on else 'معطّل ❌'}",
+            style="success" if ce_on else "primary",
+            callback_data="ann_ce_tog",
+        )
+    )
+    for k, lbl in slot_labels.items():
+        val = ems.get(k) or "غير مضبوط"
+        lines.append(f"• {lbl}: <code>{esc(val)}</code>")
+        mk.row(_btn(f"{lbl} ({'✅' if ems.get(k) else '➕'})", callback_data=f"ann_ce_set_{k}"))
+    mk.row(_btn("🔙 مركز الإعلانات", style="primary", callback_data="menu_announcements"))
+    return "\n".join(lines), mk
 
 
 def _render_announcements_view() -> tuple[str, types.InlineKeyboardMarkup]:
     items = list_announcements(only_active=False)
     active_cnt = sum(1 for a in items if a.get("is_effectively_active"))
     lines = [
-        "📢 <b>مركز الإعلانات العائمة والمنبثقة للمميزات</b>",
-        "━━━━━━━━━━━━━━━━━━━━",
-        f"✨ <b>النشطة حالياً:</b> {active_cnt} | <b>الإجمالي المحفوظ:</b> {len(items)}",
-        "💡 <i>تظهر هذه الإعلانات كبطاقة عائمة متحركة في اللوحة المصغرة ومثبّتة أعلى دردشات المستخدمين مع خيار التكرار والمدة المحددة.</i>",
-        "━━━━━━━━━━━━━━━━━━━━",
+        "📢 <b>مركز الإعلانات العائمة والبطاقات المتطورة</b>",
+        f"<blockquote>✨ <b>النشطة:</b> {active_cnt} · <b>المحفوظة:</b> {len(items)}\n"
+        "🎞️ يدعم GIF المتحركة (Chromium+HTML5) وأزرار Bot API 9.4 الملونة بدون سبام تثبيت.</blockquote>",
     ]
     markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.row(types.InlineKeyboardButton("➕ إنشاء إعلان عائم جديد", callback_data="ann_new"))
+    markup.row(
+        _btn("➕ إنشاء إعلان جديد", style="success", icon_key="rocket", callback_data="ann_new"),
+        _btn("🎨 الأيقونات والمظهر", style="primary", callback_data="ann_theme_menu"),
+    )
     if not items:
-        lines.append("<i>لا توجد إعلانات مسجلة حتى الآن. اضغط إنشاء إعلان عائم جديد.</i>")
+        lines.append("<i>لا توجد إعلانات مسجلة بعد. اضغط إنشاء إعلان جديد.</i>")
     else:
         for a in items[:10]:
             st_ico = "🟢" if a.get("is_effectively_active") else ("⌛" if a.get("is_expired") else "⏸️")
+            dm_lbl = {"animated_card": "🎞️ GIF", "photo_card": "🖼️ HD", "smart_text": "💬 ذكي"}.get(a.get("delivery_mode"), "🎞️")
             lines.append(
-                f"{st_ico} <b>[{esc(a.get('badge'))}] {esc(a.get('title'))}</b>\n"
-                f"   ⏳ {esc(a.get('remaining_label'))} | 🔄 {esc(a.get('repeat_label'))} | 📣 دفع: {a.get('push_count', 1)}x"
+                f"{st_ico} <b>[{esc(a.get('badge'))}] {esc(a.get('title'))}</b> · {dm_lbl} · ⏳ {esc(a.get('remaining_label'))}"
             )
             markup.row(
-                types.InlineKeyboardButton(
-                    f"{st_ico} {str(a.get('title') or '')[:24]}",
-                    callback_data=f"ann_view_{a['id']}"
+                _btn(
+                    f"{st_ico} {str(a.get('title') or '')[:26]}",
+                    style="success" if a.get("is_effectively_active") else None,
+                    callback_data=f"ann_view_{a['id']}",
                 )
             )
     markup.row(
-        types.InlineKeyboardButton("🔄 تحديث", callback_data="menu_announcements"),
-        types.InlineKeyboardButton("🔙 الرئيسية", callback_data="back_to_main")
+        _btn("🔄 تحديث", style="primary", callback_data="menu_announcements"),
+        _btn("🔙 الرئيسية", callback_data="back_to_main"),
     )
     txt = "\n".join(lines)
     if len(txt) > 3950:
@@ -772,49 +1071,48 @@ def _render_announcement_detail_view(ann_id: str) -> tuple[str, types.InlineKeyb
     a = get_announcement_by_id(ann_id)
     if not a:
         return "⚠️ الإعلان غير موجود أو تم حذفه.", _back_home_markup("menu_announcements")
-    st_lbl = "🟢 نشط وعائم الآن" if a.get("is_effectively_active") else ("⌛ منتهي المدة" if a.get("is_expired") else "⏸️ متوقف مؤقتاً")
-    style_lbl = STYLE_OPTIONS.get(a.get("display_style"), a.get("display_style"))
-    rop_lbl = "✅ نعم عند كل فتح" if a.get("repeat_on_open") else "❌ لا"
-    pin_lbl = "📌 نعم" if a.get("pin_in_chat") else "لا"
+    st_lbl = "🟢 نشط" if a.get("is_effectively_active") else ("⌛ منتهي" if a.get("is_expired") else "⏸️ متوقف")
+    dm_lbl = DELIVERY_MODES.get(a.get("delivery_mode"), "🎞️ بطاقة GIF متحركة")
+    rb_lbl = REPEAT_BEHAVIORS.get(a.get("repeat_behavior"), "♻️ استبدال نظيف")
+    eff_lbl = (EFFECT_PRESETS.get(a.get("effect_preset")) or ("بدون تأثير", ""))[0]
+    pin_lbl = "📌 مفعّل (مرة واحدة)" if a.get("pin_in_chat") else "🪟 معطّل (بطاقة عائمة نظيفة)"
     txt = (
-        f"📢 <b>إدارة الإعلان العائم: {esc(a.get('title'))}</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"🏷️ <b>الوسم:</b> {esc(a.get('badge'))} | <b>الحالة:</b> {st_lbl}\n"
-        f"🪟 <b>النمط:</b> {esc(style_lbl)}\n"
-        f"⏳ <b>الصلاحية المتبقية:</b> {esc(a.get('remaining_label'))}\n"
-        f"🔄 <b>التكرار التلقائي:</b> {esc(a.get('repeat_label'))} | <b>عند الفتح:</b> {rop_lbl}\n"
-        f"📌 <b>التثبيت بالدردشة:</b> {pin_lbl} ({len(a.get('sent_chats') or {})} محادثة)\n"
-        f"📣 <b>مرات البث:</b> {a.get('push_count', 1)}\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"📝 <b>النص:</b>\n{esc(a.get('body'))}"
+        f"📢 <b>{esc(a.get('title'))}</b> · {st_lbl}\n"
+        f"<blockquote>{esc(a.get('body'))}</blockquote>\n"
+        f"🎨 <b>العرض:</b> {esc(dm_lbl)}\n"
+        f"🔁 <b>التكرار ({esc(a.get('repeat_label'))}):</b> {esc(rb_lbl)}\n"
+        f"📌 <b>التثبيت:</b> {pin_lbl} ({len(a.get('sent_chats') or {})} محادثة) | 🎆 <b>التأثير:</b> {eff_lbl}\n"
+        f"⏳ <b>المتبقي:</b> {esc(a.get('remaining_label'))} | 📣 <b>البث:</b> {a.get('push_count', 1)}x"
     )
     if len(txt) > 3950:
         txt = txt[:3920] + "\n..."
     mk = types.InlineKeyboardMarkup(row_width=2)
-    tog_lbl = "⏸️ إيقاف مؤقت" if a.get("active") else "▶️ إعادة تفعيل"
+    tog_lbl = "⏸️ إيقاف" if a.get("active") else "▶️ تفعيل"
     mk.row(
-        types.InlineKeyboardButton(tog_lbl, callback_data=f"ann_tog_{ann_id}"),
-        types.InlineKeyboardButton("🚀 بث وتثبيت للجميع الآن", callback_data=f"ann_push_{ann_id}")
+        _btn(tog_lbl, style="primary" if a.get("active") else "success", callback_data=f"ann_tog_{ann_id}"),
+        _btn("🚀 بث مباشر الآن", style="success", icon_key="rocket", callback_data=f"ann_push_{ann_id}"),
     )
     mk.row(
-        types.InlineKeyboardButton("⏱️ مدة: 1 ساعة", callback_data=f"ann_dur_{ann_id}_3600"),
-        types.InlineKeyboardButton("⏱️ مدة: 24 ساعة", callback_data=f"ann_dur_{ann_id}_86400")
+        _btn("🎨 تبديل نوع البطاقة", style="primary", callback_data=f"ann_dm_{ann_id}"),
+        _btn("🔁 تبديل سلوك التكرار", style="primary", callback_data=f"ann_rb_{ann_id}"),
     )
     mk.row(
-        types.InlineKeyboardButton("⏱️ مدة: 7 أيام", callback_data=f"ann_dur_{ann_id}_604800"),
-        types.InlineKeyboardButton("♾️ دائم حتى الإزالة", callback_data=f"ann_dur_{ann_id}_0")
+        _btn(f"📌 التثبيت: {'نعم' if a.get('pin_in_chat') else 'لا (أنظف)'}", callback_data=f"ann_pin_{ann_id}"),
+        _btn(f"🎆 التأثير: {eff_lbl[:14]}", callback_data=f"ann_eff_{ann_id}"),
     )
     mk.row(
-        types.InlineKeyboardButton("🔁 تكرار: كل 30د", callback_data=f"ann_rep_{ann_id}_1800"),
-        types.InlineKeyboardButton("🔁 تكرار: كل ساعة", callback_data=f"ann_rep_{ann_id}_3600")
+        _btn("⏱️ 1 ساعة", callback_data=f"ann_dur_{ann_id}_3600"),
+        _btn("⏱️ 24 ساعة", callback_data=f"ann_dur_{ann_id}_86400"),
+        _btn("♾️ دائم", callback_data=f"ann_dur_{ann_id}_0"),
     )
     mk.row(
-        types.InlineKeyboardButton("1️⃣ مرة واحدة", callback_data=f"ann_rep_{ann_id}_0"),
-        types.InlineKeyboardButton(f"🚪 عند الفتح: {'✅' if a.get('repeat_on_open') else '❌'}", callback_data=f"ann_rop_{ann_id}")
+        _btn("🔁 كل 5د", callback_data=f"ann_rep_{ann_id}_300"),
+        _btn("🔁 كل ساعة", callback_data=f"ann_rep_{ann_id}_3600"),
+        _btn(f"🚪 عند الفتح: {'✅' if a.get('repeat_on_open') else '❌'}", callback_data=f"ann_rop_{ann_id}"),
     )
     mk.row(
-        types.InlineKeyboardButton("🗑️ حذف وفك التثبيت للجميع", callback_data=f"ann_del_{ann_id}"),
-        types.InlineKeyboardButton("🔙 الإعلانات", callback_data="menu_announcements")
+        _btn("🗑️ حذف الإعلان", style="danger", callback_data=f"ann_del_{ann_id}"),
+        _btn("🔙 الإعلانات", callback_data="menu_announcements"),
     )
     return txt, mk
 
@@ -850,8 +1148,10 @@ def get_main_dashboard_markup(user_id: int) -> types.InlineKeyboardMarkup:
     if active_anns:
         top_ann = active_anns[0]
         markup.row(
-            types.InlineKeyboardButton(
+            _btn(
                 f"✨ [{top_ann.get('badge', 'إعلان')}] {str(top_ann.get('title') or '')[:30]}",
+                style="primary",
+                icon_key="spark",
                 callback_data=f"promo_view_{top_ann['id']}"
             )
         )
@@ -865,8 +1165,16 @@ def get_main_dashboard_markup(user_id: int) -> types.InlineKeyboardMarkup:
     # 1. صف تحديد المنفذ والرابط المستهدف (فقط لمن لديه صلاحيات تشغيل/أدوات)
     top_btns = []
     if p_use or (p_exec and len(usable_accs) > 0 and has_any_action):
+        usable_ids = {a["id"] for a in usable_accs}
         sel_acc_name = "جميع الحسابات المتاحة"
-        if st["selected_acc"] != "all":
+        if st["selected_acc"] == "multi":
+            valid_multi = [x for x in (st.get("selected_accs") or []) if x in usable_ids]
+            st["selected_accs"] = valid_multi
+            if valid_multi:
+                sel_acc_name = f"{len(valid_multi)} حسابات محددة"
+            else:
+                st["selected_acc"] = "all"
+        elif st["selected_acc"] != "all":
             matched = next((a for a in usable_accs if a["id"] == st["selected_acc"]), None)
             if matched:
                 sel_acc_name = matched["name"]
@@ -1002,39 +1310,43 @@ def get_main_dashboard_markup(user_id: int) -> types.InlineKeyboardMarkup:
 
         row_d = []
         if cap_prox:
-            row_d.append(types.InlineKeyboardButton("🌐 البروكسيات ونفق 4G", callback_data="menu_proxies"))
+            row_d.append(_btn("🌐 البروكسيات ونفق 4G", style="primary", icon_key="proxy", callback_data="menu_proxies"))
         if cap_bkp:
-            row_d.append(types.InlineKeyboardButton("💾 الحفظ الدائم والنسخ الاحتياطي", callback_data="menu_backup_vault"))
+            row_d.append(_btn("💾 الحفظ والنسخ الاحتياطي", callback_data="menu_backup_vault"))
         if row_d:
             markup.row(*row_d)
 
         if cap_ann:
             markup.row(
-                types.InlineKeyboardButton(
+                _btn(
                     f"📢 الإعلانات العائمة ({len(active_anns)} نشط)",
+                    style="primary" if active_anns else None,
+                    icon_key="rocket",
                     callback_data="menu_announcements"
                 )
             )
     elif has_any_feature or wallet["points"] > 0:
-        eco_row = [types.InlineKeyboardButton(f"🪙 نقاطي ({wallet['points']} = {wallet['yer_value']:,} ر.ي)", callback_data="menu_wallet")]
+        eco_row = [_btn(f"🪙 نقاطي ({wallet['points']} = {wallet['yer_value']:,} ر.ي)", style="primary", callback_data="menu_wallet")]
         if p_inv:
-            eco_row.append(types.InlineKeyboardButton("🎁 دعوة صديق (+4)", callback_data="menu_referral"))
+            eco_row.append(_btn("🎁 دعوة صديق (+4)", style="success", callback_data="menu_referral"))
         markup.row(*eco_row)
         markup.row(
-            types.InlineKeyboardButton("💵 طلب بيع الحسابات / مراسلة المطور", callback_data="menu_support")
+            _btn("💵 طلب بيع الحسابات / مراسلة المطور", callback_data="menu_support")
         )
 
     # 10. فتح لوحة التحكم التفاعلية داخل تلغرام فقط (WebApp داخل التطبيق بدون متصفح خارجي)
     webapp_url = get_public_webapp_url()
     if webapp_url and has_any_feature:
         markup.row(
-            types.InlineKeyboardButton("📱 فتح لوحة التحكم داخل تلغرام", web_app=types.WebAppInfo(url=webapp_url))
+            _btn("📱 فتح لوحة التحكم داخل تلغرام", style="primary", icon_key="shield", web_app=types.WebAppInfo(url=webapp_url))
         )
 
-    # 11. زر الإطلاق الميداني (يظهر فقط إذا مُنح can_execute ولدى المستخدم أداة واحدة على الأقل)
+    # 11. زر الإطلاق الميداني وميزة انتظار التحقق البشري (HITL)
     if p_exec and has_any_action and (p_use or len(usable_accs) > 0):
+        wait_ico = "✅" if st.get("wait_for_hitl", True) else "❌"
         markup.row(
-            types.InlineKeyboardButton("🚀 بدء تنفيذ المهام الآن", callback_data="action_launch")
+            _btn("🚀 بدء تنفيذ المهام الآن", style="success", icon_key="rocket", callback_data="action_launch"),
+            _btn(f"⏳ انتظار التحقق [{wait_ico}]", style="primary" if st.get("wait_for_hitl", True) else None, callback_data="toggle_wait_hitl"),
         )
 
     # 12. إذا كان المستخدم معتمداً لكن لم تُفتح له أي صلاحية بعد ولم يكن لديه رصيد
@@ -1145,14 +1457,12 @@ def get_dashboard_text(user_id: int) -> str:
 
     lines.append("━━━━━━━━━━━━━━━━━━━━")
     if not has_any_feature and wallet["points"] <= 0:
-        lines.append("⏳ <b>حسابك معتمد الآن، يرجى انتظار قيام المطور بفتح الميزات المسموحة لك من رادار الصلاحيات.</b>")
+        lines.append("⏳ <b>حسابك معتمد الآن، بانتظار فتح الميزات من المطور.</b>")
     elif p_add and not has_any_action and not p_use and not is_dev:
         act_rew = int(eco_cfg.get("active_account_reward", 1) or 1)
-        lines.append(
-            f"👇 <b>وضع التوريد والربح: كل حساب فيسبوك نشط يمنحك +{act_rew} نقطة ({act_rew * wallet['yer_per_point']} ريال يمني):</b>"
-        )
+        lines.append(f"🪙 <b>مكافأة التوريد:</b> +{act_rew} نقطة ({act_rew * wallet['yer_per_point']} ر.ي) لكل حساب نشط.")
     else:
-        lines.append("👇 <b>اختر الأداة أو عدّل الإعدادات من الأزرار أدناه:</b>")
+        lines.append("🎛️ <i>تحكم بكل الميزات والحسابات والبروكسيات من الأزرار أدناه:</i>")
 
     return "\n".join(lines)
 
@@ -1893,80 +2203,171 @@ def _render_backup_vault_view() -> tuple[str, types.InlineKeyboardMarkup]:
     return "\n".join(lines), markup
 
 
-def _render_proxies_view() -> tuple[str, types.InlineKeyboardMarkup]:
-    summary = get_proxy_summary()
-    state = load_proxy_state()
+def _render_proxies_view(page: int = 0) -> tuple[str, types.InlineKeyboardMarkup]:
+    report = get_proxy_detailed_report()
+    summary = report["summary"]
+    items = report["items"]
     mode = summary["mode"]
     mode_labels = {
-        "sticky": "📌 تثبيت ذكي لكل حساب (Sticky)",
-        "4g_bridge": "📱 نفق الفورجي 4G العكسي",
-        "direct": "🌐 اتصال مباشر بدون بروكسي",
+        "sticky": "📌 تثبيت ذكي (Sticky)",
+        "4g_bridge": "📱 نفق 4G عكسي",
+        "direct": "🌐 مباشر بدون بروكسي",
     }
     b4g = summary["bridge_4g"]
     b4g_badge = (
-        f"🟢 متصل الآن (منفذ {b4g['exit_port']} | {esc(b4g.get('exit_ip') or 'جاهز')})"
+        f"🟢 متصل ({b4g['exit_port']})"
         if b4g.get("client_connected")
-        else ("🟡 البوابة مفتوحة — بانتظار ربط الهاتف" if b4g.get("running") else "⚪ متوقف")
+        else ("🟡 بانتظار الهاتف" if b4g.get("running") else "⚪ متوقف")
     )
     cfg_cap = int(summary.get("configured_max_per_proxy", 3) or 0)
-    cap_txt = f"{cfg_cap} حساب/بروكسي" if cfg_cap > 0 else "غير محدود (توزيع حر)"
     safe_cap = int(summary.get("safe_capacity", 0) or 0)
-    cap_btn_lbl = f"{cfg_cap} (آمن)" if cfg_cap == 3 else (f"{cfg_cap} (أقصى حد)" if cfg_cap > 0 else "مفتوح")
-    cap_usage_txt = f" | السعة الآمنة: <b>{summary['bindings_count']}/{safe_cap}</b>" if safe_cap > 0 else ""
+    cap_btn_lbl = f"{cfg_cap} (آمن)" if cfg_cap == 3 else (f"{cfg_cap} (أقصى)" if cfg_cap > 0 else "مفتوح")
+    watch_on = bool(summary.get("auto_check_enabled", True))
+    watch_iv = int(summary.get("auto_check_interval_sec") or 120)
+    watch_lbl = f"🟢 {watch_iv}ث" if watch_on else "⏸️ متوقف"
 
     lines = [
-        "🌐 <b>غرفة إدارة البروكسيات ونفق الفورجي (pproxy + gost v3)</b>",
+        "🌐 <b>لوحة البروكسيات والمراقبة الحية</b>",
         "━━━━━━━━━━━━━━━━━━━━",
-        f"⚙️ <b>الوضع النشط:</b> {mode_labels.get(mode, mode)}",
-        f"📡 <b>البروكسيات المحفوظة:</b> <b>{summary['total']}</b> (🟢 حي: <b>{summary['alive']}</b> | 🔴 ميت: <b>{summary['dead']}</b> | ⏳ لم يُفحص: <b>{summary['untested']}</b>)",
-        f"🔗 <b>الحسابات المربوطة بثبات (Sticky):</b> <b>{summary['bindings_count']}</b> حساب (أقصى حمولة حالية: <b>{summary.get('max_accounts_per_proxy', 0)}</b>)",
-        f"⚖️ <b>الحد المستهدف لكل IP:</b> <b>{cap_txt}</b>{cap_usage_txt}",
-        f"📱 <b>حالة نفق الفورجي 4G:</b> {b4g_badge}",
+        f"⚙️ <b>الوضع:</b> {mode_labels.get(mode, mode)} | 📱 <b>4G:</b> {b4g_badge}",
+        f"📡 <b>الحالة:</b> <b>{summary['total']}</b> إجمالي (🟢 {summary['alive']} | 🔴 {summary['dead']} | ⏳ {summary['untested']})",
+        f"🔗 <b>الربط:</b> {summary['bindings_count']}{f'/{safe_cap}' if safe_cap > 0 else ''} حساب | 🔁 <b>الاستخدامات:</b> {summary.get('total_uses', 0)} | 👁️ <b>الفحص التلقائي:</b> {watch_lbl}",
     ]
     if summary.get("is_overloaded") or (cfg_cap > 0 and summary.get("max_accounts_per_proxy", 0) > cfg_cap):
-        lines.append("⚠️ <i>تنبيه السعة: تم تجاوز الحد الآمن المحدد على بعض البروكسيات — التوزيع الذكي مستمر دون توقف، لكن يُفضّل إضافة بروكسيات جديدة.</i>")
-    elif summary.get("max_accounts_per_proxy", 0) > 5:
-        lines.append("⚠️ <i>تنبيه الحماية: بعض البروكسيات تحمل أكثر من 5 حسابات؛ يُفضّل إضافة بروكسيات أو استخدام نفق 4G.</i>")
-    lines.append("🛡️ <i>سياسة عدم الحظر: يبقى كل حساب مثبتاً على نفس IP والدولة دائماً مع منع تشغيل حسابين بنفس الثانية على نفس البروكسي.</i>")
-    proxies = state.get("proxies") or []
-    if proxies:
-        lines.append("━━━━━━━━━━━━━━━━━━━━")
-        lines.append("📋 <b>عينة من التجمع النشط (مُقنّعة للأمان):</b>")
-        for idx, p in enumerate(proxies[:6], 1):
-            st_ic = "🟢" if p.get("alive") is True else ("🔴" if p.get("alive") is False else "⚪")
-            cc = f"[{p['country_code']}]" if p.get("country_code") else ""
-            lat = f"{p['latency_ms']}ms" if p.get("latency_ms") is not None else "-"
-            lines.append(f"  {idx}. {st_ic} <code>{esc(mask_proxy_uri(p['uri']))}</code> {esc(cc)} ({lat})")
-        if len(proxies) > 6:
-            lines.append(f"  <i>... و {len(proxies) - 6} بروكسي إضافي مسجل</i>")
+        lines.append("⚠️ <i>بعض البروكسيات تجاوزت الحد الآمن — اضغط أي IP للتفاصيل أو إعادة التوزيع.</i>")
+
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    per_page = 8
+    total_pages = max(1, (len(items) + per_page - 1) // per_page)
+    page = max(0, min(page, total_pages - 1))
+    slice_items = items[page * per_page : (page + 1) * per_page]
+
+    if slice_items:
+        lines.append("👇 <i>اضغط على أي IP لعرض استخداماته وأسماء الحسابات المربوطة به:</i>")
+        for it in slice_items:
+            st_ic = "🟢" if it.get("alive") is True else ("🔴" if it.get("alive") is False else "⚪")
+            cc = f"[{it['country_code']}] " if it.get("country_code") else ""
+            host_port = f"{it.get('host') or it.get('masked_uri')}:{it.get('port')}" if it.get("port") else it.get("masked_uri", "")
+            lbl = f"{st_ic} {cc}{host_port[:22]} | 🔁{it['uses_count']} | 👥{it['bound_count']}"
+            markup.row(types.InlineKeyboardButton(lbl, callback_data=f"prx_item_{it['idx']}"))
+        if total_pages > 1:
+            nav_row = []
+            if page > 0:
+                nav_row.append(types.InlineKeyboardButton("◀️ السابق", callback_data=f"prx_page_{page - 1}"))
+            nav_row.append(types.InlineKeyboardButton(f"📄 {page + 1}/{total_pages}", callback_data="menu_proxies"))
+            if page + 1 < total_pages:
+                nav_row.append(types.InlineKeyboardButton("التالي ▶️", callback_data=f"prx_page_{page + 1}"))
+            markup.row(*nav_row)
     else:
-        lines.append("\n<i>💡 أضف بروكسيات SOCKS5/HTTP أو شغّل نفق الفورجي 4G من هاتفك مباشرة بدون VPS.</i>")
+        lines.append("<i>أضف بروكسيات أو شغّل نفق 4G أو اسحب من GitHub من الأزرار:</i>")
+
+    markup.row(
+        _btn("➕ إضافة بروكسيات", style="success", callback_data="prx_add_prompt"),
+        _btn("🩺 فحص الكل الآن", style="primary", callback_data="prx_check_all"),
+    )
+    markup.row(
+        _btn("🔗 توزيع وربط الحسابات", style="primary", callback_data="prx_bind_existing"),
+        _btn("📥 جلب من GitHub", callback_data="prx_fetch_github"),
+    )
+    markup.row(
+        _btn(f"👁️ فحص تلقائي [{'✅' if watch_on else '⏸️'}]", style="success" if watch_on else None, callback_data="prx_toggle_watch"),
+        _btn(f"⚖️ حد/IP: {cap_btn_lbl}", callback_data="prx_cycle_cap"),
+    )
+    markup.row(
+        _btn("📱 نفق 4G (بدون VPS)", style="primary", callback_data="prx_4g_menu"),
+        _btn("🔀 تبديل الوضع", callback_data="prx_cycle_mode"),
+    )
+    markup.row(
+        _btn("🧹 حذف الميتة", style="danger", callback_data="prx_clear_dead"),
+        _btn("🗑️ مسح الكل", style="danger", callback_data="prx_clear_all"),
+    )
+    markup.row(
+        _btn("🔄 تحديث", style="primary", callback_data="menu_proxies"),
+        _btn("🔙 الرئيسية", callback_data="back_to_main"),
+    )
+    return "\n".join(lines), markup
+
+
+def _render_proxy_detail_view(idx: int) -> tuple[str, types.InlineKeyboardMarkup]:
+    report = get_proxy_detailed_report()
+    items = report["items"]
+    if idx < 0 or idx >= len(items):
+        return _render_proxies_view()
+    it = items[idx]
+    st_badge = "🟢 يعمل بثبات" if it.get("alive") is True else ("🔴 متعطل / ميت" if it.get("alive") is False else "⚪ لم يُفحص بعد")
+    lat = f"{it['latency_ms']} ms" if it.get("latency_ms") is not None else "-"
+    geo = f"{it.get('country_name') or it.get('country_code') or '-'} | Exit: {it.get('exit_ip') or '-'}"
+    cap_txt = f"{it['bound_count']}/{it['max_per_proxy']}" if it.get("max_per_proxy") else str(it["bound_count"])
+    lines = [
+        f"🛰️ <b>بطاقة البروكسي #{idx + 1}</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"🌐 <b>العنوان:</b> <code>{esc(it['masked_uri'])}</code>",
+        f"⚡ <b>الحالة:</b> {st_badge} | ⏱️ {lat}",
+        f"🌍 <b>الموقع:</b> {esc(geo)}",
+        f"🔁 <b>الاستخدامات:</b> <b>{it['uses_count']}</b> (✅ نجح: {it['success_count']} | ❌ فشل: {it['total_fail_count']})",
+        f"👥 <b>الحمولة:</b> <b>{cap_txt}</b> حساب | 🕒 آخر استخدام: {esc(it.get('last_used_at') or '-')}",
+    ]
+    if it.get("last_error"):
+        lines.append(f"⚠️ <b>آخر خطأ:</b> <code>{esc(it['last_error'])}</code>")
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    bound_accs = it.get("bound_accounts") or []
+    if bound_accs:
+        lines.append(f"📱 <b>الحسابات المربوطة بهذا الـ IP ({len(bound_accs)}):</b>")
+        for b in bound_accs[:15]:
+            b_ico = "🟢" if "نشط" in str(b.get("status", "")) else "🔴"
+            lines.append(f"  {b_ico} <b>{esc(b['name'])}</b> (<code>{esc(b['id'])}</code>)")
+        if len(bound_accs) > 15:
+            lines.append(f"  <i>... و {len(bound_accs) - 15} حساب إضافي</i>")
+    else:
+        lines.append("<i>لا توجد حسابات مربوطة بهذا الـ IP حالياً.</i>")
 
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.row(
-        types.InlineKeyboardButton("➕ إضافة بروكسيات", callback_data="prx_add_prompt"),
-        types.InlineKeyboardButton("🩺 فحص كل البروكسيات", callback_data="prx_check_all"),
+        _btn("🩺 فحص هذا الـ IP", style="primary", callback_data=f"prx_chk_{idx}"),
+        _btn("🔁 نقل حساباته لـ IP سليم", style="success", callback_data=f"prx_rebind_{idx}"),
     )
     markup.row(
-        types.InlineKeyboardButton("🔗 توزيع وربط الحسابات الحالية", callback_data="prx_bind_existing"),
-        types.InlineKeyboardButton("📥 جلب مجاني (GitHub) وفحص", callback_data="prx_fetch_github"),
-    )
-    markup.row(
-        types.InlineKeyboardButton("📱 نفق الفورجي 4G (بدون VPS)", callback_data="prx_4g_menu"),
-        types.InlineKeyboardButton("🔀 تبديل الوضع النشط", callback_data="prx_cycle_mode"),
-    )
-    markup.row(
-        types.InlineKeyboardButton(f"⚖️ حد/بروكسي: {cap_btn_lbl}", callback_data="prx_cycle_cap"),
-    )
-    markup.row(
-        types.InlineKeyboardButton("🧹 حذف الميتة", callback_data="prx_clear_dead"),
-        types.InlineKeyboardButton("🗑️ مسح الكل", callback_data="prx_clear_all"),
-    )
-    markup.row(
-        types.InlineKeyboardButton("🔄 تحديث", callback_data="menu_proxies"),
-        types.InlineKeyboardButton("🔙 الرئيسية", callback_data="back_to_main"),
+        _btn("🗑️ حذف هذا الـ IP", style="danger", callback_data=f"prx_del_{idx}"),
+        _btn("🔙 قائمة البروكسيات", callback_data="menu_proxies"),
     )
     return "\n".join(lines), markup
+
+
+def _on_proxy_alert_event(payload: dict) -> None:
+    """تنبيه فوري للمطور والأدمن غير المقيد عند سقوط أي IP مع أزرار الإصلاح السريع."""
+    try:
+        newly_dead = payload.get("newly_dead") or []
+        recovered = payload.get("recovered") or []
+        if not newly_dead and not recovered:
+            return
+        acc_by_id = {str(a.get("id")): a for a in load_accounts() if a.get("id")}
+        lines = ["🚨 <b>تنبيه مراقب البروكسيات التلقائي</b>", "━━━━━━━━━━━━━━━━━━━━"]
+        for d in newly_dead[:5]:
+            b_names = [str((acc_by_id.get(aid) or {}).get("name") or aid) for aid in (d.get("bound_account_ids") or [])[:6]]
+            acc_txt = ", ".join(b_names) if b_names else "لا توجد حسابات مربوطة"
+            lines.append(
+                f"🔴 <b>تعطل IP:</b> <code>{esc(d.get('masked_uri') or d.get('host'))}</code>\n"
+                f"   ⚠️ السبب: <code>{esc(d.get('error') or 'فشل الاتصال')}</code>\n"
+                f"   👥 المتأثرة ({len(d.get('bound_account_ids') or [])}): {esc(acc_txt)}"
+            )
+        if recovered:
+            lines.append(f"🟢 <b>استعاد الاتصال:</b> {len(recovered)} بروكسي عاد للعمل.")
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        if newly_dead and newly_dead[0].get("idx") is not None:
+            i0 = newly_dead[0]["idx"]
+            markup.row(
+                types.InlineKeyboardButton("🔁 نقل الحسابات لـ IP سليم", callback_data=f"prx_rebind_{i0}"),
+                types.InlineKeyboardButton("🩺 إعادة الفحص", callback_data=f"prx_chk_{i0}"),
+            )
+        markup.row(
+            types.InlineKeyboardButton("🧹 حذف الميتة", callback_data="prx_clear_dead"),
+            types.InlineKeyboardButton("🌐 غرفة البروكسيات", callback_data="menu_proxies"),
+        )
+        txt = "\n".join(lines)
+        for admin_uid in get_admin_notification_recipients("proxies"):
+            safe_send(admin_uid, txt, reply_markup=markup)
+    except Exception:
+        pass
 
 
 def _render_4g_bridge_view() -> tuple[str, types.InlineKeyboardMarkup]:
@@ -2345,25 +2746,25 @@ def _on_state_event(scope: str, target_uid: int, reason: str) -> None:
 # ----------------- معالجات الأوامر والقوائم -----------------
 
 def _persistent_bottom_keyboard(user_id: int) -> types.ReplyKeyboardMarkup:
-    """كيبورد اختصار دائم أسفل صندوق الكتابة يفتح البوت بضغطة واحدة بدون كتابة /start"""
+    """كيبورد اختصار دائم أسفل صندوق الكتابة يفتح البوت بضغطة واحدة بألوان Bot API 9.4"""
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True, is_persistent=True)
     is_dev = is_super_admin(user_id)
     cap_prox = has_admin_capability(user_id, "proxies")
     cap_radar = has_admin_capability(user_id, "radar_users")
     can_add = is_dev or has_permission(user_id, "can_add_accounts")
-    row1 = [types.KeyboardButton("🏠 القائمة الرئيسية")]
+    row1 = [_kbtn("🏠 القائمة الرئيسية", style="primary")]
     if can_add:
-        row1.append(types.KeyboardButton("➕ إضافة حساب"))
+        row1.append(_kbtn("➕ إضافة حساب", style="success"))
     kb.row(*row1)
     if cap_prox or cap_radar:
         row2 = []
         if cap_prox:
-            row2.append(types.KeyboardButton("🌐 البروكسيات"))
+            row2.append(_kbtn("🌐 البروكسيات"))
         if cap_radar:
-            row2.append(types.KeyboardButton("🛰️ رادار المستخدمين"))
+            row2.append(_kbtn("🛰️ رادار المستخدمين"))
         kb.row(*row2)
     else:
-        kb.row(types.KeyboardButton("💰 نقاطي"))
+        kb.row(_kbtn("💰 نقاطي"))
     return kb
 
 
@@ -2437,18 +2838,21 @@ def cmd_start(message: types.Message):
         open_anns = [a for a in list_announcements(only_active=True) if a.get("repeat_on_open")]
         if open_anns:
             top_a = open_anns[0]
-            promo_msg = safe_send(
-                message.chat.id,
-                format_announcement_telegram_html(top_a, esc_fn=esc, is_repeat=False),
-                reply_markup=_build_announcement_markup(top_a, include_ack=True),
+            r_media = None
+            if top_a.get("delivery_mode") in ("animated_card", "photo_card"):
+                try:
+                    r_media = render_announcement_media(
+                        top_a, animated=(top_a.get("delivery_mode") == "animated_card"), allow_browser=True
+                    )
+                except Exception:
+                    r_media = None
+            new_mid, is_m = _send_announcement_to_chat(
+                message.chat.id, top_a, is_repeat=False, rendered_media=r_media
             )
-            if promo_msg and hasattr(promo_msg, "message_id"):
-                record_announcement_sent_chats(top_a["id"], {message.chat.id: promo_msg.message_id})
-                if top_a.get("pin_in_chat"):
-                    try:
-                        bot.pin_chat_message(message.chat.id, promo_msg.message_id, disable_notification=True)
-                    except Exception:
-                        pass
+            if new_mid:
+                record_announcement_sent_chats(
+                    top_a["id"], {message.chat.id: new_mid}, media_cids=({message.chat.id} if is_m else None)
+                )
     except Exception:
         pass
 
@@ -2599,13 +3003,28 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
             bot.unpin_chat_message(call.message.chat.id, call.message.message_id)
         except Exception:
             pass
-        safe_answer(call.id, "✅ تم إخفاء الإعلان المثبّت من محادثتك.")
-        safe_edit_message(
-            get_dashboard_text(user_id),
-            call.message.chat.id, call.message.message_id,
-            reply_markup=get_main_dashboard_markup(user_id)
-        )
-        _track_view(user_id, call.message.chat.id, call.message.message_id, "main")
+        safe_answer(call.id, "✅ تم إخفاء الإعلان.")
+        # إذا كانت رسالة الإعلان عبارة عن صورة/GIF متحركة (بدون نص قابل للتحرير) نحذفها ونرسل الرئيسية نظيفة
+        is_media_bubble = bool(getattr(call.message, "photo", None) or getattr(call.message, "animation", None))
+        if is_media_bubble:
+            try:
+                bot.delete_message(call.message.chat.id, call.message.message_id)
+            except Exception:
+                pass
+            sent_m = safe_send(
+                call.message.chat.id,
+                get_dashboard_text(user_id),
+                reply_markup=get_main_dashboard_markup(user_id),
+            )
+            if sent_m and hasattr(sent_m, "message_id"):
+                _track_view(user_id, call.message.chat.id, sent_m.message_id, "main")
+        else:
+            safe_edit_message(
+                get_dashboard_text(user_id),
+                call.message.chat.id, call.message.message_id,
+                reply_markup=get_main_dashboard_markup(user_id)
+            )
+            _track_view(user_id, call.message.chat.id, call.message.message_id, "main")
         return
 
     # ----------------- مركز الإعلانات العائمة والمنبثقة للمطور والأدمن غير المقيد -----------------
@@ -2619,6 +3038,40 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
         return
 
+    elif data == "ann_theme_menu":
+        if not has_admin_capability(user_id, "announcements"):
+            safe_answer(call.id, "⛔ غير مصرح لك.", show_alert=True)
+            return
+        txt, mk = _render_theme_config_view()
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
+        return
+
+    elif data == "ann_ce_tog":
+        if not has_admin_capability(user_id, "announcements"):
+            return
+        cur_ce = bool(get_theme_config().get("custom_emojis_enabled", True))
+        update_theme_config({"custom_emojis_enabled": not cur_ce})
+        safe_answer(call.id, "✅ تم تحديث حالة الأيقونات المخصصة.")
+        txt, mk = _render_theme_config_view()
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
+        return
+
+    elif data.startswith("ann_ce_set_"):
+        if not has_admin_capability(user_id, "announcements"):
+            return
+        slot = data[len("ann_ce_set_"):]
+        if slot not in DEFAULT_THEME_EMOJIS:
+            return
+        st["input_mode"] = f"waiting_ann_ce_{slot}"
+        safe_answer(call.id)
+        safe_send(
+            call.message.chat.id,
+            f"🧩 <b>ضبط Custom Emoji ID لخانة (<code>{esc(slot)}</code>):</b>\n"
+            "<blockquote>أرسل الرقم التعريفي للإيموجي المخصص (أو أرسل <code>0</code> لمسحه والعودة للافتراضي).</blockquote>",
+            reply_markup=_prompt_back_markup("ann_theme_menu"),
+        )
+        return
+
     elif data == "ann_new":
         if not has_admin_capability(user_id, "announcements"):
             safe_answer(call.id, "⛔ غير مصرح لك.", show_alert=True)
@@ -2626,18 +3079,20 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         st["temp_ann_data"] = {
             "badge": "ميزة جديدة",
             "display_style": "floating_card",
+            "delivery_mode": "animated_card",
+            "repeat_behavior": "replace",
+            "effect_preset": "fire",
             "duration_sec": 86400,
             "repeat_interval_sec": 3600,
             "repeat_on_open": True,
-            "pin_in_chat": True,
+            "pin_in_chat": False,
         }
         st["input_mode"] = "waiting_ann_title"
         safe_answer(call.id)
         safe_send(
             call.message.chat.id,
-            "📢 <b>إنشاء إعلان عائم ومنبثق جديد (الخطوة 1/3)</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "✍️ أرسل <b>عنوان الإعلان</b> الآن (مثال: <i>تحديث محرك البروفايلات الذكي + ميزة جديدة!</i>):",
+            "📢 <b>إنشاء إعلان ببطاقة متحركة وملونة (الخطوة 1/3)</b>\n"
+            "<blockquote>✍️ أرسل <b>عنوان الإعلان</b> الآن (سيتم تصيير بطاقة GIF متحركة + أزرار Bot API 9.4 ملونة تلقائياً).</blockquote>",
             reply_markup=_prompt_back_markup("menu_announcements"),
         )
         return
@@ -2653,12 +3108,13 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         draft["duration_sec"] = d_sec
         mk = types.InlineKeyboardMarkup(row_width=2)
         for rsec, rlbl in REPEAT_PRESETS:
-            mk.add(types.InlineKeyboardButton(f"🔁 {rlbl}", callback_data=f"ann_c_rep_{rsec}"))
+            mk.add(_btn(f"🔁 {rlbl}", style="primary" if rsec == 0 else None, callback_data=f"ann_c_rep_{rsec}"))
         safe_answer(call.id, f"⏱️ المدة: {format_duration_ar(d_sec)}")
         safe_edit_message(
-            f"📢 <b>اختر نظام التكرار والظهور المتكرر للإعلان:</b>\n"
-            f"• <b>العنوان:</b> {esc(draft.get('title'))}\n"
-            f"• <b>المدة المحددة:</b> {esc(format_duration_ar(d_sec))}",
+            f"📢 <b>اختر نظام التكرار والظهور للإعلان:</b>\n"
+            f"<blockquote>• <b>العنوان:</b> {esc(draft.get('title'))}\n"
+            f"• <b>المدة:</b> {esc(format_duration_ar(d_sec))}\n"
+            f"• <b>نمط التكرار الافتراضي:</b> استبدال نظيف بدون تثبيت مكرر</blockquote>",
             call.message.chat.id, call.message.message_id,
             reply_markup=mk,
         )
@@ -2681,22 +3137,89 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
             created_by=user_id,
             badge=draft.get("badge", "ميزة جديدة"),
             display_style=draft.get("display_style", "floating_card"),
+            delivery_mode=draft.get("delivery_mode", "animated_card"),
+            repeat_behavior=draft.get("repeat_behavior", "replace"),
+            effect_preset=draft.get("effect_preset", "fire"),
             duration_sec=int(draft.get("duration_sec", 86400)),
             repeat_interval_sec=r_sec,
             repeat_on_open=bool(draft.get("repeat_on_open", True)),
-            pin_in_chat=bool(draft.get("pin_in_chat", True)),
+            pin_in_chat=bool(draft.get("pin_in_chat", False)),
         )
         st["temp_ann_data"] = {}
         st["input_mode"] = None
-        safe_answer(call.id, "🚀 جاري بث وتثبيت الإعلان العائم للجميع...")
+        safe_answer(call.id, "🚀 جاري تصيير البطاقة وبث الإعلان العائم...")
         b_res = _broadcast_announcement_to_users(ann, is_repeat=False)
-        record_audit_log(user_id, call.from_user.first_name or "", "ANNOUNCEMENT_CREATED", f"إعلان عائم: {ann['title']} | مستلمون: {b_res['sent']}")
+        record_audit_log(user_id, call.from_user.first_name or "", "ANNOUNCEMENT_CREATED", f"إعلان متحرك: {ann['title']} | مستلمون: {b_res['sent']}")
         txt, mk = _render_announcement_detail_view(ann["id"])
         safe_edit_message(
-            txt + f"\n\n✅ <b>تم البث الفوري إلى {b_res['sent']} محادثة وتثبيته أعلى الدردشة ({b_res['pinned']} مثبّت)!</b>",
+            txt + f"\n\n✅ <b>تم البث إلى {b_res['sent']} محادثة</b> ({'🎞️ بطاقة بصرية' if b_res.get('media') else '💬 بطاقة ذكية'})!",
             call.message.chat.id, call.message.message_id,
             reply_markup=mk,
         )
+        return
+
+    elif data.startswith("ann_dm_"):
+        if not has_admin_capability(user_id, "announcements"):
+            return
+        ann_id = data[len("ann_dm_"):]
+        cur_a = get_announcement_by_id(ann_id)
+        if not cur_a:
+            return
+        order = ("animated_card", "photo_card", "smart_text")
+        cur_m = cur_a.get("delivery_mode", "animated_card")
+        nxt = order[(order.index(cur_m) + 1) % len(order)] if cur_m in order else "animated_card"
+        update_announcement_delivery(ann_id, delivery_mode=nxt)
+        safe_answer(call.id, f"🎨 {DELIVERY_MODES.get(nxt, nxt)}")
+        txt, mk = _render_announcement_detail_view(ann_id)
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
+        return
+
+    elif data.startswith("ann_rb_"):
+        if not has_admin_capability(user_id, "announcements"):
+            return
+        ann_id = data[len("ann_rb_"):]
+        cur_a = get_announcement_by_id(ann_id)
+        if not cur_a:
+            return
+        order = ("replace", "edit_live", "new_msg")
+        cur_r = cur_a.get("repeat_behavior", "replace")
+        nxt = order[(order.index(cur_r) + 1) % len(order)] if cur_r in order else "replace"
+        update_announcement_delivery(ann_id, repeat_behavior=nxt)
+        safe_answer(call.id, f"🔁 {REPEAT_BEHAVIORS.get(nxt, nxt)}")
+        txt, mk = _render_announcement_detail_view(ann_id)
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
+        return
+
+    elif data.startswith("ann_pin_"):
+        if not has_admin_capability(user_id, "announcements"):
+            return
+        ann_id = data[len("ann_pin_"):]
+        cur_a = get_announcement_by_id(ann_id)
+        if not cur_a:
+            return
+        new_pin = not bool(cur_a.get("pin_in_chat", False))
+        update_announcement_delivery(ann_id, pin_in_chat=new_pin)
+        if not new_pin:
+            _unpin_announcement_chats(cur_a)
+        safe_answer(call.id, "📌 تم تفعيل التثبيت (مرة واحدة)" if new_pin else "🪟 تم إيقاف التثبيت (وضع عائم نظيف)")
+        txt, mk = _render_announcement_detail_view(ann_id)
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
+        return
+
+    elif data.startswith("ann_eff_"):
+        if not has_admin_capability(user_id, "announcements"):
+            return
+        ann_id = data[len("ann_eff_"):]
+        cur_a = get_announcement_by_id(ann_id)
+        if not cur_a:
+            return
+        order = tuple(EFFECT_PRESETS.keys())
+        cur_e = cur_a.get("effect_preset", "none")
+        nxt = order[(order.index(cur_e) + 1) % len(order)] if cur_e in order else "fire"
+        update_announcement_delivery(ann_id, effect_preset=nxt)
+        safe_answer(call.id, f"🎆 {(EFFECT_PRESETS.get(nxt) or ('',))[0]}")
+        txt, mk = _render_announcement_detail_view(ann_id)
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
         return
 
     elif data.startswith("ann_view_"):
@@ -3299,6 +3822,44 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
             )
         return
 
+    elif data.startswith("mission_hitl_"):
+        if data.startswith("mission_hitl_resume_"):
+            acc_id = data[len("mission_hitl_resume_"):]
+            dec = "verified"
+            ack = "✅ تم تأكيد إكمال التحقق — سيُستكمل تنفيذ المهمة على هذا الحساب فوراً!"
+        elif data.startswith("mission_hitl_skip_"):
+            acc_id = data[len("mission_hitl_skip_"):]
+            dec = "skip"
+            ack = "⏭️ تم تخطي هذا الحساب ومتابعة بقية الموجة."
+        elif data.startswith("mission_hitl_abort_"):
+            acc_id = data[len("mission_hitl_abort_"):]
+            dec = "abort"
+            ack = "🛑 تم إرسال أمر إيقاف المهمة فوراً."
+        else:
+            safe_answer(call.id, "أمر غير معروف.")
+            return
+        w_info = get_mission_hitl_waiter(acc_id=acc_id)
+        acc = get_account_by_id(acc_id)
+        can_access = (
+            has_admin_capability(user_id, "accounts_pool")
+            or (w_info and int(w_info.get("owner_uid") or 0) == int(user_id))
+            or (acc and int(acc.get("owner_id") or 0) == int(user_id))
+        )
+        if not can_access:
+            record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", f"محاولة التحكم بانتظار HITL لحساب خارج النطاق: {acc_id}")
+            safe_answer(call.id, "⛔ غير مصرح لك.", show_alert=True)
+            return
+        ok_sig = signal_mission_hitl_decision(acc_id, dec)
+        safe_answer(call.id, ack if ok_sig else "انتهى وقت الانتظار أو استؤنف الحساب مسبقاً.", show_alert=not ok_sig)
+        return
+
+    elif data == "toggle_wait_hitl":
+        st["wait_for_hitl"] = not bool(st.get("wait_for_hitl", True))
+        persist_user_states()
+        safe_answer(call.id, "⏳ انتظار التحقق البشري: مفعّل" if st["wait_for_hitl"] else "⏭️ انتظار التحقق: معطل (تخطي تلقائي)")
+        safe_edit_message(get_dashboard_text(user_id), call.message.chat.id, call.message.message_id, reply_markup=get_main_dashboard_markup(user_id))
+        return
+
     elif data == "menu_proxies" or data.startswith("prx_"):
         if not has_admin_capability(user_id, "proxies"):
             record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", f"محاولة الوصول لإدارة البروكسيات بدون صلاحية: {data}")
@@ -3387,6 +3948,73 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
             record_audit_log(user_id, call.from_user.first_name or "", "PROXY_CAP_UPDATED", f"تغيير حد الحسابات لكل بروكسي إلى {nxt_cap}")
             cap_msg = f"{nxt_cap} حسابات/بروكسي" if nxt_cap > 0 else "توزيع مرن غير محدود"
             safe_answer(call.id, f"✅ تم ضبط الحد الآمن على: {cap_msg}")
+            txt, markup = _render_proxies_view()
+            safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+            return
+        elif data == "prx_toggle_watch":
+            enabled = toggle_auto_check()
+            record_audit_log(user_id, call.from_user.first_name or "", "PROXY_WATCH_TOGGLE", f"الفحص التلقائي: {enabled}")
+            safe_answer(call.id, "✅ تم تفعيل الفحص التلقائي للبروكسيات" if enabled else "⏸️ تم إيقاف الفحص التلقائي مؤقتاً")
+            txt, markup = _render_proxies_view()
+            safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+            return
+        elif data.startswith("prx_page_"):
+            try:
+                pg = int(data[len("prx_page_"):])
+            except Exception:
+                pg = 0
+            safe_answer(call.id)
+            txt, markup = _render_proxies_view(page=pg)
+            safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+            return
+        elif data.startswith("prx_item_"):
+            try:
+                idx = int(data[len("prx_item_"):])
+            except Exception:
+                idx = -1
+            safe_answer(call.id)
+            txt, markup = _render_proxy_detail_view(idx)
+            safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+            return
+        elif data.startswith("prx_chk_"):
+            try:
+                idx = int(data[len("prx_chk_"):])
+            except Exception:
+                idx = -1
+            safe_answer(call.id, "🩺 جاري فحص هذا البروكسي...")
+            def _bg_chk_one():
+                res = check_single_proxy(idx, timeout=8.0)
+                if res.get("ok"):
+                    txt, markup = _render_proxy_detail_view(int(res.get("idx", idx)))
+                else:
+                    txt, markup = _render_proxies_view()
+                safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+            threading.Thread(target=_bg_chk_one, daemon=True).start()
+            return
+        elif data.startswith("prx_rebind_"):
+            try:
+                idx = int(data[len("prx_rebind_"):])
+            except Exception:
+                idx = -1
+            rb = rebind_proxy_accounts(idx)
+            if rb.get("ok"):
+                safe_answer(call.id, f"🔁 تم نقل {rb.get('moved', 0)} حساب لبروكسيات سليمة بنجاح!", show_alert=True)
+            else:
+                safe_answer(call.id, f"⚠️ {rb.get('error', 'تعذر النقل')}", show_alert=True)
+            txt, markup = _render_proxy_detail_view(idx)
+            safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+            return
+        elif data.startswith("prx_del_"):
+            try:
+                idx = int(data[len("prx_del_"):])
+            except Exception:
+                idx = -1
+            d_res = delete_single_proxy(idx, auto_rebind=True)
+            if d_res.get("ok"):
+                record_audit_log(user_id, call.from_user.first_name or "", "PROXY_DELETED", f"حذف {d_res.get('masked_uri')} | إعادة ربط {d_res.get('rebound', 0)}")
+                safe_answer(call.id, f"🗑️ تم حذف الـ IP (نُقل {d_res.get('rebound', 0)} حساب لبديل سليم)", show_alert=True)
+            else:
+                safe_answer(call.id, f"⚠️ {d_res.get('error', 'غير موجود')}", show_alert=True)
             txt, markup = _render_proxies_view()
             safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
             return
@@ -4375,31 +5003,131 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
             safe_answer(call.id, "⛔ ليس لديك صلاحية استخدام حسابات البوت.", show_alert=True)
             return
 
+        if st.get("selected_acc") not in ("all", "multi") and any(a["id"] == st["selected_acc"] for a in usable):
+            st["selected_accs"] = [st["selected_acc"]]
+        sel_set = set(st.get("selected_accs") or [])
+
         markup = types.InlineKeyboardMarkup(row_width=2)
-        markup.add(types.InlineKeyboardButton("🚀 (All) تنفيذ بجميع الحسابات المتاحة", callback_data="sel_acc_all"))
+        all_chk = "✅" if st.get("selected_acc") == "all" else "⬜"
+        markup.row(types.InlineKeyboardButton(f"{all_chk} جميع الحسابات المتاحة تلقائياً", callback_data="sel_acc_all"))
         for a in usable:
             st_icon = "🟢" if "نشط" in a.get("status", "") else "🔴"
-            # نعرض الاسم فقط بدون كشف البريد الإلكتروني لحماية حسابات المطور
-            markup.add(types.InlineKeyboardButton(f"{st_icon} {a['name']}", callback_data=f"sel_acc_{a['id']}"))
-        markup.add(types.InlineKeyboardButton("🔙 رجوع للرئيسية", callback_data="back_to_main"))
+            chk = "☑️" if (st.get("selected_acc") == "all" or a["id"] in sel_set) else "⬜"
+            cc = f" [{a.get('bound_proxy_country')}]" if a.get("bound_proxy_country") else ""
+            markup.row(
+                types.InlineKeyboardButton(f"{chk} {st_icon} {a['name']}{cc}", callback_data=f"sel_acc_tog_{a['id']}"),
+                types.InlineKeyboardButton("⚡ هذا فقط", callback_data=f"sel_acc_only_{a['id']}"),
+            )
+        markup.row(
+            types.InlineKeyboardButton(f"✅ اعتماد المحدد ({len(sel_set)})", callback_data="sel_acc_done"),
+            types.InlineKeyboardButton("⬜ مسح التحديد", callback_data="sel_acc_none"),
+        )
+        markup.row(types.InlineKeyboardButton("🔙 رجوع للرئيسية", callback_data="back_to_main"))
         safe_edit_message(
-            "👤 <b>اختر الحساب المطلوب لتنفيذ العمليات:</b>",
+            "👥 <b>اختيار الحسابات المنفذة (واحد / متعدد / الكل):</b>\n"
+            "<i>اضغط ☑️ لتحديد عدة حسابات أو ⚡ لتنفيذ سريع بحساب واحد ثم اضغط اعتماد.</i>",
             call.message.chat.id, call.message.message_id, reply_markup=markup
         )
 
     elif data.startswith("sel_acc_"):
-        chosen = data.replace("sel_acc_", "")
+        chosen = data.replace("sel_acc_", "", 1)
         usable = get_usable_accounts_for_user(user_id)
+        usable_ids = {a["id"] for a in usable}
         if not (is_super_admin(user_id) or has_permission(user_id, "can_use_accounts") or (has_permission(user_id, "can_execute") and usable)):
             safe_answer(call.id, "⛔ ليس لديك صلاحية استخدام الحسابات.", show_alert=True)
             return
-        if chosen != "all" and not any(a["id"] == chosen for a in usable):
-            record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", f"محاولة اختيار حساب غير مصرح {chosen}")
-            safe_answer(call.id, "⛔ غير مسموح لك باختيار هذا الحساب!", show_alert=True)
+
+        if chosen == "all":
+            st["selected_acc"] = "all"
+            st["selected_accs"] = []
+            persist_user_states()
+            safe_answer(call.id, "✅ تم اختيار جميع الحسابات المتاحة!")
+            safe_edit_message(get_dashboard_text(user_id), call.message.chat.id, call.message.message_id, reply_markup=get_main_dashboard_markup(user_id))
             return
-        st["selected_acc"] = chosen
-        safe_answer(call.id, "تم تحديد الحساب المنفذ بنجاح!")
-        safe_edit_message(get_dashboard_text(user_id), call.message.chat.id, call.message.message_id, reply_markup=get_main_dashboard_markup(user_id))
+
+        if chosen == "none":
+            st["selected_acc"] = "multi"
+            st["selected_accs"] = []
+            chosen_msg = "⬜ تم تفريغ التحديد — اختر حساباتك ثم اضغط اعتماد"
+            safe_answer(call.id, chosen_msg)
+        elif chosen == "done":
+            valid = [x for x in (st.get("selected_accs") or []) if x in usable_ids]
+            st["selected_accs"] = valid
+            if not valid:
+                st["selected_acc"] = "all"
+                safe_answer(call.id, "لم تحدد حسابات؛ أُعيدت للوضع التلقائي (الكل)")
+            elif len(valid) == 1:
+                st["selected_acc"] = valid[0]
+                safe_answer(call.id, "✅ تم اعتماد الحساب المنفذ!")
+            else:
+                st["selected_acc"] = "multi"
+                safe_answer(call.id, f"✅ تم اعتماد {len(valid)} حسابات للتنفيذ!")
+            persist_user_states()
+            safe_edit_message(get_dashboard_text(user_id), call.message.chat.id, call.message.message_id, reply_markup=get_main_dashboard_markup(user_id))
+            return
+        elif chosen.startswith("tog_"):
+            tid = chosen[len("tog_"):]
+            if tid not in usable_ids:
+                record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", f"محاولة اختيار حساب غير مصرح {tid}")
+                safe_answer(call.id, "⛔ غير مسموح لك باختيار هذا الحساب!", show_alert=True)
+                return
+            cur_list = [x for x in (st.get("selected_accs") or []) if x in usable_ids]
+            if st.get("selected_acc") not in ("all", "multi") and st["selected_acc"] in usable_ids and st["selected_acc"] not in cur_list:
+                cur_list.append(st["selected_acc"])
+            if tid in cur_list:
+                cur_list.remove(tid)
+            else:
+                cur_list.append(tid)
+            st["selected_acc"] = "multi"
+            st["selected_accs"] = cur_list
+            persist_user_states()
+            safe_answer(call.id, f"المحدد الآن: {len(cur_list)}")
+        elif chosen.startswith("only_"):
+            tid = chosen[len("only_"):]
+            if tid not in usable_ids:
+                safe_answer(call.id, "⛔ غير مسموح!", show_alert=True)
+                return
+            st["selected_acc"] = tid
+            st["selected_accs"] = [tid]
+            persist_user_states()
+            safe_answer(call.id, "✅ تم اختيار الحساب للتنفيذ!")
+            safe_edit_message(get_dashboard_text(user_id), call.message.chat.id, call.message.message_id, reply_markup=get_main_dashboard_markup(user_id))
+            return
+        else:
+            if chosen not in usable_ids:
+                record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", f"محاولة اختيار حساب غير مصرح {chosen}")
+                safe_answer(call.id, "⛔ غير مسموح لك باختيار هذا الحساب!", show_alert=True)
+                return
+            st["selected_acc"] = chosen
+            st["selected_accs"] = [chosen]
+            persist_user_states()
+            safe_answer(call.id, "تم تحديد الحساب المنفذ بنجاح!")
+            safe_edit_message(get_dashboard_text(user_id), call.message.chat.id, call.message.message_id, reply_markup=get_main_dashboard_markup(user_id))
+            return
+
+        # تحديث قائمة الاختيار المتعدد مباشرة بعد tog_ أو none
+        sel_set = set(st.get("selected_accs") or [])
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        all_chk = "✅" if st.get("selected_acc") == "all" else "⬜"
+        markup.row(types.InlineKeyboardButton(f"{all_chk} جميع الحسابات المتاحة تلقائياً", callback_data="sel_acc_all"))
+        for a in usable:
+            st_icon = "🟢" if "نشط" in a.get("status", "") else "🔴"
+            chk = "☑️" if (st.get("selected_acc") == "all" or a["id"] in sel_set) else "⬜"
+            cc = f" [{a.get('bound_proxy_country')}]" if a.get("bound_proxy_country") else ""
+            markup.row(
+                types.InlineKeyboardButton(f"{chk} {st_icon} {a['name']}{cc}", callback_data=f"sel_acc_tog_{a['id']}"),
+                types.InlineKeyboardButton("⚡ هذا فقط", callback_data=f"sel_acc_only_{a['id']}"),
+            )
+        markup.row(
+            types.InlineKeyboardButton(f"✅ اعتماد المحدد ({len(sel_set)})", callback_data="sel_acc_done"),
+            types.InlineKeyboardButton("⬜ مسح التحديد", callback_data="sel_acc_none"),
+        )
+        markup.row(types.InlineKeyboardButton("🔙 رجوع للرئيسية", callback_data="back_to_main"))
+        safe_edit_message(
+            "👥 <b>اختيار الحسابات المنفذة (واحد / متعدد / الكل):</b>\n"
+            "<i>اضغط ☑️ لتحديد عدة حسابات أو ⚡ لتنفيذ سريع بحساب واحد ثم اضغط اعتماد.</i>",
+            call.message.chat.id, call.message.message_id, reply_markup=markup
+        )
 
     # H) إدارة الحسابات (معزولة الملكية: المطور/النائب غير المقيد يرى الكل، والمستخدم يرى حساباته المضافة فقط)
     elif data == "menu_manage_accs":
@@ -4785,6 +5513,26 @@ def _handle_text_inputs_impl(message: types.Message):
             "📢 <b>الخطوة 3/3: اختر مدة بقاء الإعلان العائم قبل انتهائه وفك تثبيته تلقائياً:</b>",
             reply_markup=mk,
         )
+        return
+
+    elif mode and mode.startswith("waiting_ann_ce_"):
+        if not has_admin_capability(user_id, "announcements"):
+            st["input_mode"] = None
+            return
+        slot = mode[len("waiting_ann_ce_"):]
+        val_txt = text.strip()
+        new_val = "" if val_txt in ("0", "clear", "حذف") else val_txt
+        if new_val and not (new_val.isdigit() and 15 <= len(new_val) <= 24):
+            bot.reply_to(
+                message,
+                "⚠️ أرسل رقماً صحيحاً لمعرف Custom Emoji ID (أو <code>0</code> للمسح).",
+                reply_markup=_prompt_back_markup("ann_theme_menu"),
+            )
+            return
+        update_theme_config({"emojis": {slot: new_val}})
+        st["input_mode"] = None
+        txt, mk = _render_theme_config_view()
+        bot.reply_to(message, txt, reply_markup=mk)
         return
 
     if mode == "waiting_backup_channel":
@@ -5787,6 +6535,9 @@ def execute_mission_worker(chat_id: int, user_id: int):
             target_accounts = [a for a in usable if "نشط" in a.get("status", "")]
             if not target_accounts:
                 target_accounts = usable
+        elif st["selected_acc"] == "multi":
+            picked_ids = {str(x) for x in (st.get("selected_accs") or [])}
+            target_accounts = [a for a in usable if a["id"] in picked_ids]
         else:
             target_accounts = [a for a in usable if a["id"] == st["selected_acc"]]
 
@@ -5818,7 +6569,33 @@ def execute_mission_worker(chat_id: int, user_id: int):
             gap_min, gap_max = 8.0, 18.0
         circuit_tripped = False
 
+        def _build_mission_pause_markup(aid: str, can_otp: bool = True) -> types.InlineKeyboardMarkup:
+            mk = types.InlineKeyboardMarkup(row_width=2)
+            w_url = get_public_webapp_url()
+            if w_url:
+                sep = "&" if "?" in w_url else "?"
+                mk.row(
+                    _btn(
+                        "🖥️ فتح الشاشة الحية للتحقق الآن",
+                        style="primary",
+                        icon_key="shield",
+                        web_app=types.WebAppInfo(url=f"{w_url}{sep}hitl={aid}"),
+                    )
+                )
+            row_ctl = [_btn("✅ أكملت التحقق — تابع", style="success", icon_key="check", callback_data=f"mission_hitl_resume_{aid}")]
+            if can_otp:
+                row_ctl.append(_btn("🔑 إرسال 2FA", style="primary", callback_data=f"hitl_otp_{aid}"))
+            mk.row(*row_ctl)
+            mk.row(
+                _btn("⏭️ تخطي الحساب", callback_data=f"mission_hitl_skip_{aid}"),
+                _btn("🛑 إيقاف المهمة", style="danger", callback_data=f"mission_hitl_abort_{aid}"),
+            )
+            return mk
+
+        mission_aborted = False
         for idx, acc in enumerate(target_accounts, 1):
+            if mission_aborted:
+                break
             # التحقق الفوري أثناء التشغيل تحسباً لحظْر أو سحب الصلاحيات في المنتصف
             if not (is_super_admin(user_id) or (is_authorized_user(user_id) and has_permission(user_id, "can_execute"))):
                 update_live_status(
@@ -5828,300 +6605,423 @@ def execute_mission_worker(chat_id: int, user_id: int):
                 return
 
             label_acc = acc["name"] if is_super_admin(user_id) else f"{acc['name']}"
-            update_live_status(
-                f"🚀 <b>جاري التنفيذ بالخلفية ({idx}/{total_accounts}):</b>\n"
-                f"👤 <b>{esc(label_acc)}</b>\n"
-                f"🔗 <b>الهدف:</b> <code>{esc(target_url[:48])}</code>"
-            )
+            wait_hitl_enabled = bool(st.get("wait_for_hitl", True))
 
-            shot_path = str(SHOTS_TEMP_DIR / f"mission_{user_id}_{acc['id']}_{int(time.time())}.png")
-            lock = get_profile_lock(acc["id"])
-            proxy_uri = _account_proxy_guard_uri(acc)
-            with lock, proxy_execution_guard(proxy_uri, min_gap_sec=1.5), _browser_semaphore:
-                with sync_playwright() as p:
+            for _attempt in range(2):
+                acc = get_account_by_id(acc["id"]) or acc
+                update_live_status(
+                    f"🚀 <b>جاري التنفيذ بالخلفية ({idx}/{total_accounts}):</b>\n"
+                    f"👤 <b>{esc(label_acc)}</b>"
+                    + (" <i>(بعد التحقق البشري)</i>" if _attempt > 0 else "")
+                    + f"\n🔗 <b>الهدف:</b> <code>{esc(target_url[:48])}</code>"
+                )
+
+                shot_path = str(SHOTS_TEMP_DIR / f"mission_{user_id}_{acc['id']}_{int(time.time())}.png")
+                lock = get_profile_lock(acc["id"])
+                proxy_uri = _account_proxy_guard_uri(acc)
+                resolved_proxy_uri = str(acc.get("proxy") or "").strip()
+                if not resolved_proxy_uri:
                     try:
-                        acc_proxy = str(acc.get("proxy") or "").strip()
-                        ctx = (
-                            launch_account_browser(p, acc["profile_dir"], visible=False, proxy=acc_proxy)
-                            if acc_proxy
-                            else launch_account_browser(p, acc["profile_dir"], visible=False)
-                        )
+                        resolved_proxy_uri = str(resolve_proxy_for_account(account_id=acc["id"]).get("raw_uri") or "")
+                    except Exception:
+                        resolved_proxy_uri = ""
+                hitl_pause_req: dict | None = None
+                pause_shot_saved = False
+
+                with lock, proxy_execution_guard(proxy_uri, min_gap_sec=1.5), _browser_semaphore:
+                    with sync_playwright() as p:
                         try:
-                            page = ctx.pages[0] if ctx.pages else ctx.new_page()
-                            acc_actions = 0
-                            logged = False
-                            challenge_hit_this_acc = False
+                            acc_proxy = str(acc.get("proxy") or "").strip()
+                            ctx = (
+                                launch_account_browser(p, acc["profile_dir"], visible=False, proxy=acc_proxy)
+                                if acc_proxy
+                                else launch_account_browser(p, acc["profile_dir"], visible=False)
+                            )
+                            try:
+                                page = ctx.pages[0] if ctx.pages else ctx.new_page()
+                                acc_actions = 0
+                                logged = False
+                                challenge_hit_this_acc = False
 
-                            def _record_issue(step_lbl: str, fallback_msg: str):
-                                diag = get_page_diag(page) or fallback_msg
-                                msg_line = f"• <b>{esc(label_acc)} ({step_lbl}):</b> {esc(diag)}"
-                                run_issues.append(msg_line)
-                                update_live_status(f"⚠️ {msg_line}")
+                                def _record_issue(step_lbl: str, fallback_msg: str):
+                                    diag = get_page_diag(page) or fallback_msg
+                                    msg_line = f"• <b>{esc(label_acc)} ({step_lbl}):</b> {esc(diag)}"
+                                    run_issues.append(msg_line)
+                                    update_live_status(f"⚠️ {msg_line}")
 
-                            def _record_success(step_lbl: str):
-                                msg_line = f"• <b>{esc(label_acc)}:</b> {step_lbl}"
-                                done_logs.append(msg_line)
-                                update_live_status(
-                                    f"⚙️ <b>تقدم الخلفية ({idx}/{total_accounts}):</b> {esc(label_acc)} — {step_lbl}"
+                                def _record_success(step_lbl: str):
+                                    msg_line = f"• <b>{esc(label_acc)}:</b> {step_lbl}"
+                                    done_logs.append(msg_line)
+                                    update_live_status(
+                                        f"⚙️ <b>تقدم الخلفية ({idx}/{total_accounts}):</b> {esc(label_acc)} — {step_lbl}"
+                                    )
+
+                                can_fix_acc = is_super_admin(user_id) or (
+                                    int(acc.get("owner_id") or 0) == int(user_id)
+                                    and (has_permission(user_id, "can_add_accounts") or has_permission(user_id, "can_use_accounts"))
                                 )
 
-                            can_fix_acc = is_super_admin(user_id) or (
-                                int(acc.get("owner_id") or 0) == int(user_id)
-                                and (has_permission(user_id, "can_add_accounts") or has_permission(user_id, "can_use_accounts"))
-                            )
-
-                            is_ck_acc = acc.get("password") == "[SESSION_COOKIES]"
-                            logged = auto_login_facebook(
-                                ctx,
-                                page,
-                                "" if is_ck_acc else acc.get("email", ""),
-                                "" if is_ck_acc else acc.get("password", ""),
-                                max_wait=35,
-                            )
-                            proceed_actions = True
-                            if not logged:
-                                login_err = get_login_error(ctx) or "الحساب غير مسجل دخوله أو الجلسة منتهية"
-                                try:
-                                    d_fail = diagnose_facebook_challenge(page)
-                                except Exception:
-                                    d_fail = {}
-                                if d_fail.get("is_challenge") or any(k in login_err.lower() for k in ("recaptcha", "arkose", "checkpoint", "2fa", "تحقق أمان", "تأكيد أنك إنسان")):
-                                    challenge_hit_this_acc = True
-                                run_issues.append(f"• <b>{esc(label_acc)} (الدخول):</b> {esc(login_err)}")
-                                update_live_status(f"⚠️ <b>{esc(label_acc)}:</b> {esc(login_err)}")
-                                try:
-                                    update_account(acc["id"], {
-                                        "status": "يتطلب تسجيل الدخول",
-                                        "diagnostic_reason": login_err
-                                    }, sync_git=False)
-                                except Exception:
-                                    pass
-                                shot_mk = _build_hitl_action_markup(acc["id"], can_otp=True, can_del=False) if can_fix_acc else None
-                                try:
-                                    page.screenshot(path=shot_path)
-                                    with open(shot_path, "rb") as shot_file:
-                                        bot.send_photo(
-                                            chat_id,
-                                            shot_file,
-                                            caption=f"⚠️ <b>لقطة سبب تعذر الدخول ({esc(label_acc)}):</b>\n{esc(login_err)}",
-                                            reply_markup=shot_mk,
-                                        )
-                                except Exception:
-                                    pass
-                                proceed_actions = False
-                            elif not navigate_to_target(page, target_url):
-                                try:
-                                    d_nav = diagnose_facebook_challenge(page)
-                                except Exception:
-                                    d_nav = {}
-                                nav_reason = d_nav.get("message") or get_page_diag(page) or "تعذر فتح الرابط المستهدف أو أنه مقيد/غير متاح"
-                                if d_nav.get("is_challenge"):
-                                    challenge_hit_this_acc = True
+                                is_ck_acc = acc.get("password") == "[SESSION_COOKIES]"
+                                logged = auto_login_facebook(
+                                    ctx,
+                                    page,
+                                    "" if is_ck_acc else acc.get("email", ""),
+                                    "" if is_ck_acc else acc.get("password", ""),
+                                    max_wait=35,
+                                )
+                                proceed_actions = True
+                                if not logged:
+                                    login_err = get_login_error(ctx) or "الحساب غير مسجل دخوله أو يتطلب تحققاً"
                                     try:
-                                        update_account(acc["id"], {"diagnostic_reason": nav_reason}, sync_git=False)
+                                        d_fail = diagnose_facebook_challenge(page)
+                                    except Exception:
+                                        d_fail = {}
+                                    if d_fail.get("is_challenge") or any(k in login_err.lower() for k in ("recaptcha", "arkose", "checkpoint", "2fa", "تحقق أمان", "تأكيد أنك إنسان")):
+                                        challenge_hit_this_acc = True
+                                    try:
+                                        update_account(acc["id"], {
+                                            "status": "يتطلب تسجيل الدخول",
+                                            "diagnostic_reason": login_err
+                                        }, sync_git=False)
                                     except Exception:
                                         pass
-                                _record_issue("فتح الرابط", nav_reason)
-                                nav_mk = _build_hitl_action_markup(acc["id"], can_otp=bool(d_nav.get("can_otp")), can_del=False) if (can_fix_acc and d_nav.get("can_hitl")) else None
-                                try:
-                                    page.screenshot(path=shot_path)
-                                    with open(shot_path, "rb") as shot_file:
-                                        bot.send_photo(
-                                            chat_id,
-                                            shot_file,
-                                            caption=f"❌ <b>لقطة تعذر فتح الرابط ({esc(label_acc)}):</b>\n{esc(nav_reason)}",
-                                            reply_markup=nav_mk,
+                                    try:
+                                        page.screenshot(path=shot_path)
+                                        pause_shot_saved = True
+                                    except Exception:
+                                        pause_shot_saved = False
+                                    if wait_hitl_enabled and can_fix_acc and _attempt == 0:
+                                        hitl_pause_req = {"reason": login_err, "can_otp": True}
+                                    else:
+                                        run_issues.append(f"• <b>{esc(label_acc)} (الدخول):</b> {esc(login_err)}")
+                                        update_live_status(f"⚠️ <b>{esc(label_acc)}:</b> {esc(login_err)}")
+                                        shot_mk = _build_hitl_action_markup(acc["id"], can_otp=True, can_del=False) if can_fix_acc else None
+                                        if pause_shot_saved:
+                                            try:
+                                                with open(shot_path, "rb") as shot_file:
+                                                    bot.send_photo(
+                                                        chat_id,
+                                                        shot_file,
+                                                        caption=f"⚠️ <b>لقطة سبب تعذر الدخول ({esc(label_acc)}):</b>\n{esc(login_err)}",
+                                                        reply_markup=shot_mk,
+                                                    )
+                                            except Exception:
+                                                pass
+                                    proceed_actions = False
+                                else:
+                                    if _attempt > 0:
+                                        try:
+                                            human_warmup_after_login(page)
+                                        except Exception:
+                                            pass
+                                    if not navigate_to_target(page, target_url):
+                                        try:
+                                            d_nav = diagnose_facebook_challenge(page)
+                                        except Exception:
+                                            d_nav = {}
+                                        nav_reason = d_nav.get("message") or get_page_diag(page) or "تعذر فتح الرابط المستهدف أو أنه مقيد/غير متاح"
+                                        if d_nav.get("is_challenge"):
+                                            challenge_hit_this_acc = True
+                                            try:
+                                                update_account(acc["id"], {"diagnostic_reason": nav_reason}, sync_git=False)
+                                            except Exception:
+                                                pass
+                                        try:
+                                            page.screenshot(path=shot_path)
+                                            pause_shot_saved = True
+                                        except Exception:
+                                            pause_shot_saved = False
+                                        if wait_hitl_enabled and can_fix_acc and _attempt == 0 and d_nav.get("can_hitl"):
+                                            hitl_pause_req = {"reason": nav_reason, "can_otp": bool(d_nav.get("can_otp"))}
+                                        else:
+                                            _record_issue("فتح الرابط", nav_reason)
+                                            nav_mk = _build_hitl_action_markup(acc["id"], can_otp=bool(d_nav.get("can_otp")), can_del=False) if (can_fix_acc and d_nav.get("can_hitl")) else None
+                                            if pause_shot_saved:
+                                                try:
+                                                    with open(shot_path, "rb") as shot_file:
+                                                        bot.send_photo(
+                                                            chat_id,
+                                                            shot_file,
+                                                            caption=f"❌ <b>لقطة تعذر فتح الرابط ({esc(label_acc)}):</b>\n{esc(nav_reason)}",
+                                                            reply_markup=nav_mk,
+                                                        )
+                                                except Exception:
+                                                    pass
+                                        proceed_actions = False
+
+                                # عمليات مستوى البروفايل (صداقة، متابعة، مراسلة، بلاغ حساب، حظر)
+                                if proceed_actions and has_permission(user_id, "can_friend_follow"):
+                                    if st["friend"]:
+                                        if send_friend_request(page):
+                                            actions_done += 1
+                                            acc_actions += 1
+                                            _record_success("إرسال طلب صداقة")
+                                        else:
+                                            _record_issue("طلب صداقة", "زر إضافة صديق غير متاح بالصفحة")
+                                    elif st["cancel_friend"]:
+                                        if cancel_friend_request(page):
+                                            actions_done += 1
+                                            acc_actions += 1
+                                            _record_success("إلغاء طلب الصداقة")
+                                        else:
+                                            _record_issue("إلغاء الصداقة", "لا يوجد طلب صداقة معلق أو علاقة لإلغائها")
+
+                                    if st["follow"]:
+                                        if follow_profile(page):
+                                            actions_done += 1
+                                            acc_actions += 1
+                                            _record_success("متابعة الحساب")
+                                        else:
+                                            _record_issue("متابعة", "زر المتابعة غير متوفر أو الحساب متابَع مسبقاً")
+                                    elif st["unfollow"]:
+                                        if unfollow_profile(page):
+                                            actions_done += 1
+                                            acc_actions += 1
+                                            _record_success("إلغاء المتابعة")
+                                        else:
+                                            _record_issue("إلغاء المتابعة", "لم يتم العثور على زر إلغاء المتابعة")
+
+                                if proceed_actions and has_permission(user_id, "can_message") and st["message"] and st["message_text"]:
+                                    if send_direct_message(page, st["message_text"], target_url=target_url):
+                                        actions_done += 1
+                                        acc_actions += 1
+                                        _record_success("إرسال رسالة خاصة")
+                                    else:
+                                        _record_issue("رسالة خاصة", "تعذر إرسال الرسالة بالماسنجر أو الحساب يمنع الرسائل")
+
+                                if proceed_actions and has_permission(user_id, "can_report") and st["report_profile"]:
+                                    update_live_status(f"🛡️ <b>جاري تنفيذ بلاغ الحساب بـ {esc(label_acc)}...</b>")
+                                    if report_profile(page, reason=st["rep_reason"], victim=st["rep_victim"]):
+                                        actions_done += 1
+                                        acc_actions += 1
+                                        _record_success("تأكيد استلام بلاغ الحساب")
+                                    else:
+                                        _record_issue("بلاغ حساب", "تعذر إتمام خطوات بلاغ الحساب")
+
+                                if proceed_actions and has_permission(user_id, "can_report") and st["block"]:
+                                    if block_profile(page):
+                                        actions_done += 1
+                                        acc_actions += 1
+                                        _record_success("حظر الحساب")
+                                    else:
+                                        _record_issue("حظر", "تعذر العثور على خيار حظر الحساب")
+
+                                # عمليات مستوى المنشور والتعليقات
+                                on_custom_url = False
+                                if proceed_actions and has_permission(user_id, "can_react") and st["like"]:
+                                    r_lim = st.get("react_acc_count", 0)
+                                    if r_lim == 0 or idx <= r_lim:
+                                        r_url = st.get("react_post_url", "").strip()
+                                        nav_ok = True
+                                        if r_url:
+                                            nav_ok = navigate_to_target(page, r_url)
+                                            on_custom_url = True
+                                        if nav_ok and react_to_posts(page, reaction=st["reaction_type"], post_index=1 if r_url else st["react_post_index"]):
+                                            actions_done += 1
+                                            acc_actions += 1
+                                            r_name = REACTION_ICONS.get(st["reaction_type"], st["reaction_type"])
+                                            _record_success(f"تفاعل ({esc(r_name)})")
+                                        else:
+                                            _record_issue("التفاعل", "لم يتم العثور على المنشور أو زر التفاعل")
+
+                                if proceed_actions and has_permission(user_id, "can_comment") and st["comment"] and st["comment_text"]:
+                                    c_lim = st.get("comment_acc_count", 0)
+                                    if c_lim == 0 or idx <= c_lim:
+                                        c_url = st.get("comment_post_url", "").strip()
+                                        if not c_url and on_custom_url:
+                                            navigate_to_target(page, target_url)
+                                            on_custom_url = False
+                                        c_cnt = comment_on_posts(
+                                            page,
+                                            comment_text=st["comment_text"],
+                                            post_index=1 if c_url else st["comment_post_index"],
+                                            post_url=c_url
                                         )
-                                except Exception:
-                                    pass
-                                proceed_actions = False
+                                        if c_url:
+                                            on_custom_url = True
+                                        if c_cnt > 0:
+                                            actions_done += c_cnt
+                                            acc_actions += c_cnt
+                                            _record_success("نشر تعليق")
+                                        else:
+                                            _record_issue("التعليق", "التعليقات مقيدة أو تعذر الوصول لصندوق التعليق")
 
-                            # عمليات مستوى البروفايل (صداقة، متابعة، مراسلة، بلاغ حساب، حظر)
-                            if proceed_actions and has_permission(user_id, "can_friend_follow"):
-                                if st["friend"]:
-                                    if send_friend_request(page):
-                                        actions_done += 1
-                                        acc_actions += 1
-                                        _record_success("إرسال طلب صداقة")
-                                    else:
-                                        _record_issue("طلب صداقة", "زر إضافة صديق غير متاح بالصفحة")
-                                elif st["cancel_friend"]:
-                                    if cancel_friend_request(page):
-                                        actions_done += 1
-                                        acc_actions += 1
-                                        _record_success("إلغاء طلب الصداقة")
-                                    else:
-                                        _record_issue("إلغاء الصداقة", "لا يوجد طلب صداقة معلق أو علاقة لإلغائها")
-
-                                if st["follow"]:
-                                    if follow_profile(page):
-                                        actions_done += 1
-                                        acc_actions += 1
-                                        _record_success("متابعة الحساب")
-                                    else:
-                                        _record_issue("متابعة", "زر المتابعة غير متوفر أو الحساب متابَع مسبقاً")
-                                elif st["unfollow"]:
-                                    if unfollow_profile(page):
-                                        actions_done += 1
-                                        acc_actions += 1
-                                        _record_success("إلغاء المتابعة")
-                                    else:
-                                        _record_issue("إلغاء المتابعة", "لم يتم العثور على زر إلغاء المتابعة")
-
-                            if proceed_actions and has_permission(user_id, "can_message") and st["message"] and st["message_text"]:
-                                if send_direct_message(page, st["message_text"], target_url=target_url):
-                                    actions_done += 1
-                                    acc_actions += 1
-                                    _record_success("إرسال رسالة خاصة")
-                                else:
-                                    _record_issue("رسالة خاصة", "تعذر إرسال الرسالة بالماسنجر أو الحساب يمنع الرسائل")
-
-                            if proceed_actions and has_permission(user_id, "can_report") and st["report_profile"]:
-                                update_live_status(f"🛡️ <b>جاري تنفيذ بلاغ الحساب بـ {esc(label_acc)}...</b>")
-                                if report_profile(page, reason=st["rep_reason"], victim=st["rep_victim"]):
-                                    actions_done += 1
-                                    acc_actions += 1
-                                    _record_success("تأكيد استلام بلاغ الحساب")
-                                else:
-                                    _record_issue("بلاغ حساب", "تعذر إتمام خطوات بلاغ الحساب")
-
-                            if proceed_actions and has_permission(user_id, "can_report") and st["block"]:
-                                if block_profile(page):
-                                    actions_done += 1
-                                    acc_actions += 1
-                                    _record_success("حظر الحساب")
-                                else:
-                                    _record_issue("حظر", "تعذر العثور على خيار حظر الحساب")
-
-                            # عمليات مستوى المنشور والتعليقات
-                            on_custom_url = False
-                            if proceed_actions and has_permission(user_id, "can_react") and st["like"]:
-                                r_lim = st.get("react_acc_count", 0)
-                                if r_lim == 0 or idx <= r_lim:
-                                    r_url = st.get("react_post_url", "").strip()
-                                    nav_ok = True
-                                    if r_url:
-                                        nav_ok = navigate_to_target(page, r_url)
-                                        on_custom_url = True
-                                    if nav_ok and react_to_posts(page, reaction=st["reaction_type"], post_index=1 if r_url else st["react_post_index"]):
-                                        actions_done += 1
-                                        acc_actions += 1
-                                        r_name = REACTION_ICONS.get(st["reaction_type"], st["reaction_type"])
-                                        _record_success(f"تفاعل ({esc(r_name)})")
-                                    else:
-                                        _record_issue("التفاعل", "لم يتم العثور على المنشور أو زر التفاعل")
-
-                            if proceed_actions and has_permission(user_id, "can_comment") and st["comment"] and st["comment_text"]:
-                                c_lim = st.get("comment_acc_count", 0)
-                                if c_lim == 0 or idx <= c_lim:
-                                    c_url = st.get("comment_post_url", "").strip()
-                                    if not c_url and on_custom_url:
+                                if proceed_actions and has_permission(user_id, "can_interact_comments") and st["interact_cmt"]:
+                                    if on_custom_url:
                                         navigate_to_target(page, target_url)
                                         on_custom_url = False
-                                    c_cnt = comment_on_posts(
-                                        page,
-                                        comment_text=st["comment_text"],
-                                        post_index=1 if c_url else st["comment_post_index"],
-                                        post_url=c_url
-                                    )
-                                    if c_url:
-                                        on_custom_url = True
-                                    if c_cnt > 0:
-                                        actions_done += c_cnt
-                                        acc_actions += c_cnt
-                                        _record_success("نشر تعليق")
+                                    if interact_with_specific_comment(
+                                        page, post_index=1,
+                                        target_mode=st["cmt_target_mode"],
+                                        target_value=st["cmt_target_val"],
+                                        reaction=st["cmt_reaction"],
+                                        reply_text=st["cmt_reply"]
+                                    ):
+                                        actions_done += 1
+                                        acc_actions += 1
+                                        _record_success("التفاعل/الرد على تعليق")
                                     else:
-                                        _record_issue("التعليق", "التعليقات مقيدة أو تعذر الوصول لصندوق التعليق")
+                                        _record_issue("رد على تعليق", "لم يتم العثور على التعليق المطابق")
 
-                            if proceed_actions and has_permission(user_id, "can_interact_comments") and st["interact_cmt"]:
-                                if on_custom_url:
-                                    navigate_to_target(page, target_url)
-                                    on_custom_url = False
-                                if interact_with_specific_comment(
-                                    page, post_index=1,
-                                    target_mode=st["cmt_target_mode"],
-                                    target_value=st["cmt_target_val"],
-                                    reaction=st["cmt_reaction"],
-                                    reply_text=st["cmt_reply"]
-                                ):
-                                    actions_done += 1
-                                    acc_actions += 1
-                                    _record_success("التفاعل/الرد على تعليق")
-                                else:
-                                    _record_issue("رد على تعليق", "لم يتم العثور على التعليق المطابق")
+                                if proceed_actions and has_permission(user_id, "can_report") and st["report_post"]:
+                                    if on_custom_url:
+                                        navigate_to_target(page, target_url)
+                                    update_live_status(f"🛡️ <b>جاري تنفيذ بلاغ المنشور بـ {esc(label_acc)}...</b>")
+                                    if report_post(page, reason=st["rep_reason"], victim=st["rep_victim"]):
+                                        actions_done += 1
+                                        acc_actions += 1
+                                        _record_success("بلاغ منشور")
+                                    else:
+                                        _record_issue("بلاغ منشور", "تعذر إتمام خطوات بلاغ المنشور")
 
-                            if proceed_actions and has_permission(user_id, "can_report") and st["report_post"]:
-                                if on_custom_url:
-                                    navigate_to_target(page, target_url)
-                                update_live_status(f"🛡️ <b>جاري تنفيذ بلاغ المنشور بـ {esc(label_acc)}...</b>")
-                                if report_post(page, reason=st["rep_reason"], victim=st["rep_victim"]):
-                                    actions_done += 1
-                                    acc_actions += 1
-                                    _record_success("بلاغ منشور")
-                                else:
-                                    _record_issue("بلاغ منشور", "تعذر إتمام خطوات بلاغ المنشور")
-
-                            # تقليل الإشعارات: إرفاق لقطة الشاشة فقط عند تعذر تنفيذ أي إجراء (0) لتشخيص السبب
-                            if proceed_actions and acc_actions == 0:
-                                try:
-                                    d_zero = diagnose_facebook_challenge(page)
-                                except Exception:
-                                    d_zero = {}
-                                if d_zero.get("is_challenge"):
-                                    challenge_hit_this_acc = True
+                                # عند 0 إجراءات مع وجود تحدي قابل للحل عبر الشاشة الحية، يتم تفعيل الانتظار التفاعلي
+                                if proceed_actions and acc_actions == 0:
                                     try:
-                                        update_account(acc["id"], {"diagnostic_reason": d_zero.get("message") or ""}, sync_git=False)
+                                        d_zero = diagnose_facebook_challenge(page)
                                     except Exception:
-                                        pass
-                                zero_mk = _build_hitl_action_markup(acc["id"], can_otp=bool(d_zero.get("can_otp")), can_del=False) if (can_fix_acc and d_zero.get("can_hitl")) else None
-                                zero_reason = d_zero.get("message") or get_page_diag(page) or ""
-                                zero_cap = f"📸 <b>لقطة تشخيصية (0 إجراءات بالحساب):</b> {esc(label_acc)}" + (f"\n{esc(zero_reason)}" if zero_reason else "")
+                                        d_zero = {}
+                                    if d_zero.get("is_challenge"):
+                                        challenge_hit_this_acc = True
+                                        try:
+                                            update_account(acc["id"], {"diagnostic_reason": d_zero.get("message") or ""}, sync_git=False)
+                                        except Exception:
+                                            pass
+                                    zero_reason = d_zero.get("message") or get_page_diag(page) or ""
+                                    try:
+                                        page.screenshot(path=shot_path)
+                                        pause_shot_saved = True
+                                    except Exception:
+                                        pause_shot_saved = False
+                                    if wait_hitl_enabled and can_fix_acc and _attempt == 0 and d_zero.get("can_hitl"):
+                                        hitl_pause_req = {
+                                            "reason": zero_reason or "يتطلب إكمال التحقق في الشاشة الحية",
+                                            "can_otp": bool(d_zero.get("can_otp")),
+                                        }
+                                    else:
+                                        zero_mk = _build_hitl_action_markup(acc["id"], can_otp=bool(d_zero.get("can_otp")), can_del=False) if (can_fix_acc and d_zero.get("can_hitl")) else None
+                                        zero_cap = f"📸 <b>لقطة تشخيصية (0 إجراءات بالحساب):</b> {esc(label_acc)}" + (f"\n{esc(zero_reason)}" if zero_reason else "")
+                                        if pause_shot_saved:
+                                            try:
+                                                with open(shot_path, "rb") as shot_file:
+                                                    bot.send_photo(
+                                                        chat_id,
+                                                        shot_file,
+                                                        caption=zero_cap,
+                                                        reply_markup=zero_mk,
+                                                    )
+                                            except Exception:
+                                                pass
+
+                                if proceed_actions:
+                                    human_delay(1.5, 2.5)
+                            finally:
+                                page_ok = True
                                 try:
-                                    page.screenshot(path=shot_path)
-                                    with open(shot_path, "rb") as shot_file:
-                                        bot.send_photo(
-                                            chat_id,
-                                            shot_file,
-                                            caption=zero_cap,
-                                            reply_markup=zero_mk,
+                                    if proceed_actions and acc_actions == 0:
+                                        try:
+                                            page_ok = bool(diagnose_facebook_challenge(page).get("is_ok", True))
+                                        except Exception:
+                                            page_ok = True
+                                    if acc_actions > 0 or (logged and page_ok):
+                                        save_account_storage_state(ctx, acc["profile_dir"])
+                                except Exception:
+                                    pass
+                                try:
+                                    if resolved_proxy_uri and not hitl_pause_req:
+                                        record_proxy_use(
+                                            resolved_proxy_uri,
+                                            success=bool(acc_actions > 0 or (logged and page_ok)),
+                                            error="" if (acc_actions > 0 or logged) else (get_page_diag(page) or "فشل الجلسة"),
                                         )
                                 except Exception:
                                     pass
-
-                            if proceed_actions:
-                                human_delay(1.5, 2.5)
+                                try:
+                                    ctx.close()
+                                except Exception:
+                                    pass
+                                if hitl_pause_req:
+                                    pass
+                                elif acc_actions > 0:
+                                    consecutive_challenges = 0
+                                elif challenge_hit_this_acc:
+                                    consecutive_challenges += 1
+                                else:
+                                    consecutive_challenges = 0
+                        except Exception as err:
+                            try:
+                                if resolved_proxy_uri:
+                                    record_proxy_use(resolved_proxy_uri, success=False, error=str(err))
+                                    detect_and_report_proxy_error(resolved_proxy_uri, err, account_id=acc["id"])
+                            except Exception:
+                                pass
+                            err_txt = f"• <b>{esc(label_acc)} (خطأ متصفح):</b> <code>{esc(err)}</code>"
+                            run_issues.append(err_txt)
+                            update_live_status(f"❌ <b>خطأ بالحساب {esc(label_acc)}:</b> <code>{esc(err)}</code>")
                         finally:
-                            try:
-                                page_ok = True
-                                if proceed_actions and acc_actions == 0:
-                                    try:
-                                        page_ok = bool(diagnose_facebook_challenge(page).get("is_ok", True))
-                                    except Exception:
-                                        page_ok = True
-                                if acc_actions > 0 or (logged and page_ok):
-                                    save_account_storage_state(ctx, acc["profile_dir"])
-                            except Exception:
-                                pass
-                            try:
-                                ctx.close()
-                            except Exception:
-                                pass
-                            if acc_actions > 0:
-                                consecutive_challenges = 0
-                            elif challenge_hit_this_acc:
-                                consecutive_challenges += 1
-                            else:
-                                consecutive_challenges = 0
-                    except Exception as err:
-                        err_txt = f"• <b>{esc(label_acc)} (خطأ متصفح):</b> <code>{esc(err)}</code>"
-                        run_issues.append(err_txt)
-                        update_live_status(f"❌ <b>خطأ بالحساب {esc(label_acc)}:</b> <code>{esc(err)}</code>")
-                    finally:
-                        if os.path.exists(shot_path):
-                            try:
-                                os.remove(shot_path)
-                            except Exception:
-                                pass
+                            if (not hitl_pause_req) and os.path.exists(shot_path):
+                                try:
+                                    os.remove(shot_path)
+                                except Exception:
+                                    pass
+
+                # خارج أقفال البروفايل والمتصفح تماماً لتجنب التعارض: انتظار التحقق البشري ثم المتابعة التلقائية
+                if not hitl_pause_req:
+                    break
+
+                wait_reason = str(hitl_pause_req.get("reason") or "يتطلب تحققاً بشرياً من فيسبوك")
+                register_mission_hitl_waiter(acc["id"], user_id, wait_reason)
+                st["waiting_hitl_acc_id"] = acc["id"]
+                st["waiting_hitl_reason"] = wait_reason
+                publish_event("mission", user_id, "hitl_waiting")
+                pause_mk = _build_mission_pause_markup(acc["id"], can_otp=bool(hitl_pause_req.get("can_otp", True)))
+                pause_txt = (
+                    f"⏸️ <b>إيقاف مؤقت للحساب ({esc(label_acc)}) بانتظار التحقق البشري:</b>\n"
+                    f"⚠️ <b>السبب:</b> {esc(wait_reason)}\n"
+                    "🖥️ افتح <b>الشاشة الحية</b> أدناه لحل التحقق وحفظ الجلسة، وسيُكمل البوت التنفيذ تلقائياً فور الانتهاء!"
+                )
+                update_live_status(
+                    f"⏸️ <b>بانتظار التحقق اليدوي للحساب {esc(label_acc)} ({idx}/{total_accounts})...</b>\n{esc(wait_reason)}"
+                )
+                try:
+                    if pause_shot_saved and os.path.exists(shot_path):
+                        with open(shot_path, "rb") as sf:
+                            bot.send_photo(chat_id, sf, caption=pause_txt, reply_markup=pause_mk)
+                    else:
+                        safe_send(chat_id, pause_txt, reply_markup=pause_mk)
+                except Exception:
+                    safe_send(chat_id, pause_txt, reply_markup=pause_mk)
+                finally:
+                    if os.path.exists(shot_path):
+                        try:
+                            os.remove(shot_path)
+                        except Exception:
+                            pass
+
+                try:
+                    hitl_wait_sec = max(1.0, float(os.environ.get("FB_HITL_WAIT_TIMEOUT", "300") or "300"))
+                except Exception:
+                    hitl_wait_sec = 300.0
+                wait_res = wait_for_mission_hitl(acc["id"], timeout=hitl_wait_sec)
+                st["waiting_hitl_acc_id"] = ""
+                st["waiting_hitl_reason"] = ""
+                publish_event("mission", user_id, "hitl_resumed")
+                dec = wait_res.get("decision", "timeout")
+                if dec == "verified":
+                    try:
+                        update_account(acc["id"], {"status": "نشط (تم التحقق)", "diagnostic_reason": ""}, sync_git=False)
+                    except Exception:
+                        pass
+                    update_live_status(f"✅ <b>تم التحقق لـ {esc(label_acc)}! جاري استئناف التنفيذ الآن بالجلسة المحفوظة...</b>")
+                    continue
+                elif dec == "abort":
+                    mission_aborted = True
+                    run_issues.append(f"• <b>{esc(label_acc)} ({esc(wait_reason)}):</b> تم إيقاف المهمة يدوياً أثناء انتظار التحقق")
+                    break
+                else:
+                    msg_skip = "تخطي الحساب يدوياً" if dec == "skip" else "انتهت مهلة انتظار التحقق (5 دقائق)"
+                    run_issues.append(f"• <b>{esc(label_acc)} ({esc(wait_reason)}):</b> {msg_skip}")
+                    consecutive_challenges += 1
+                    break
 
             if consecutive_challenges >= max_consec_challenges and idx < total_accounts:
                 circuit_tripped = True
@@ -6176,6 +7076,8 @@ def execute_mission_worker(chat_id: int, user_id: int):
         update_live_status(f"❌ حدث خطأ أثناء التنفيذ: <code>{esc(e)}</code>", reply_markup=_back_home_markup())
     finally:
         st["is_running"] = False
+        st["waiting_hitl_acc_id"] = ""
+        st["waiting_hitl_reason"] = ""
         publish_event("mission", user_id, "done")
 
 
@@ -6235,9 +7137,10 @@ def _build_webapp_hooks() -> dict:
 
 
 def _maintenance_sync_worker() -> None:
-    """مراقبة خلفية لجدولة قناة النسخ الاحتياطي والإعلانات العائمة المتكررة والمنتهية وحذف الحسابات التالفة"""
+    """مراقبة خلفية لجدولة قناة النسخ الاحتياطي والإعلانات العائمة ومراقب البروكسيات الآلي وحذف الحسابات التالفة"""
     last_purge = time.time()
     last_ann_check = 0.0
+    last_proxy_tick = 0.0
     while True:
         time.sleep(2)
         try:
@@ -6256,6 +7159,12 @@ def _maintenance_sync_worker() -> None:
                 for rep_ann in get_announcements_due_for_repeat(now_ts=now_t):
                     _broadcast_announcement_to_users(rep_ann, is_repeat=True)
                     mark_announcement_repushed(rep_ann["id"])
+            except Exception:
+                pass
+        if now_t - last_proxy_tick >= 20:
+            last_proxy_tick = now_t
+            try:
+                threading.Thread(target=run_scheduled_proxy_watchdog, daemon=True).start()
             except Exception:
                 pass
         if now_t - last_purge >= 1800:
@@ -6338,6 +7247,7 @@ def run_telegram_bot():
 
     if not _live_sync_started:
         register_hitl_verified_callback(_on_hitl_account_verified)
+        register_proxy_alert_callback(_on_proxy_alert_event)
         register_listener(_on_state_event)
         threading.Thread(target=_live_inline_sync_worker, daemon=True).start()
         threading.Thread(target=_maintenance_sync_worker, daemon=True).start()

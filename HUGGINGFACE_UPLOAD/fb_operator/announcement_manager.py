@@ -37,6 +37,35 @@ STYLE_OPTIONS = {
     "full_spotlight": "✨ نافذة عرض موسّعة للميزة",
 }
 
+DELIVERY_MODES = {
+    "animated_card": "🎞️ بطاقة GIF متحركة + أزرار ملونة",
+    "photo_card": "🖼️ بطاقة HD صورية + أزرار ملونة",
+    "smart_text": "💬 بطاقة <blockquote> ذكية + أزرار ملونة",
+}
+
+REPEAT_BEHAVIORS = {
+    "replace": "♻️ استبدال نظيف (تحذف السابقة بلا تكدس)",
+    "edit_live": "⚡ تحديث حي في نفس الرسالة (بدون أي تكرار)",
+    "new_msg": "📨 إرسال تنبيه جديد كل مرة",
+}
+
+EFFECT_PRESETS = {
+    "none": ("بدون تأثير حركي", ""),
+    "fire": ("🔥 لهب وحماس", "5104841245755180586"),
+    "heart": ("❤️ احتفال وقلوب", "5044134455711629726"),
+    "thumb": ("👍 إعجاب متطاير", "5107584321108051014"),
+}
+
+DEFAULT_THEME_EMOJIS = {
+    "rocket": "",
+    "spark": "",
+    "check": "",
+    "shield": "",
+    "fb": "",
+    "proxy": "",
+    "alert": "",
+}
+
 DURATION_PRESETS = (
     (900, "15 دقيقة"),
     (3600, "ساعة واحدة"),
@@ -103,6 +132,19 @@ def format_duration_ar(sec: int) -> str:
     return f"{d} يوم" + (f" و{h} س" if h else "")
 
 
+def _normalize_theme(raw: Any) -> dict[str, Any]:
+    src = raw if isinstance(raw, dict) else {}
+    emojis_raw = src.get("emojis") if isinstance(src.get("emojis"), dict) else {}
+    emojis: dict[str, str] = {}
+    for k in DEFAULT_THEME_EMOJIS:
+        val = str(emojis_raw.get(k) or "").strip()
+        emojis[k] = val if (val.isdigit() and 15 <= len(val) <= 24) else ""
+    return {
+        "custom_emojis_enabled": bool(src.get("custom_emojis_enabled", True)),
+        "emojis": emojis,
+    }
+
+
 def _normalize_ann(raw: dict[str, Any]) -> dict[str, Any]:
     exp_ts = float(raw.get("expires_at_ts") or 0.0)
     dur = max(0, int(raw.get("duration_sec") or 0))
@@ -110,6 +152,15 @@ def _normalize_ann(raw: dict[str, Any]) -> dict[str, Any]:
     style = str(raw.get("display_style") or "floating_card").strip()
     if style not in STYLE_OPTIONS:
         style = "floating_card"
+    delivery_mode = str(raw.get("delivery_mode") or "animated_card").strip()
+    if delivery_mode not in DELIVERY_MODES:
+        delivery_mode = "animated_card"
+    repeat_behavior = str(raw.get("repeat_behavior") or "replace").strip()
+    if repeat_behavior not in REPEAT_BEHAVIORS:
+        repeat_behavior = "replace"
+    effect_preset = str(raw.get("effect_preset") or "none").strip()
+    if effect_preset not in EFFECT_PRESETS:
+        effect_preset = "none"
     badge = str(raw.get("badge") or "ميزة جديدة").strip()[:32]
     sent_raw = raw.get("sent_chats") if isinstance(raw.get("sent_chats"), dict) else {}
     sent_clean: dict[str, int] = {}
@@ -124,9 +175,12 @@ def _normalize_ann(raw: dict[str, Any]) -> dict[str, Any]:
         "body": str(raw.get("body") or "").strip()[:1800],
         "badge": badge,
         "display_style": style,
+        "delivery_mode": delivery_mode,
+        "repeat_behavior": repeat_behavior,
+        "effect_preset": effect_preset,
         "cta_label": str(raw.get("cta_label") or "استعراض الميزة الآن").strip()[:48],
         "cta_tab": str(raw.get("cta_tab") or "").strip()[:24],
-        "pin_in_chat": bool(raw.get("pin_in_chat", True)),
+        "pin_in_chat": bool(raw.get("pin_in_chat", False)),
         "repeat_on_open": bool(raw.get("repeat_on_open", True)),
         "repeat_interval_sec": rep,
         "duration_sec": dur,
@@ -138,6 +192,7 @@ def _normalize_ann(raw: dict[str, Any]) -> dict[str, Any]:
         "last_repushed_ts": float(raw.get("last_repushed_ts") or 0.0),
         "push_count": max(0, int(raw.get("push_count") or 0)),
         "sent_chats": sent_clean,
+        "media_chat_ids": [str(x) for x in (raw.get("media_chat_ids") or []) if str(x).isdigit()][:100],
     }
 
 
@@ -145,28 +200,54 @@ def load_announcements_state() -> dict[str, Any]:
     with _ann_lock:
         path = _announcements_path()
         if not path.exists():
-            return {"announcements": []}
+            return {"announcements": [], "theme": _normalize_theme({})}
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
-            return {"announcements": []}
+            return {"announcements": [], "theme": _normalize_theme({})}
         if not isinstance(data, dict):
-            return {"announcements": []}
+            return {"announcements": [], "theme": _normalize_theme({})}
         items = [
             _normalize_ann(x)
             for x in (data.get("announcements") or [])
             if isinstance(x, dict) and str(x.get("title") or x.get("body") or "").strip()
         ]
-        return {"announcements": items[-100:]}
+        return {"announcements": items[-100:], "theme": _normalize_theme(data.get("theme"))}
 
 
 def save_announcements_state(state: dict[str, Any], notify: bool = True, reason: str = "announcements_update") -> None:
     with _ann_lock:
         items = [_normalize_ann(x) for x in (state.get("announcements") or []) if isinstance(x, dict)]
-        payload = {"announcements": items[-100:]}
+        payload = {
+            "announcements": items[-100:],
+            "theme": _normalize_theme(state.get("theme")),
+        }
         _atomic_write_json(_announcements_path(), payload)
     if notify:
         _notify_persistence_and_clients(reason)
+
+
+def get_theme_config() -> dict[str, Any]:
+    with _ann_lock:
+        return dict(load_announcements_state().get("theme") or _normalize_theme({}))
+
+
+def update_theme_config(updates: dict[str, Any]) -> dict[str, Any]:
+    with _ann_lock:
+        st = load_announcements_state()
+        cur = _normalize_theme(st.get("theme"))
+        if "custom_emojis_enabled" in updates:
+            cur["custom_emojis_enabled"] = bool(updates["custom_emojis_enabled"])
+        if isinstance(updates.get("emojis"), dict):
+            merged_em = dict(cur["emojis"])
+            for k, v in updates["emojis"].items():
+                if k in DEFAULT_THEME_EMOJIS:
+                    s = str(v or "").strip()
+                    merged_em[k] = s if (s.isdigit() and 15 <= len(s) <= 24) else ""
+            cur["emojis"] = merged_em
+        st["theme"] = _normalize_theme(cur)
+        save_announcements_state(st, notify=True, reason="theme_updated")
+        return dict(st["theme"])
 
 
 def create_announcement(
@@ -175,12 +256,15 @@ def create_announcement(
     created_by: int,
     badge: str = "ميزة جديدة",
     display_style: str = "floating_card",
+    delivery_mode: str = "animated_card",
+    repeat_behavior: str = "replace",
+    effect_preset: str = "none",
     cta_label: str = "استعراض الميزة الآن",
     cta_tab: str = "",
     duration_sec: int = 86400,
     repeat_interval_sec: int = 3600,
     repeat_on_open: bool = True,
-    pin_in_chat: bool = True,
+    pin_in_chat: bool = False,
 ) -> dict[str, Any]:
     now = time.time()
     dur = max(0, int(duration_sec or 0))
@@ -192,6 +276,9 @@ def create_announcement(
         "body": body,
         "badge": badge or "ميزة جديدة",
         "display_style": display_style,
+        "delivery_mode": delivery_mode,
+        "repeat_behavior": repeat_behavior,
+        "effect_preset": effect_preset,
         "cta_label": cta_label or "استعراض الميزة الآن",
         "cta_tab": cta_tab,
         "pin_in_chat": bool(pin_in_chat),
@@ -206,6 +293,7 @@ def create_announcement(
         "last_repushed_ts": now,
         "push_count": 1,
         "sent_chats": {},
+        "media_chat_ids": [],
     })
     with _ann_lock:
         st = load_announcements_state()
@@ -333,7 +421,40 @@ def delete_announcement(ann_id: str) -> dict[str, Any] | None:
     return removed
 
 
-def record_announcement_sent_chats(ann_id: str, sent_map: dict[int, int]) -> None:
+def update_announcement_delivery(
+    ann_id: str,
+    delivery_mode: str | None = None,
+    repeat_behavior: str | None = None,
+    pin_in_chat: bool | None = None,
+    effect_preset: str | None = None,
+) -> dict[str, Any] | None:
+    target = str(ann_id or "").strip()
+    now = time.time()
+    updated = None
+    with _ann_lock:
+        st = load_announcements_state()
+        for a in st["announcements"]:
+            if a["id"] == target:
+                if delivery_mode in DELIVERY_MODES:
+                    a["delivery_mode"] = delivery_mode
+                if repeat_behavior in REPEAT_BEHAVIORS:
+                    a["repeat_behavior"] = repeat_behavior
+                if pin_in_chat is not None:
+                    a["pin_in_chat"] = bool(pin_in_chat)
+                if effect_preset in EFFECT_PRESETS:
+                    a["effect_preset"] = effect_preset
+                updated = _enrich_ann(a, now)
+                break
+        if updated:
+            save_announcements_state(st, notify=True, reason="announcement_delivery_updated")
+    return updated
+
+
+def record_announcement_sent_chats(
+    ann_id: str,
+    sent_map: dict[int, int],
+    media_cids: set[int] | list[int] | None = None,
+) -> None:
     if not sent_map:
         return
     target = str(ann_id or "").strip()
@@ -346,6 +467,11 @@ def record_announcement_sent_chats(ann_id: str, sent_map: dict[int, int]) -> Non
                 for cid, mid in sent_map.items():
                     chats[str(int(cid))] = int(mid)
                 a["sent_chats"] = chats
+                if media_cids is not None:
+                    existing_m = set(str(x) for x in (a.get("media_chat_ids") or []))
+                    for mc in media_cids:
+                        existing_m.add(str(int(mc)))
+                    a["media_chat_ids"] = sorted(existing_m)[-100:]
                 changed = True
                 break
         if changed:
@@ -395,21 +521,42 @@ def get_announcements_due_for_repeat(now_ts: float | None = None) -> list[dict[s
     return due
 
 
-def format_announcement_telegram_html(ann: dict[str, Any], esc_fn=None, is_repeat: bool = False) -> str:
+def _tg_ico(fallback: str, emoji_id: str = "", use_custom: bool = False) -> str:
+    if use_custom and emoji_id and str(emoji_id).isdigit():
+        return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
+    return fallback
+
+
+def format_announcement_telegram_html(
+    ann: dict[str, Any],
+    esc_fn=None,
+    is_repeat: bool = False,
+    use_custom_emojis: bool = True,
+) -> str:
     if esc_fn is None:
         import html as _html
         esc_fn = lambda v: _html.escape(str(v or ""), quote=True)
+    theme = get_theme_config()
+    em = theme.get("emojis") or {}
+    allow_ce = bool(use_custom_emojis and theme.get("custom_emojis_enabled", True))
+
     badge = esc_fn(ann.get("badge") or "ميزة جديدة")
     title = esc_fn(ann.get("title") or "تحديث جديد")
     body = esc_fn(ann.get("body") or "")
     rem_lbl = esc_fn(ann.get("remaining_label") or "")
-    rep_tag = "🔁 <b>تذكير متجدد</b> | " if is_repeat else ""
-    pin_tag = "📌 <b>معلّق وعائم أعلى الدردشة</b>" if ann.get("pin_in_chat") else "✨ <b>إعلان تفاعلي</b>"
-    return (
-        f"🚀 <b>[{badge}] {title}</b>\n"
-        f"{rep_tag}{pin_tag}\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"{body}\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"⏳ <b>الصلاحية:</b> {rem_lbl} | 🔄 <b>التكرار:</b> {esc_fn(ann.get('repeat_label') or 'مرة واحدة')}"
-    )
+    rep_lbl = esc_fn(ann.get("repeat_label") or "مرة واحدة")
+
+    ico_top = _tg_ico("⚡", em.get("rocket", ""), allow_ce)
+    ico_time = _tg_ico("⏱", em.get("spark", ""), allow_ce)
+    rep_prefix = "🔁 " if is_repeat else ""
+
+    lines = [
+        f"{rep_prefix}{ico_top} <b>{badge}</b> · <b>{title}</b>",
+    ]
+    if body:
+        if len(body) > 260:
+            lines.append(f"<blockquote expandable>{body}</blockquote>")
+        else:
+            lines.append(f"<blockquote>{body}</blockquote>")
+    lines.append(f"{ico_time} <b>{rem_lbl}</b>  ·  🔄 <code>{rep_lbl}</code>")
+    return "\n".join(lines)

@@ -49,6 +49,75 @@ ALLOWED_KEYS = frozenset({
 _hitl_lock = threading.RLock()
 _sessions: dict[str, "HITLSession"] = {}
 _on_verified_callback: Callable[[str, str, int], None] | None = None
+_mission_waiters_lock = threading.Lock()
+_mission_waiters: dict[str, dict[str, Any]] = {}
+
+
+def register_mission_hitl_waiter(acc_id: str, owner_uid: int, reason: str = "") -> threading.Event:
+    ev = threading.Event()
+    with _mission_waiters_lock:
+        _mission_waiters[str(acc_id)] = {
+            "acc_id": str(acc_id),
+            "owner_uid": int(owner_uid or 0),
+            "reason": str(reason or "يتطلب تحقيقاً بشرياً من فيسبوك")[:160],
+            "event": ev,
+            "decision": "",
+            "fb_id": "",
+            "created_at": time.time(),
+        }
+    return ev
+
+
+def signal_mission_hitl_decision(acc_id: str, decision: str, fb_id: str = "") -> bool:
+    clean_dec = str(decision or "").strip().lower()
+    if clean_dec not in ("verified", "skip", "abort"):
+        return False
+    with _mission_waiters_lock:
+        w = _mission_waiters.get(str(acc_id))
+        if not w:
+            return False
+        w["decision"] = clean_dec
+        if fb_id:
+            w["fb_id"] = str(fb_id)
+        ev = w.get("event")
+        if ev:
+            ev.set()
+        return True
+
+
+def wait_for_mission_hitl(acc_id: str, timeout: float = 300.0) -> dict[str, Any]:
+    with _mission_waiters_lock:
+        w = _mission_waiters.get(str(acc_id))
+        if not w:
+            return {"decision": "skip", "fb_id": ""}
+        ev = w["event"]
+    signaled = ev.wait(timeout=max(1.0, float(timeout or 300.0)))
+    with _mission_waiters_lock:
+        w_after = _mission_waiters.pop(str(acc_id), {})
+    if not signaled:
+        return {"decision": "timeout", "fb_id": str(w_after.get("fb_id") or "")}
+    return {
+        "decision": str(w_after.get("decision") or "skip"),
+        "fb_id": str(w_after.get("fb_id") or ""),
+    }
+
+
+def get_mission_hitl_waiter(owner_uid: int | None = None, acc_id: str | None = None) -> dict[str, Any] | None:
+    with _mission_waiters_lock:
+        if acc_id and str(acc_id) in _mission_waiters:
+            w = _mission_waiters[str(acc_id)]
+            return {k: v for k, v in w.items() if k != "event"}
+        for w in _mission_waiters.values():
+            if owner_uid is None or int(w.get("owner_uid") or 0) == int(owner_uid):
+                return {k: v for k, v in w.items() if k != "event"}
+    return None
+
+
+def clear_mission_hitl_waiter(acc_id: str) -> None:
+    with _mission_waiters_lock:
+        w = _mission_waiters.pop(str(acc_id), None)
+        if w and w.get("event"):
+            w["event"].set()
 
 
 def register_hitl_verified_callback(cb: Callable[[str, str, int], None]) -> None:
@@ -332,9 +401,13 @@ def _hitl_worker(session: HITLSession, acc: dict) -> None:
         with session.state_lock:
             session.running = False
             session.ready = True
+            completed_flag = bool(session.completed)
+            verified_fb_id = str(session.fb_id or "")
         with _hitl_lock:
             if _sessions.get(acc_id) is session:
                 _sessions.pop(acc_id, None)
+        if completed_flag:
+            signal_mission_hitl_decision(acc_id, "verified", verified_fb_id)
 
 
 def _prune_inactive_locked() -> None:

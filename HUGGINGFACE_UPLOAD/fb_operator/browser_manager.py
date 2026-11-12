@@ -587,7 +587,12 @@ def launch_account_browser(
             channel="chrome", **launch_kwargs
         )
     except Exception:
-        context = playwright_instance.chromium.launch_persistent_context(**launch_kwargs)
+        try:
+            context = playwright_instance.chromium.launch_persistent_context(**launch_kwargs)
+        except Exception as exc:
+            if proxy_srv:
+                detect_and_report_proxy_error(proxy_srv, exc)
+            raise
 
     stealth_template = """
     (() => {
@@ -707,8 +712,57 @@ def launch_account_browser(
     )
     context.add_init_script(stealth_script)
     _CTX_PROFILES[id(context)] = profile_path
+    if proxy_srv:
+        _CTX_PROXIES[id(context)] = proxy_srv
     restore_account_storage_state(context, profile_path)
     return context
+
+
+_CTX_PROXIES: dict[int, str] = {}
+_PROXY_ERR_TOKENS = (
+    "ERR_PROXY_CONNECTION_FAILED",
+    "ERR_TUNNEL_CONNECTION_FAILED",
+    "ERR_SOCKS_CONNECTION_FAILED",
+    "ERR_NO_SUPPORTED_PROXIES",
+    "ERR_PROXY_AUTH_REQUESTED",
+    "ERR_PROXY_CERTIFICATE_INVALID",
+    "ERR_PROXY_",
+)
+
+
+def get_context_proxy_uri(context) -> str:
+    if not context:
+        return ""
+    return str(_CTX_PROXIES.get(id(context), "") or "").strip()
+
+
+def detect_and_report_proxy_error(context_or_proxy, err_or_text: object, account_id: str = "") -> bool:
+    txt = str(err_or_text or "")
+    up = txt.upper()
+    is_proxy_err = any(tok in up for tok in _PROXY_ERR_TOKENS) or (
+        "PROXY" in up and any(w in up for w in ("FAIL", "TIMEOUT", "REFUSED", "RESET", "TIMED OUT"))
+    )
+    if not is_proxy_err:
+        return False
+    proxy_uri = ""
+    if isinstance(context_or_proxy, str):
+        proxy_uri = context_or_proxy.strip()
+    elif context_or_proxy is not None:
+        proxy_uri = get_context_proxy_uri(context_or_proxy)
+    if not proxy_uri and account_id:
+        try:
+            from fb_operator import proxy_manager
+            proxy_uri = str(proxy_manager.resolve_proxy_for_account(account_id=account_id).get("raw_uri") or "")
+        except Exception:
+            proxy_uri = ""
+    if not proxy_uri:
+        return False
+    try:
+        from fb_operator import proxy_manager
+        proxy_manager.report_proxy_network_error(proxy_uri, txt[:160])
+        return True
+    except Exception:
+        return False
 
 
 def _bezier_curve_points(x0: float, y0: float, x1: float, y1: float, steps: int = 16) -> list[tuple[float, float]]:

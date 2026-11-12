@@ -24,6 +24,7 @@ import fb_operator.admin_manager as adm
 import fb_operator.announcement_manager as ann
 import fb_operator.economy_manager as eco
 import fb_operator.hitl_manager as hitl
+import fb_operator.proxy_manager as prx
 
 _url_lock = threading.Lock()
 _public_webapp_url: str | None = None
@@ -471,7 +472,7 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                     {
                         "id": a["id"],
                         "name": a.get("name", a["id"]),
-                        "is_active": "نشط" in str(a.get("status", ""))
+                        "is_active": "نشط" in str(a.get("status", "")),
                     }
                     for a in usable_raw
                 ]
@@ -487,11 +488,17 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                             "is_active": "نشط" in str(a.get("status", "")),
                             "owner_label": owner_lbl,
                             "diagnostic_reason": a.get("diagnostic_reason", ""),
+                            "bound_proxy": str(a.get("bound_proxy") or ""),
+                            "bound_proxy_country": str(a.get("bound_proxy_country") or ""),
                         })
 
                 st = hooks["get_user_state"](uid)
                 mission_state = {
                     "selected_acc": st.get("selected_acc", "all"),
+                    "selected_accs": list(st.get("selected_accs") or []),
+                    "wait_for_hitl": bool(st.get("wait_for_hitl", True)),
+                    "waiting_hitl_acc_id": str(st.get("waiting_hitl_acc_id") or ""),
+                    "waiting_hitl_reason": str(st.get("waiting_hitl_reason") or ""),
                     "target_url": st.get("target_url", ""),
                     "acc_count_limit": st.get("acc_count_limit", 0),
                     "like": bool(st.get("like", False)),
@@ -528,6 +535,7 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                 usable_total = len(usable_safe)
                 manageable_total = len(manageable_safe)
                 active_anns = ann.list_announcements(only_active=True)
+                cap_prox = bool(caps.get("proxies") or is_dev)
                 self._send_json(200, {
                     "authorized": True,
                     "status": "approved",
@@ -547,6 +555,7 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                     "manageable_accounts": manageable_safe[:250] if manageable_total > 250 else manageable_safe,
                     "manageable_total": manageable_total,
                     "mission_state": mission_state,
+                    "proxy_report": prx.get_proxy_detailed_report() if cap_prox else None,
                     "wallet": eco.get_user_wallet(uid),
                     "settlement_snapshot": eco.build_user_settlement_snapshot(uid),
                     "economy_settings": eco_cfg,
@@ -565,10 +574,26 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                     "ann_meta": {
                         "badges": list(ann.BADGE_OPTIONS),
                         "styles": ann.STYLE_OPTIONS,
+                        "delivery_modes": ann.DELIVERY_MODES,
+                        "repeat_behaviors": ann.REPEAT_BEHAVIORS,
+                        "effect_presets": {k: v[0] for k, v in ann.EFFECT_PRESETS.items()},
                         "durations": ann.DURATION_PRESETS,
                         "repeats": ann.REPEAT_PRESETS,
                     },
                 })
+                return
+
+            if path == "/api/proxies/status":
+                auth = self._authenticate(touch_login=False)
+                if not auth:
+                    return
+                uid, tg_user, user_rec = auth
+                if not self._require_approved(uid, tg_user, user_rec):
+                    return
+                if not self._has_cap(uid, "proxies"):
+                    self._deny_perm(uid, tg_user, "محاولة قراءة حالة البروكسيات بدون صلاحية proxies")
+                    return
+                self._send_json(200, {"ok": True, **prx.get_proxy_detailed_report()})
                 return
 
             if path == "/api/announcements/list":
@@ -908,10 +933,26 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                     self._send_json(400, {"error": "لا توجد أي حسابات مصرح لك بالتنفيذ منها حالياً."})
                     return
 
+                usable_ids = {str(a["id"]) for a in usable}
                 selected_acc = str(body.get("selected_acc") or "all").strip()
-                if selected_acc != "all" and not any(a["id"] == selected_acc for a in usable):
-                    self._deny_perm(uid, tg_user, f"محاولة استخدام حساب خارج النطاق ({selected_acc})", "الحساب المحدد غير متاح ضمن صلاحياتك.")
-                    return
+                raw_multi = body.get("selected_accs")
+                selected_accs: list[str] = []
+                if selected_acc == "multi":
+                    if not isinstance(raw_multi, list) or not raw_multi:
+                        self._send_json(400, {"error": "اختر حساباً واحداً على الأقل في وضع التحديد المتعدد."})
+                        return
+                    for raw_aid in raw_multi:
+                        aid_s = str(raw_aid or "").strip()
+                        if aid_s not in usable_ids:
+                            self._deny_perm(uid, tg_user, f"محاولة استخدام حساب خارج النطاق ({aid_s})", "أحد الحسابات المحددة غير متاح ضمن صلاحياتك.")
+                            return
+                        if aid_s not in selected_accs:
+                            selected_accs.append(aid_s)
+                elif selected_acc != "all":
+                    if selected_acc not in usable_ids:
+                        self._deny_perm(uid, tg_user, f"محاولة استخدام حساب خارج النطاق ({selected_acc})", "الحساب المحدد غير متاح ضمن صلاحياتك.")
+                        return
+                    selected_accs = [selected_acc]
 
                 with _mission_launch_lock:
                     st = hooks["get_user_state"](uid)
@@ -945,7 +986,7 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                         "block": bool(body.get("block")) and rep_ok,
                     }
                     acc_est = eco.estimate_mission_account_count(
-                        usable, {"selected_acc": selected_acc, "acc_count_limit": acc_limit_val}
+                        usable, {"selected_acc": selected_acc, "selected_accs": selected_accs, "acc_count_limit": acc_limit_val}
                     )
                     debit_res = eco.debit_points_for_mission(uid, flags_for_billing, acc_est, target_url)
                     if not debit_res.get("ok"):
@@ -960,6 +1001,8 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
 
                     st["target_url"] = target_url[:1000]
                     st["selected_acc"] = selected_acc
+                    st["selected_accs"] = selected_accs
+                    st["wait_for_hitl"] = bool(body.get("wait_for_hitl", True))
                     st["acc_count_limit"] = acc_limit_val
 
                     st["like"] = flags_for_billing["like"]
@@ -1130,7 +1173,10 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                         duration_sec=dur_s,
                         repeat_interval_sec=rep_s,
                         repeat_on_open=bool(body.get("repeat_on_open", True)),
-                        pin_in_chat=bool(body.get("pin_in_chat", True)),
+                        pin_in_chat=bool(body.get("pin_in_chat", False)),
+                        delivery_mode=str(body.get("delivery_mode") or "animated_card"),
+                        repeat_behavior=str(body.get("repeat_behavior") or "replace"),
+                        effect_preset=str(body.get("effect_preset") or "none"),
                     )
                     b_res = {"sent": 0, "pinned": 0}
                     if body.get("push_telegram", True) and callable(hooks.get("broadcast_announcement")):
@@ -1138,13 +1184,14 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                             b_res = hooks["broadcast_announcement"](item, is_repeat=False)
                         except Exception:
                             pass
-                    hooks["record_audit_log"](uid, user_label, "ANNOUNCEMENT_CREATED", f"إنشاء إعلان عائم: {item['title']}")
+                    hooks["record_audit_log"](uid, user_label, "ANNOUNCEMENT_CREATED", f"إنشاء إعلان: {item['title']}")
+                    pin_note = " (مع تثبيت اختياري)" if item.get("pin_in_chat") else ""
                     self._send_json(200, {
                         "ok": True,
                         "announcement": item,
                         "all_announcements": ann.list_announcements(only_active=False),
                         "announcements": ann.list_announcements(only_active=True),
-                        "message": f"✅ تم نشر الإعلان العائم فوراً (تثبيت تلقائي لـ {b_res.get('sent', 0)} محادثة).",
+                        "message": f"✅ تم نشر البطاقة الإعلانية إلى {b_res.get('sent', 0)} محادثة{pin_note}.",
                     })
                     return
 
@@ -1186,6 +1233,30 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                         "all_announcements": ann.list_announcements(only_active=False),
                         "announcements": ann.list_announcements(only_active=True),
                         "message": "✅ تم تحديث مدة وتكرار الإعلان.",
+                    })
+                    return
+
+                if act == "update_delivery":
+                    dm_v = str(body["delivery_mode"]) if body.get("delivery_mode") else None
+                    rb_v = str(body["repeat_behavior"]) if body.get("repeat_behavior") else None
+                    pin_v = bool(body["pin_in_chat"]) if "pin_in_chat" in body and body["pin_in_chat"] is not None else None
+                    eff_v = str(body["effect_preset"]) if body.get("effect_preset") else None
+                    upd = ann.update_announcement_delivery(
+                        ann_id,
+                        delivery_mode=dm_v,
+                        repeat_behavior=rb_v,
+                        pin_in_chat=pin_v,
+                        effect_preset=eff_v,
+                    )
+                    if not upd:
+                        self._send_json(404, {"error": "الإعلان غير موجود."})
+                        return
+                    self._send_json(200, {
+                        "ok": True,
+                        "announcement": upd,
+                        "all_announcements": ann.list_announcements(only_active=False),
+                        "announcements": ann.list_announcements(only_active=True),
+                        "message": "✅ تم تحديث إعدادات الإرسال والمظهر.",
                     })
                     return
 
@@ -1582,6 +1653,112 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                     return
                 hitl.stop_hitl_session(acc_id)
                 self._send_json(200, {"ok": True, "running": False, "acc_id": acc_id})
+                return
+
+            if path == "/api/mission/hitl_decision":
+                acc_id = str(body.get("account_id") or body.get("acc_id") or "").strip()
+                dec = str(body.get("decision") or "").strip().lower()
+                if dec not in ("verified", "skip", "abort"):
+                    self._send_json(400, {"error": "قرار غير صالح."})
+                    return
+                w_info = hitl.get_mission_hitl_waiter(acc_id=acc_id)
+                acc_obj = hooks["get_account_by_id"](acc_id)
+                allowed_w = (
+                    is_dev
+                    or self._has_cap(uid, "accounts_pool")
+                    or (w_info and int(w_info.get("owner_uid") or 0) == int(uid))
+                    or (acc_obj and int(acc_obj.get("owner_id") or 0) == int(uid))
+                )
+                if not allowed_w:
+                    self._deny_perm(uid, tg_user, f"محاولة إرسال قرار HITL لحساب غير مصرح ({acc_id})")
+                    return
+                ok_sig = hitl.signal_mission_hitl_decision(acc_id, dec)
+                self._send_json(200, {"ok": True, "signaled": ok_sig, "decision": dec, "acc_id": acc_id})
+                return
+
+            if path == "/api/proxies/manage":
+                if not self._has_cap(uid, "proxies"):
+                    self._deny_perm(uid, tg_user, "محاولة إدارة البروكسيات من Mini App بدون صلاحية proxies")
+                    return
+                act = str(body.get("action") or "").strip().lower()
+                msg_out = "✅ تم تنفيذ الإجراء بنجاح."
+                res_out: dict[str, Any] = {}
+                if act == "add":
+                    raw_txt = str(body.get("text") or "").strip()
+                    if not raw_txt:
+                        self._send_json(400, {"error": "ألصق بروكسيات صحيحة أولاً."})
+                        return
+                    res_out = prx.add_proxies_bulk(raw_txt)
+                    prx.bind_existing_accounts(rebalance_all=False)
+                    msg_out = f"✅ أُضيف {res_out.get('added', 0)} بروكسي (مكرر {res_out.get('duplicates', 0)} | غير صالح {res_out.get('invalid', 0)})."
+                elif act == "check_all":
+                    res_out = prx.check_all_proxies(max_workers=10, timeout=7.0)
+                    hooks["record_audit_log"](uid, user_label, "PROXIES_CHECKED", f"فحص {res_out.get('checked', 0)} | حي {res_out.get('alive', 0)}")
+                    msg_out = f"🩺 فُحص {res_out.get('checked', 0)} | 🟢 حي: {res_out.get('alive', 0)} | 🔴 ميت: {res_out.get('dead', 0)}"
+                elif act == "check_one":
+                    sel = body.get("selector") if body.get("selector") is not None else body.get("id", "")
+                    res_out = prx.check_single_proxy(sel, timeout=8.0)
+                    if not res_out.get("ok"):
+                        self._send_json(404, {"error": res_out.get("error", "البروكسي غير موجود.")})
+                        return
+                    msg_out = "🟢 البروكسي يعمل بكفاءة." if res_out.get("alive") else f"🔴 تعطل البروكسي: {res_out.get('error', '')}"
+                elif act == "rebind_one":
+                    sel = body.get("selector") if body.get("selector") is not None else body.get("id", "")
+                    res_out = prx.rebind_proxy_accounts(sel)
+                    if not res_out.get("ok"):
+                        self._send_json(400, {"error": res_out.get("error", "تعذر نقل الحسابات.")})
+                        return
+                    msg_out = f"🔁 تم نقل {res_out.get('moved', 0)} حساب لبروكسيات بديلة سليمة."
+                elif act == "delete_one":
+                    sel = body.get("selector") if body.get("selector") is not None else body.get("id", "")
+                    res_out = prx.delete_single_proxy(sel, auto_rebind=True)
+                    if not res_out.get("ok"):
+                        self._send_json(404, {"error": res_out.get("error", "البروكسي غير موجود.")})
+                        return
+                    hooks["record_audit_log"](uid, user_label, "PROXY_DELETED", f"حذف {res_out.get('masked_uri')}")
+                    msg_out = f"🗑️ تم حذف الـ IP ونقل {res_out.get('rebound', 0)} حساب."
+                elif act == "clear_dead":
+                    rm = prx.clear_dead_proxies()
+                    res_out = {"removed": rm}
+                    msg_out = f"🧹 تم حذف {rm} بروكسي ميت."
+                elif act == "clear_all":
+                    rm = prx.clear_all_proxies()
+                    res_out = {"removed": rm}
+                    hooks["record_audit_log"](uid, user_label, "PROXIES_CLEARED", f"مسح {rm} بروكسي")
+                    msg_out = f"🗑️ تم مسح {rm} بروكسي."
+                elif act == "bind_existing":
+                    res_out = prx.bind_existing_accounts(rebalance_all=False)
+                    msg_out = f"🔗 تم توزيع وربط {res_out.get('newly_bound', 0)} حساب جديد."
+                elif act == "toggle_watch":
+                    en = prx.toggle_auto_check(body.get("enabled") if "enabled" in body else None)
+                    res_out = {"auto_check_enabled": en}
+                    msg_out = "✅ الفحص الآلي التلقائي مُفعّل." if en else "⏸️ تم إيقاف الفحص الآلي مؤقتاً."
+                elif act == "set_interval":
+                    iv = prx.set_auto_check_interval(int(body.get("seconds", 120) or 120))
+                    res_out = {"auto_check_interval_sec": iv}
+                    msg_out = f"⏱️ تم ضبط الفحص التلقائي كل {iv} ثانية."
+                elif act == "set_mode":
+                    m = prx.set_proxy_mode(str(body.get("mode") or "sticky"))
+                    res_out = {"mode": m}
+                    msg_out = f"🔀 تم تعيين الوضع النشط إلى: {m}"
+                elif act == "set_cap":
+                    lim = prx.set_max_per_proxy(int(body.get("limit", 3) if body.get("limit") is not None else 3))
+                    res_out = {"max_per_proxy": lim}
+                    msg_out = f"⚖️ تم ضبط الحد الأقصى للحسابات لكل IP إلى {lim if lim > 0 else 'مفتوح'}."
+                elif act == "fetch_github":
+                    res_out = prx.fetch_and_check_github_free_proxies()
+                    hooks["record_audit_log"](uid, user_label, "PROXIES_GITHUB_FETCH", f"فحص {res_out.get('tested', 0)} | مضاف {res_out.get('added', 0)}")
+                    msg_out = f"📥 فُحص {res_out.get('tested', 0)} بروكسي — شغال: {res_out.get('alive', 0)} | أُضيف: {res_out.get('added', 0)}"
+                else:
+                    self._send_json(400, {"error": "إجراء بروكسي غير معروف."})
+                    return
+
+                self._send_json(200, {
+                    "ok": True,
+                    "result": res_out,
+                    "proxy_report": prx.get_proxy_detailed_report(),
+                    "message": msg_out,
+                })
                 return
 
             self._send_json(404, {"error": "المسار غير موجود"})

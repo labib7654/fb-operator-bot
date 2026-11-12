@@ -538,8 +538,15 @@ def reward_account_activation(
 
 def estimate_mission_account_count(usable: list[dict], params: dict) -> int:
     selected_acc = str(params.get("selected_acc") or "all")
+    usable_ids = {str(a.get("id")) for a in usable if a.get("id")}
+    if selected_acc == "multi":
+        raw_sel = params.get("selected_accs") or []
+        picked = [str(x) for x in raw_sel if str(x) in usable_ids]
+        if picked:
+            return len(dict.fromkeys(picked))
+        return 0
     if selected_acc != "all":
-        return 1 if any(a.get("id") == selected_acc for a in usable) else 0
+        return 1 if selected_acc in usable_ids else 0
     active = [a for a in usable if "نشط" in str(a.get("status", ""))]
     pool = active if active else usable
     if not pool:

@@ -103,7 +103,29 @@ def _proxies_file_path() -> Path:
     return Path(getattr(config, "PROXIES_FILE", Path(config.DATA_DIR) / "proxies.json"))
 
 
+_proxy_alert_callbacks: list[Any] = []
+_watchdog_run_lock = threading.Lock()
+
+
+def register_proxy_alert_callback(cb) -> None:
+    if cb and cb not in _proxy_alert_callbacks:
+        _proxy_alert_callbacks.append(cb)
+
+
+def _emit_proxy_alert(payload: dict[str, Any]) -> None:
+    for cb in list(_proxy_alert_callbacks):
+        try:
+            cb(payload)
+        except Exception:
+            pass
+
+
 def _notify_change(reason: str = "proxies") -> None:
+    try:
+        from fb_operator.state_events import publish_event
+        publish_event("proxies", 0, reason)
+    except Exception:
+        pass
     try:
         from fb_operator import persistence_manager
         persistence_manager.notify_data_changed(reason)
@@ -115,6 +137,9 @@ def _default_state() -> dict[str, Any]:
     return {
         "mode": "sticky",  # sticky | 4g_bridge | direct
         "max_per_proxy": 3,  # الحد الآمن الموصى به للحسابات لكل بروكسي (3=آمن، 5=حد أقصى، 0=غير محدود)
+        "auto_check_enabled": True,
+        "auto_check_interval_sec": 120,
+        "last_auto_check_ts": 0.0,
         "proxies": [],
         "bindings": {},    # account_id -> canonical_uri
         "bridge_4g": {
@@ -161,7 +186,19 @@ def load_proxy_state() -> dict[str, Any]:
                 max_per_proxy = 3
         except Exception:
             max_per_proxy = 3
-        proxies = [p for p in (data.get("proxies") or []) if isinstance(p, dict) and p.get("uri")]
+        proxies: list[dict[str, Any]] = []
+        for idx_p, raw_p in enumerate(data.get("proxies") or []):
+            if isinstance(raw_p, dict) and raw_p.get("uri"):
+                p_obj = dict(raw_p)
+                if not p_obj.get("id"):
+                    p_obj["id"] = f"prx_{idx_p + 1}_{secrets.token_hex(2)}"
+                p_obj.setdefault("uses_count", 0)
+                p_obj.setdefault("success_count", 0)
+                p_obj.setdefault("fail_count", 0)
+                p_obj.setdefault("total_fail_count", 0)
+                p_obj.setdefault("last_used_at", "")
+                p_obj.setdefault("last_error", "")
+                proxies.append(p_obj)
         bindings = {
             str(k): str(v)
             for k, v in (data.get("bindings") or {}).items()
@@ -170,9 +207,20 @@ def load_proxy_state() -> dict[str, Any]:
         b4g = dict(base["bridge_4g"])
         if isinstance(data.get("bridge_4g"), dict):
             b4g.update({k: v for k, v in data["bridge_4g"].items() if v not in (None, "")})
+        try:
+            interval_s = max(30, min(3600, int(data.get("auto_check_interval_sec", 120) or 120)))
+        except Exception:
+            interval_s = 120
+        try:
+            last_auto_ts = float(data.get("last_auto_check_ts", 0.0) or 0.0)
+        except Exception:
+            last_auto_ts = 0.0
         return {
             "mode": mode,
             "max_per_proxy": max_per_proxy,
+            "auto_check_enabled": bool(data.get("auto_check_enabled", True)),
+            "auto_check_interval_sec": interval_s,
+            "last_auto_check_ts": last_auto_ts,
             "proxies": proxies,
             "bindings": bindings,
             "bridge_4g": b4g,
@@ -300,6 +348,7 @@ def add_proxies_bulk(raw_lines: str | list[str]) -> dict[str, Any]:
                 duplicates += 1
                 continue
             item = {
+                "id": f"prx_{secrets.token_hex(4)}",
                 "uri": uri,
                 "scheme": parts["scheme"],
                 "host": parts["host"],
@@ -313,6 +362,11 @@ def add_proxies_bulk(raw_lines: str | list[str]) -> dict[str, Any]:
                 "added_at": now_iso,
                 "last_checked": "",
                 "fail_count": 0,
+                "total_fail_count": 0,
+                "uses_count": 0,
+                "success_count": 0,
+                "last_used_at": "",
+                "last_error": "",
             }
             state["proxies"].append(item)
             existing[uri] = item
@@ -690,28 +744,62 @@ def check_all_proxies(max_workers: int = 12, timeout: float = 8.0) -> dict[str, 
     now_iso = datetime.now().isoformat(timespec="seconds")
     alive_cnt = 0
     dead_cnt = 0
+    newly_dead: list[dict[str, Any]] = []
+    recovered: list[dict[str, Any]] = []
     with _proxy_lock:
         fresh = load_proxy_state()
+        fresh["last_auto_check_ts"] = time.time()
+        bindings = fresh.get("bindings") or {}
         for p in fresh["proxies"]:
             res = results_by_uri.get(p["uri"])
             if not res:
                 continue
+            was_alive = p.get("alive")
             is_ok = bool(res.get("alive"))
             p["alive"] = is_ok
             p["latency_ms"] = res.get("latency_ms")
             p["last_checked"] = now_iso
+            bound_ids = [aid for aid, u in bindings.items() if u == p["uri"]]
             if is_ok:
                 alive_cnt += 1
                 p["fail_count"] = 0
+                p["last_error"] = ""
                 for gk in ("exit_ip", "country_code", "country_name", "timezone"):
                     if res.get(gk):
                         p[gk] = res[gk]
+                if was_alive is False:
+                    recovered.append({
+                        "id": p.get("id", ""),
+                        "masked_uri": mask_proxy_uri(p["uri"]),
+                        "host": p.get("host", ""),
+                        "port": p.get("port", ""),
+                        "country_code": p.get("country_code", ""),
+                        "bound_account_ids": bound_ids,
+                    })
             else:
                 dead_cnt += 1
                 p["fail_count"] = int(p.get("fail_count") or 0) + 1
+                p["total_fail_count"] = int(p.get("total_fail_count") or 0) + 1
+                p["last_error"] = str(res.get("error") or "فشل الاتصال بالبروكسي")[:160]
+                if was_alive is not False:
+                    newly_dead.append({
+                        "id": p.get("id", ""),
+                        "uri": p["uri"],
+                        "masked_uri": mask_proxy_uri(p["uri"]),
+                        "host": p.get("host", ""),
+                        "port": p.get("port", ""),
+                        "error": p["last_error"],
+                        "bound_account_ids": bound_ids,
+                    })
         save_proxy_state(fresh, notify=True)
 
-    return {"checked": len(items), "alive": alive_cnt, "dead": dead_cnt}
+    return {
+        "checked": len(items),
+        "alive": alive_cnt,
+        "dead": dead_cnt,
+        "newly_dead": newly_dead,
+        "recovered": recovered,
+    }
 
 
 GITHUB_FREE_PROXY_SOURCES: tuple[tuple[str, str], ...] = (
@@ -819,22 +907,319 @@ def fetch_and_check_github_free_proxies(
     }
 
 
-def mark_proxy_failure(proxy_uri: str) -> None:
+def _match_proxy_entry(proxies: list[dict[str, Any]], selector: str | int) -> tuple[int, dict[str, Any] | None]:
+    if isinstance(selector, int):
+        if 0 <= selector < len(proxies):
+            return selector, proxies[selector]
+        return -1, None
+    raw = str(selector or "").strip()
+    if raw.isdigit():
+        idx = int(raw)
+        if 0 <= idx < len(proxies):
+            return idx, proxies[idx]
+    norm = normalize_proxy_uri(raw) or raw
+    for idx, p in enumerate(proxies):
+        if p.get("id") == raw or p.get("uri") == norm or p.get("uri") == raw:
+            return idx, p
+    return -1, None
+
+
+def toggle_auto_check(enabled: bool | None = None) -> bool:
+    with _proxy_lock:
+        state = load_proxy_state()
+        new_val = (not bool(state.get("auto_check_enabled", True))) if enabled is None else bool(enabled)
+        state["auto_check_enabled"] = new_val
+        save_proxy_state(state, notify=True)
+        return new_val
+
+
+def set_auto_check_interval(seconds: int) -> int:
+    try:
+        val = max(30, min(3600, int(seconds)))
+    except Exception:
+        val = 120
+    with _proxy_lock:
+        state = load_proxy_state()
+        state["auto_check_interval_sec"] = val
+        save_proxy_state(state, notify=True)
+        return val
+
+
+def record_proxy_use(proxy_uri: str, success: bool = True, error: str = "") -> None:
     target = normalize_proxy_uri(proxy_uri) or str(proxy_uri or "").strip()
     if not target:
         return
+    now_iso = datetime.now().isoformat(timespec="seconds")
     with _proxy_lock:
         state = load_proxy_state()
         changed = False
         for p in state["proxies"]:
             if p.get("uri") == target:
-                p["fail_count"] = int(p.get("fail_count") or 0) + 1
-                if p["fail_count"] >= 3:
-                    p["alive"] = False
+                p["uses_count"] = int(p.get("uses_count") or 0) + 1
+                p["last_used_at"] = now_iso
+                if success:
+                    p["success_count"] = int(p.get("success_count") or 0) + 1
+                    p["fail_count"] = 0
+                    p["last_error"] = ""
+                    if p.get("alive") is None:
+                        p["alive"] = True
+                else:
+                    p["fail_count"] = int(p.get("fail_count") or 0) + 1
+                    p["total_fail_count"] = int(p.get("total_fail_count") or 0) + 1
+                    if error:
+                        p["last_error"] = str(error)[:160]
                 changed = True
                 break
         if changed:
             save_proxy_state(state, notify=True)
+
+
+def report_proxy_network_error(proxy_uri: str, error: str = "") -> dict[str, Any]:
+    """رصد تعطل فوري للـ IP أثناء التشغيل، إعلانه غير صالح، وإرسال تنبيه فوري للمسؤولين."""
+    target = normalize_proxy_uri(proxy_uri) or str(proxy_uri or "").strip()
+    if not target:
+        return {"ok": False}
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    err_txt = str(error or "انقطع اتصال البروكسي أثناء التشغيل").strip()[:160]
+    alert_item: dict[str, Any] | None = None
+    with _proxy_lock:
+        state = load_proxy_state()
+        bindings = state.get("bindings") or {}
+        for idx, p in enumerate(state["proxies"]):
+            if p.get("uri") == target:
+                was_alive = p.get("alive")
+                p["alive"] = False
+                p["fail_count"] = int(p.get("fail_count") or 0) + 1
+                p["total_fail_count"] = int(p.get("total_fail_count") or 0) + 1
+                p["last_checked"] = now_iso
+                p["last_error"] = err_txt
+                bound_ids = [aid for aid, u in bindings.items() if u == target]
+                save_proxy_state(state, notify=True)
+                alert_item = {
+                    "idx": idx,
+                    "id": p.get("id", ""),
+                    "uri": target,
+                    "masked_uri": mask_proxy_uri(target),
+                    "host": p.get("host", ""),
+                    "port": p.get("port", ""),
+                    "error": err_txt,
+                    "bound_account_ids": bound_ids,
+                    "was_alive": was_alive,
+                }
+                break
+    if alert_item and alert_item.get("was_alive") is not False:
+        _emit_proxy_alert({
+            "kind": "proxy_down",
+            "newly_dead": [alert_item],
+            "recovered": [],
+            "reason": "runtime_error",
+        })
+    return {"ok": bool(alert_item), "item": alert_item}
+
+
+def check_single_proxy(selector: str | int, timeout: float = 8.0) -> dict[str, Any]:
+    state = load_proxy_state()
+    idx, entry = _match_proxy_entry(state["proxies"], selector)
+    if not entry:
+        return {"ok": False, "error": "البروكسي غير موجود."}
+    res = check_proxy_health(entry["uri"], timeout=timeout)
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    with _proxy_lock:
+        fresh = load_proxy_state()
+        idx2, p = _match_proxy_entry(fresh["proxies"], entry.get("id") or entry["uri"])
+        if not p:
+            return {"ok": False, "error": "البروكسي غير موجود."}
+        was_alive = p.get("alive")
+        is_ok = bool(res.get("alive"))
+        p["alive"] = is_ok
+        p["latency_ms"] = res.get("latency_ms")
+        p["last_checked"] = now_iso
+        if is_ok:
+            p["fail_count"] = 0
+            p["last_error"] = ""
+            for gk in ("exit_ip", "country_code", "country_name", "timezone"):
+                if res.get(gk):
+                    p[gk] = res[gk]
+        else:
+            p["fail_count"] = int(p.get("fail_count") or 0) + 1
+            p["total_fail_count"] = int(p.get("total_fail_count") or 0) + 1
+            p["last_error"] = str(res.get("error") or "تعذر الوصول للبروكسي")[:160]
+        save_proxy_state(fresh, notify=True)
+    return {
+        "ok": True,
+        "idx": idx2 if idx2 >= 0 else idx,
+        "id": p.get("id", ""),
+        "masked_uri": mask_proxy_uri(p["uri"]),
+        "alive": is_ok,
+        "was_alive": was_alive,
+        "latency_ms": p.get("latency_ms"),
+        "exit_ip": p.get("exit_ip", ""),
+        "country_code": p.get("country_code", ""),
+        "error": p.get("last_error", ""),
+    }
+
+
+def rebind_proxy_accounts(selector: str | int) -> dict[str, Any]:
+    """نقل الحسابات المرتبطة ببروكسي محدد (متعطل أو مزدحم) إلى بروكسيات أخرى سليمة متوازنة."""
+    try:
+        from fb_operator import account_manager as acc_m
+    except Exception:
+        acc_m = None
+
+    moved: list[dict[str, str]] = []
+    with _proxy_lock:
+        state = load_proxy_state()
+        idx, entry = _match_proxy_entry(state["proxies"], selector)
+        if not entry:
+            return {"ok": False, "error": "البروكسي غير موجود.", "moved": 0}
+        target_uri = entry["uri"]
+        affected_ids = [aid for aid, u in state["bindings"].items() if u == target_uri]
+        if not affected_ids:
+            return {"ok": True, "moved": 0, "accounts": [], "message": "لا توجد حسابات مربوطة بهذا الـ IP."}
+
+        alt_candidates = [
+            p for p in state["proxies"]
+            if p.get("uri") != target_uri and p.get("alive") is not False
+        ]
+        if not alt_candidates:
+            return {
+                "ok": False,
+                "error": "لا توجد بروكسيات بديلة صالحة لنقل الحسابات إليها حالياً.",
+                "moved": 0,
+            }
+
+        usage: dict[str, int] = {p["uri"]: 0 for p in alt_candidates}
+        for bound_u in state["bindings"].values():
+            if bound_u in usage:
+                usage[bound_u] += 1
+
+        for aid in affected_ids:
+            best = min(
+                alt_candidates,
+                key=lambda p: (usage.get(p["uri"], 0), int(p.get("latency_ms") or 9999), str(p.get("uri"))),
+            )
+            state["bindings"][aid] = best["uri"]
+            usage[best["uri"]] = usage.get(best["uri"], 0) + 1
+            moved.append({
+                "id": aid,
+                "new_masked": mask_proxy_uri(best["uri"]),
+                "country_code": str(best.get("country_code") or "").upper(),
+            })
+        save_proxy_state(state, notify=True)
+
+    if acc_m and moved:
+        for mv in moved:
+            try:
+                acc_m.update_account(
+                    mv["id"],
+                    {"bound_proxy": mv["new_masked"], "bound_proxy_country": mv["country_code"]},
+                    sync_git=False,
+                )
+            except Exception:
+                pass
+        _notify_change("proxies_rebind")
+
+    return {"ok": True, "moved": len(moved), "accounts": moved}
+
+
+def delete_single_proxy(selector: str | int, auto_rebind: bool = True) -> dict[str, Any]:
+    rebound_cnt = 0
+    with _proxy_lock:
+        state = load_proxy_state()
+        idx, entry = _match_proxy_entry(state["proxies"], selector)
+        if not entry:
+            return {"ok": False, "error": "البروكسي غير موجود."}
+        target_uri = entry["uri"]
+        masked = mask_proxy_uri(target_uri)
+        orphans = [aid for aid, u in state["bindings"].items() if u == target_uri]
+
+    if auto_rebind and orphans:
+        rb = rebind_proxy_accounts(target_uri)
+        if rb.get("ok"):
+            rebound_cnt = int(rb.get("moved") or 0)
+
+    ok_del = remove_proxy(target_uri)
+    return {
+        "ok": ok_del,
+        "masked_uri": masked,
+        "rebound": rebound_cnt,
+        "orphans": len(orphans),
+    }
+
+
+def run_scheduled_proxy_watchdog(force: bool = False) -> dict[str, Any]:
+    """مراقب آلي دوري يفحص جميع البروكسيات ويرسل تنبيهاً فورياً عند سقوط أو تعافي أي IP."""
+    if not _watchdog_run_lock.acquire(blocking=False):
+        return {"skipped": True, "reason": "already_running"}
+    try:
+        state = load_proxy_state()
+        if not state["proxies"]:
+            return {"skipped": True, "reason": "empty"}
+        if not force:
+            if not state.get("auto_check_enabled", True):
+                return {"skipped": True, "reason": "disabled"}
+            interval = max(30, int(state.get("auto_check_interval_sec") or 120))
+            last_ts = float(state.get("last_auto_check_ts") or 0.0)
+            if (time.time() - last_ts) < interval:
+                return {"skipped": True, "reason": "interval"}
+
+        res = check_all_proxies(timeout=6.0, max_workers=8)
+        newly_dead = res.get("newly_dead") or []
+        recovered = res.get("recovered") or []
+        if newly_dead or recovered:
+            _emit_proxy_alert({
+                "kind": "watchdog",
+                "newly_dead": newly_dead,
+                "recovered": recovered,
+                "alive": res.get("alive", 0),
+                "dead": res.get("dead", 0),
+                "checked": res.get("checked", 0),
+            })
+        return {"skipped": False, **res}
+    finally:
+        _watchdog_run_lock.release()
+
+
+def mark_proxy_failure(proxy_uri: str, error: str = "") -> None:
+    target = normalize_proxy_uri(proxy_uri) or str(proxy_uri or "").strip()
+    if not target:
+        return
+    became_dead_item: dict[str, Any] | None = None
+    with _proxy_lock:
+        state = load_proxy_state()
+        changed = False
+        bindings = state.get("bindings") or {}
+        for idx, p in enumerate(state["proxies"]):
+            if p.get("uri") == target:
+                was_alive = p.get("alive")
+                p["fail_count"] = int(p.get("fail_count") or 0) + 1
+                p["total_fail_count"] = int(p.get("total_fail_count") or 0) + 1
+                if error:
+                    p["last_error"] = str(error)[:160]
+                if p["fail_count"] >= 3:
+                    p["alive"] = False
+                    if was_alive is not False:
+                        became_dead_item = {
+                            "idx": idx,
+                            "id": p.get("id", ""),
+                            "uri": target,
+                            "masked_uri": mask_proxy_uri(target),
+                            "host": p.get("host", ""),
+                            "port": p.get("port", ""),
+                            "error": p.get("last_error") or "فشل متكرر 3 مرات",
+                            "bound_account_ids": [aid for aid, u in bindings.items() if u == target],
+                        }
+                changed = True
+                break
+        if changed:
+            save_proxy_state(state, notify=True)
+    if became_dead_item:
+        _emit_proxy_alert({
+            "kind": "proxy_down",
+            "newly_dead": [became_dead_item],
+            "recovered": [],
+            "reason": "threshold",
+        })
 
 
 def locale_hints_for_geo(country_code: str, timezone: str) -> dict[str, Any]:
@@ -1332,6 +1717,7 @@ def get_proxy_summary() -> dict[str, Any]:
         if configured_max > 0
         else 0
     )
+    total_uses = sum(int(p.get("uses_count") or 0) for p in proxies)
     return {
         "mode": state["mode"],
         "total": len(proxies),
@@ -1344,5 +1730,61 @@ def get_proxy_summary() -> dict[str, Any]:
         "safe_capacity": safe_capacity,
         "overloaded_proxies": overloaded_proxies,
         "is_overloaded": bool(overloaded_proxies > 0 or (safe_capacity > 0 and len(state["bindings"]) > safe_capacity)),
+        "auto_check_enabled": bool(state.get("auto_check_enabled", True)),
+        "auto_check_interval_sec": int(state.get("auto_check_interval_sec") or 120),
+        "last_auto_check_ts": float(state.get("last_auto_check_ts") or 0.0),
+        "total_uses": total_uses,
         "bridge_4g": b4g,
     }
+
+
+def get_proxy_detailed_report() -> dict[str, Any]:
+    """تقرير تفصيلي لحظي لكل IP: عدد مرات الاستخدام، حالة الفحص، وقائمة الحسابات المربوطة به بالاسم."""
+    state = load_proxy_state()
+    summary = get_proxy_summary()
+    try:
+        from fb_operator import account_manager as acc_m
+        acc_by_id = {str(a.get("id")): a for a in acc_m.load_accounts() if a.get("id")}
+    except Exception:
+        acc_by_id = {}
+
+    bound_by_uri: dict[str, list[dict[str, str]]] = {}
+    for aid, p_uri in (state.get("bindings") or {}).items():
+        a_obj = acc_by_id.get(str(aid))
+        bound_by_uri.setdefault(p_uri, []).append({
+            "id": str(aid),
+            "name": str(a_obj.get("name") or aid) if a_obj else str(aid),
+            "status": str(a_obj.get("status") or "") if a_obj else "",
+            "fb_id": str(a_obj.get("fb_id") or "") if a_obj else "",
+        })
+
+    configured_max = int(state.get("max_per_proxy", 3) or 0)
+    items: list[dict[str, Any]] = []
+    for idx, p in enumerate(state["proxies"]):
+        uri = str(p.get("uri") or "")
+        bound_accs = bound_by_uri.get(uri, [])
+        items.append({
+            "idx": idx,
+            "id": str(p.get("id") or f"prx_{idx + 1}"),
+            "masked_uri": mask_proxy_uri(uri),
+            "host": str(p.get("host") or ""),
+            "port": p.get("port"),
+            "scheme": str(p.get("scheme") or ""),
+            "country_code": str(p.get("country_code") or "").upper(),
+            "country_name": str(p.get("country_name") or ""),
+            "exit_ip": str(p.get("exit_ip") or ""),
+            "latency_ms": p.get("latency_ms"),
+            "alive": p.get("alive"),
+            "uses_count": int(p.get("uses_count") or 0),
+            "success_count": int(p.get("success_count") or 0),
+            "fail_count": int(p.get("fail_count") or 0),
+            "total_fail_count": int(p.get("total_fail_count") or 0),
+            "last_used_at": str(p.get("last_used_at") or ""),
+            "last_checked": str(p.get("last_checked") or ""),
+            "last_error": str(p.get("last_error") or ""),
+            "bound_count": len(bound_accs),
+            "max_per_proxy": configured_max,
+            "over_capacity": bool(configured_max > 0 and len(bound_accs) > configured_max),
+            "bound_accounts": bound_accs,
+        })
+    return {"summary": summary, "items": items}
