@@ -19,6 +19,9 @@ except Exception:
     from playwright.sync_api import Page, Locator
 from fb_operator.browser_manager import (
     human_delay,
+    human_click,
+    human_type_text,
+    _curved_mouse_move,
     dismiss_dialogs,
     smooth_scroll,
     check_facebook_page_access,
@@ -26,6 +29,47 @@ from fb_operator.browser_manager import (
 
 _DIAG_LOCK = threading.Lock()
 _PAGE_DIAGS: dict[int, str] = {}
+
+
+def _human_act_click(page: Page, locator, timeout: int = 4000, force: bool = False) -> bool:
+    """نقر بشري موحّد بمسار بيزيه منحنٍ وضغط وإفلات طبيعي بدلاً من النقرات الفورية أو الاصطناعية"""
+    try:
+        if hasattr(locator, "scroll_into_view_if_needed"):
+            locator.scroll_into_view_if_needed(timeout=min(timeout, 2500))
+    except Exception:
+        pass
+    try:
+        if human_click(page, locator, timeout=timeout):
+            return True
+    except Exception:
+        pass
+    try:
+        locator.click(timeout=timeout, force=force)
+        return True
+    except Exception:
+        if force:
+            return False
+        try:
+            locator.click(timeout=min(timeout, 3000), force=True)
+            return True
+        except Exception:
+            return False
+
+
+def _human_hover(page: Page, locator) -> None:
+    """تحريك المؤشر بمنحنى بيزيه فوق العنصر قبل التفاعل أو إظهار قائمة التفاعلات"""
+    try:
+        if hasattr(locator, "scroll_into_view_if_needed"):
+            locator.scroll_into_view_if_needed(timeout=1800)
+        box = locator.bounding_box()
+        if box and box.get("width", 0) > 2 and box.get("height", 0) > 2:
+            tx = box["x"] + box["width"] * random.uniform(0.32, 0.68)
+            ty = box["y"] + box["height"] * random.uniform(0.32, 0.68)
+            _curved_mouse_move(page, tx, ty)
+            human_delay(0.15, 0.35)
+        locator.hover()
+    except Exception:
+        pass
 
 
 def set_page_diag(page, reason: str) -> None:
@@ -88,9 +132,19 @@ def navigate_to_target(page: Page, target_url: str) -> bool:
             page.goto(clean_url, wait_until="domcontentloaded", timeout=45000)
         except Exception:
             page.goto(clean_url, wait_until="commit", timeout=45000)
-        human_delay(1.8, 3.0)
+        human_delay(1.8, 3.2)
         dismiss_dialogs(page)
         close_floating_chats(page)
+        try:
+            vp = getattr(page, "viewport_size", None) or {}
+            vw = float(vp.get("width", 1280))
+            vh = float(vp.get("height", 800))
+            _curved_mouse_move(page, random.uniform(vw * 0.25, vw * 0.72), random.uniform(vh * 0.22, vh * 0.58))
+            if hasattr(page, "mouse") and hasattr(page.mouse, "wheel"):
+                page.mouse.wheel(0, random.randint(140, 320))
+                human_delay(0.8, 1.6)
+        except Exception:
+            pass
 
         ok, reason = check_facebook_page_access(page)
         if not ok:
@@ -205,10 +259,10 @@ def get_target_post(page: Page, post_index: int = 1):
             return target
 
         try:
-            page.evaluate("window.scrollBy({top: 650, behavior: 'smooth'})")
+            page.evaluate(f"window.scrollBy({{top: {random.randint(420, 740)}, behavior: 'smooth'}})")
         except Exception:
             pass
-        human_delay(1.5, 2.5)
+        human_delay(1.4, 2.6)
         attempts += 1
 
     all_p = _find_posts(page)
@@ -264,14 +318,7 @@ def react_to_posts(page: Page, reaction: str = "like", post_index: int = 1) -> b
         return False
 
     def _safe_click_btn(btn) -> None:
-        try:
-            btn.scroll_into_view_if_needed(timeout=1500)
-        except Exception:
-            pass
-        try:
-            btn.click(timeout=4000)
-        except Exception:
-            btn.click(force=True, timeout=3000)
+        _human_act_click(page, btn, timeout=4000, force=True)
 
     aria_label = (like_btn.get_attribute("aria-label") or "").strip().lower()
     btn_text = (like_btn.inner_text() or "").strip().lower()
@@ -310,7 +357,7 @@ def react_to_posts(page: Page, reaction: str = "like", post_index: int = 1) -> b
     keywords = reaction_map.get(reaction, ["أحببته", "Love"])
 
     try:
-        like_btn.hover()
+        _human_hover(page, like_btn)
         human_delay(1.1, 1.7)
 
         for attempt in range(2):
@@ -385,7 +432,7 @@ def like_posts(page: Page, mode: str = "latest", count: int = 1, post_index: int
             if is_already_liked:
                 continue
 
-            like_btn.click()
+            _human_act_click(page, like_btn)
             liked_count += 1
             human_delay(2.0, 3.5)
         except Exception:
@@ -432,8 +479,7 @@ def comment_on_posts(page: Page, comment_text: str, mode: str = "latest", count:
 
         if comment_btn.is_visible(timeout=2500):
             try:
-                comment_btn.scroll_into_view_if_needed(timeout=1500)
-                comment_btn.click()
+                _human_act_click(page, comment_btn, timeout=3000)
                 human_delay(1.5, 2.5)
             except Exception:
                 pass
@@ -473,11 +519,9 @@ def comment_on_posts(page: Page, comment_text: str, mode: str = "latest", count:
                 input_box.scroll_into_view_if_needed(timeout=2000)
             except Exception:
                 pass
-            human_delay(0.5, 1.0)
-            input_box.click(force=True)
-            human_delay(0.4, 0.8)
-            page.keyboard.type(comment_text, delay=random.randint(40, 75))
-            human_delay(1.0, 1.8)
+            human_delay(0.5, 1.1)
+            human_type_text(page, input_box, comment_text, clear_existing=False, fast=True)
+            human_delay(0.9, 1.8)
             typed_ok = False
             try:
                 cur_val = (input_box.inner_text(timeout=1000) or "").strip()
@@ -521,7 +565,7 @@ def comment_on_posts(page: Page, comment_text: str, mode: str = "latest", count:
                     try:
                         b = scope_root.locator(sb).first
                         if b.is_visible(timeout=800):
-                            b.click(timeout=1000)
+                            _human_act_click(page, b, timeout=1200)
                             clicked_submit = True
                             break
                     except Exception:
@@ -561,7 +605,7 @@ def _ensure_post_comments_expanded(page: Page, target_post) -> list:
         try:
             btn = target_post.locator(sel).first
             if btn.is_visible(timeout=1500):
-                btn.dispatch_event('click')
+                _human_act_click(page, btn, timeout=2500)
                 human_delay(2.0, 3.0)
                 break
         except Exception:
@@ -596,7 +640,7 @@ def like_comment_on_post(page: Page, post_index: int = 1, comment_index: int = 1
         comment_likes = [b for b in like_btns if b.is_visible()]
         if len(comment_likes) > 1:
             target_like = comment_likes[comment_index] if len(comment_likes) > comment_index else comment_likes[1]
-            target_like.dispatch_event('click')
+            _human_act_click(page, target_like, timeout=2500)
             print(f"[+] تم وضع إعجاب بنجاح على التعليق رقم {comment_index} في المنشور {post_index}!")
             human_delay(2.0, 3.5)
             return True
@@ -605,7 +649,7 @@ def like_comment_on_post(page: Page, post_index: int = 1, comment_index: int = 1
         alt_likes = page.locator('span:has-text("أعجبني"), div[role="button"]:has-text("أعجبني")').all()
         for al in alt_likes:
             if al.is_visible():
-                al.dispatch_event('click')
+                _human_act_click(page, al, timeout=2500)
                 print("[+] تم الإعجاب بالتعليق بنجاح عبر الخيار البديل!")
                 human_delay(2.0, 3.5)
                 return True
@@ -650,9 +694,7 @@ def reply_to_comment_on_post(page: Page, reply_text: str, post_index: int = 1, c
             return False
 
         target_reply = reply_btns[comment_index - 1] if len(reply_btns) >= comment_index else reply_btns[0]
-        
-        # النقر البرمجي لتفادي اعتراض مؤشر الفأرة
-        target_reply.dispatch_event('click')
+        _human_act_click(page, target_reply, timeout=3000)
         human_delay(1.5, 2.5)
 
         # 2. تحديد صندوق الرد المتولد حديثاً
@@ -680,13 +722,8 @@ def reply_to_comment_on_post(page: Page, reply_text: str, post_index: int = 1, c
                     break
 
         if reply_box:
-            try:
-                reply_box.focus()
-            except Exception:
-                reply_box.click(force=True, timeout=2000)
-            human_delay(0.5, 1.0)
-            page.keyboard.type(reply_text, delay=random.randint(45, 85))
-            human_delay(1.0, 1.8)
+            human_type_text(page, reply_box, reply_text, clear_existing=False, fast=True)
+            human_delay(0.9, 1.8)
             page.keyboard.press("Enter")
             print(f"[+] تم إرسال الرد بنجاح على التعليق رقم {comment_index}: '{reply_text}'")
             human_delay(4.5, 6.0)
@@ -800,23 +837,23 @@ def apply_comment_reaction(page: Page, comment_elem, reaction: str = "like") -> 
 
     try:
         if reaction.lower() == "like":
-            like_btn.dispatch_event('click')
+            _human_act_click(page, like_btn, timeout=2500)
             print("[+] تم وضع إعجاب (Like) على التعليق بنجاح.")
             human_delay(1.5, 2.5)
             return True
         else:
-            like_btn.hover()
+            _human_hover(page, like_btn)
             human_delay(1.0, 1.8)
 
             for lbl in target_labels:
                 r_btn = page.locator(f'div[role="toolbar"] div[role="button"][aria-label*="{lbl}" i], div[role="button"][aria-label="{lbl}"]').first
                 if r_btn.is_visible(timeout=1500):
-                    r_btn.click()
+                    _human_act_click(page, r_btn, timeout=2500)
                     print(f"[+] تم اختيار تفاعل '{lbl}' على التعليق بنجاح!")
                     human_delay(1.5, 2.5)
                     return True
 
-            like_btn.dispatch_event('click')
+            _human_act_click(page, like_btn, timeout=2500)
             print(f"[+] تم وضع إعجاب عادي كبديل لتفاعل '{target_labels[0]}'.")
             human_delay(1.5, 2.5)
             return True
@@ -835,7 +872,7 @@ def post_reply_to_comment_elem(page: Page, comment_elem, reply_text: str) -> boo
         return False
 
     try:
-        reply_btn.dispatch_event('click')
+        _human_act_click(page, reply_btn, timeout=3000)
         human_delay(1.5, 2.5)
 
         reply_box_selectors = [
@@ -862,13 +899,8 @@ def post_reply_to_comment_elem(page: Page, comment_elem, reply_text: str) -> boo
                     break
 
         if reply_box:
-            try:
-                reply_box.focus()
-            except Exception:
-                reply_box.click(force=True, timeout=2000)
-            human_delay(0.5, 1.0)
-            page.keyboard.type(reply_text, delay=random.randint(45, 85))
-            human_delay(1.0, 1.8)
+            human_type_text(page, reply_box, reply_text, clear_existing=False, fast=True)
+            human_delay(0.9, 1.8)
             page.keyboard.press("Enter")
             print(f"[+] تم إرسال الرد بنجاح على التعليق المحدد: '{reply_text}'")
             human_delay(4.5, 6.0)
@@ -953,7 +985,7 @@ def send_friend_request(page: Page) -> bool:
         try:
             btn = page.locator(sel).first
             if btn.is_visible(timeout=3000):
-                btn.click()
+                _human_act_click(page, btn, timeout=3000)
                 print("[+] تم إرسال طلب الصداقة بنجاح.")
                 human_delay(2.0, 4.0)
                 return True
@@ -983,7 +1015,7 @@ def cancel_friend_request(page: Page) -> bool:
         try:
             btn = page.locator(sel).first
             if btn.is_visible(timeout=2500):
-                btn.click()
+                _human_act_click(page, btn, timeout=3000)
                 print("[+] تم إلغاء طلب الصداقة بنجاح.")
                 human_delay(2.0, 4.0)
                 return True
@@ -1001,7 +1033,7 @@ def cancel_friend_request(page: Page) -> bool:
         try:
             f_btn = page.locator(fs).first
             if f_btn.is_visible(timeout=2000):
-                f_btn.click()
+                _human_act_click(page, f_btn, timeout=2500)
                 human_delay(1.0, 1.8)
                 unfriend_btn = page.locator(
                     'div[role="menuitem"]:has-text("إلغاء الصداقة"), '
@@ -1009,14 +1041,14 @@ def cancel_friend_request(page: Page) -> bool:
                     'span:has-text("إلغاء الصداقة"), span:has-text("Unfriend")'
                 ).first
                 if unfriend_btn.is_visible(timeout=2000):
-                    unfriend_btn.click()
+                    _human_act_click(page, unfriend_btn, timeout=2500)
                     human_delay(0.8, 1.5)
                     confirm = page.locator(
                         'div[role="dialog"] div[role="button"]:has-text("تأكيد"), '
                         'div[role="dialog"] div[role="button"]:has-text("Confirm")'
                     ).first
                     if confirm.is_visible(timeout=2000):
-                        confirm.click()
+                        _human_act_click(page, confirm, timeout=2500)
                     print("[+] تم إلغاء الصداقة بنجاح.")
                     human_delay(2.0, 3.5)
                     return True
@@ -1047,7 +1079,7 @@ def follow_profile(page: Page) -> bool:
         try:
             btn = page.locator(sel).first
             if btn.is_visible(timeout=2500):
-                btn.click()
+                _human_act_click(page, btn, timeout=3000)
                 print("[+] تمت متابعة الحساب بنجاح.")
                 human_delay(2.0, 4.0)
                 return True
@@ -1063,7 +1095,7 @@ def follow_profile(page: Page) -> bool:
         try:
             more_menu = page.locator(m_sel).first
             if more_menu.is_visible(timeout=1500):
-                more_menu.click()
+                _human_act_click(page, more_menu, timeout=2500)
                 human_delay(1.0, 2.0)
                 inner_follow = page.locator(
                     'div[role="menuitem"]:has-text("متابعة"), '
@@ -1072,7 +1104,7 @@ def follow_profile(page: Page) -> bool:
                     'span:has-text("Follow")'
                 ).first
                 if inner_follow.is_visible(timeout=2000):
-                    inner_follow.click()
+                    _human_act_click(page, inner_follow, timeout=2500)
                     print("[+] تمت متابعة الحساب عبر القائمة الجانبية بنجاح.")
                     human_delay(2.0, 4.0)
                     return True
@@ -1103,7 +1135,7 @@ def unfollow_profile(page: Page) -> bool:
         try:
             btn = page.locator(sel).first
             if btn.is_visible(timeout=2500):
-                btn.click()
+                _human_act_click(page, btn, timeout=3000)
                 human_delay(1.0, 2.0)
                 menu_unfollow = page.locator(
                     'div[role="menuitem"]:has-text("إلغاء المتابعة"), '
@@ -1112,7 +1144,7 @@ def unfollow_profile(page: Page) -> bool:
                     'span:has-text("Unfollow")'
                 ).first
                 if menu_unfollow.is_visible(timeout=2000):
-                    menu_unfollow.click()
+                    _human_act_click(page, menu_unfollow, timeout=2500)
                 print("[+] تم إلغاء متابعة الحساب بنجاح.")
                 human_delay(2.0, 3.5)
                 return True
@@ -1128,7 +1160,7 @@ def unfollow_profile(page: Page) -> bool:
         try:
             more_menu = page.locator(m_sel).first
             if more_menu.is_visible(timeout=1500):
-                more_menu.click()
+                _human_act_click(page, more_menu, timeout=2500)
                 human_delay(1.0, 2.0)
                 inner_unfollow = page.locator(
                     'div[role="menuitem"]:has-text("إلغاء المتابعة"), '
@@ -1137,7 +1169,7 @@ def unfollow_profile(page: Page) -> bool:
                     'span:has-text("Unfollow")'
                 ).first
                 if inner_unfollow.is_visible(timeout=2000):
-                    inner_unfollow.click()
+                    _human_act_click(page, inner_unfollow, timeout=2500)
                     print("[+] تم إلغاء متابعة الحساب عبر القائمة الجانبية بنجاح.")
                     human_delay(2.0, 3.5)
                     return True
@@ -1201,7 +1233,7 @@ def send_direct_message(page: Page, message_text: str, target_url: str = "") -> 
     opened_via_direct_url = False
     if msg_btn:
         try:
-            msg_btn.click()
+            _human_act_click(page, msg_btn, timeout=3000)
             print("[+] تم النقر على زر المراسلة في ترويسة الحساب، بانتظار فتح المحادثة...")
             human_delay(2.5, 4.0)
         except Exception:
@@ -1260,13 +1292,8 @@ def send_direct_message(page: Page, message_text: str, target_url: str = "") -> 
                     continue
 
         if chat_input:
-            try:
-                chat_input.focus()
-            except Exception:
-                chat_input.click(force=True, timeout=2000)
-            human_delay(0.5, 1.2)
-            page.keyboard.type(message_text, delay=random.randint(45, 85))
-            human_delay(1.0, 2.0)
+            human_type_text(page, chat_input, message_text, clear_existing=False, fast=True)
+            human_delay(0.9, 1.8)
             page.keyboard.press("Enter")
             print(f"[+] تم إرسال الرسالة الخاصة بنجاح عبر ماسنجر: '{message_text}'")
             human_delay(3.0, 4.5)
@@ -1320,7 +1347,7 @@ def block_profile(page: Page) -> bool:
         return False
 
     try:
-        more_btn.click()
+        _human_act_click(page, more_btn, timeout=3000)
         human_delay(1.5, 2.5)
 
         block_item_selectors = [
@@ -1334,7 +1361,7 @@ def block_profile(page: Page) -> bool:
         for sel in block_item_selectors:
             item = page.locator(sel).first
             if item.is_visible(timeout=2000):
-                item.click()
+                _human_act_click(page, item, timeout=2500)
                 clicked_block = True
                 print("[+] تم النقر على خيار 'حظر'. بانتظار نافذة التأكيد...")
                 human_delay(1.5, 3.0)
@@ -1356,7 +1383,7 @@ def block_profile(page: Page) -> bool:
         for sel in confirm_selectors:
             confirm_btn = page.locator(sel).first
             if confirm_btn.is_visible(timeout=3000):
-                confirm_btn.click()
+                _human_act_click(page, confirm_btn, timeout=3000)
                 print("[+] تم تأكيد حظر الحساب بنجاح!")
                 human_delay(2.0, 4.0)
                 return True
@@ -1417,7 +1444,7 @@ def _execute_report_wizard(page: Page, reason: str = "harassment", victim: str =
             print(f"[+] نجاح قطعي: تم الوصول لشاشة تأكيد البلاغ الرسمية في الخطوة {step}!")
             done_btn = dialog.locator('div[role="button"]:has-text("تم"), div[role="button"][aria-label="تم"], div[role="button"]:has-text("Done")').last
             if done_btn.is_visible(timeout=2000):
-                done_btn.click()
+                _human_act_click(page, done_btn, timeout=2500)
                 print("[+] تم النقر على زر 'تم' وإغلاق البلاغ بنجاح.")
                 human_delay(1.5, 2.5)
             return True
@@ -1432,7 +1459,7 @@ def _execute_report_wizard(page: Page, reason: str = "harassment", victim: str =
         submit_btn = dialog.locator('div[role="button"]:has-text("إرسال"), div[role="button"]:has-text("Submit")').last
         if submit_btn.is_visible(timeout=1000):
             print(f"[*] الخطوة {step}: النقر على زر 'إرسال' البلاغ...")
-            submit_btn.click()
+            _human_act_click(page, submit_btn, timeout=2500)
             human_delay(3.0, 4.5)
             continue
 
@@ -1440,7 +1467,7 @@ def _execute_report_wizard(page: Page, reason: str = "harassment", victim: str =
         s1 = dialog.locator('div[role="button"]:has-text("شيء ما حول هذا الملف الشخصي"), span:has-text("شيء ما حول هذا الملف الشخصي")').first
         if s1.is_visible(timeout=1000):
             print(f"[*] الخطوة {step}: تحديد 'شيء ما حول هذا الملف الشخصي'...")
-            s1.click()
+            _human_act_click(page, s1, timeout=2500)
             human_delay(2.0, 3.0)
             continue
 
@@ -1450,7 +1477,7 @@ def _execute_report_wizard(page: Page, reason: str = "harassment", victim: str =
             c_btn = dialog.locator(f'div[role="button"]:has-text("{ct}"), span:has-text("{ct}")').first
             if c_btn.is_visible(timeout=1000):
                 print(f"[*] الخطوة {step}: اختيار سبب البلاغ: '{ct}'...")
-                c_btn.click()
+                _human_act_click(page, c_btn, timeout=2500)
                 cat_clicked = True
                 human_delay(2.0, 3.0)
                 break
@@ -1463,7 +1490,7 @@ def _execute_report_wizard(page: Page, reason: str = "harassment", victim: str =
             v_btn = dialog.locator(f'div[role="button"]:has-text("{vt}"), span:has-text("{vt}")').first
             if v_btn.is_visible(timeout=1000):
                 print(f"[*] الخطوة {step}: تحديد الطرف المتضرر: '{vt}'...")
-                v_btn.click()
+                _human_act_click(page, v_btn, timeout=2500)
                 vic_clicked = True
                 human_delay(2.0, 3.0)
                 break
@@ -1474,7 +1501,7 @@ def _execute_report_wizard(page: Page, reason: str = "harassment", victim: str =
         next_btn = dialog.locator('div[role="button"]:has-text("التالي"), div[role="button"]:has-text("Next")').last
         if next_btn.is_visible(timeout=1000):
             print(f"[*] الخطوة {step}: النقر على 'التالي' للمتابعة...")
-            next_btn.click()
+            _human_act_click(page, next_btn, timeout=2500)
             human_delay(2.0, 3.0)
             continue
 
@@ -1483,7 +1510,7 @@ def _execute_report_wizard(page: Page, reason: str = "harassment", victim: str =
         filtered = [b for b in action_btns if b.is_visible() and b.get_attribute("aria-label") not in ["إغلاق", "Close", "عودة", "Back"]]
         if filtered:
             print(f"[*] الخطوة {step}: تقدم عبر الخيار التلقائي: '{filtered[0].inner_text().strip()[:30]}'...")
-            filtered[0].click()
+            _human_act_click(page, filtered[0], timeout=2500)
             human_delay(2.0, 3.0)
             continue
 
@@ -1537,7 +1564,7 @@ def report_post(page: Page, reason: str = "harassment", victim: str = "me") -> b
             print("[-] تعذر العثور على زر خيارات المنشور (...).")
             return False
 
-        post_more.click()
+        _human_act_click(page, post_more, timeout=3000)
         human_delay(1.5, 2.5)
 
         # النقر على الإبلاغ عن المنشور
@@ -1553,7 +1580,7 @@ def report_post(page: Page, reason: str = "harassment", victim: str = "me") -> b
         for sel in report_selectors:
             item = page.locator(sel).first
             if item.is_visible(timeout=2000):
-                item.click()
+                _human_act_click(page, item, timeout=2500)
                 clicked_rep = True
                 human_delay(2.5, 3.5)
                 break
@@ -1598,7 +1625,7 @@ def report_profile(page: Page, reason: str = "fake", victim: str = "me") -> bool
         return False
 
     try:
-        more_btn.click()
+        _human_act_click(page, more_btn, timeout=3000)
         human_delay(1.5, 2.5)
 
         rep_selectors = [
@@ -1613,7 +1640,7 @@ def report_profile(page: Page, reason: str = "fake", victim: str = "me") -> bool
         for sel in rep_selectors:
             item = page.locator(sel).first
             if item.is_visible(timeout=2000):
-                item.click()
+                _human_act_click(page, item, timeout=2500)
                 clicked_rep = True
                 human_delay(2.5, 3.5)
                 break

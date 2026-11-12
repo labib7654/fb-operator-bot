@@ -4560,6 +4560,17 @@ def execute_mission_worker(chat_id: int, user_id: int):
         target_url = st["target_url"]
         run_issues = []
         done_logs = []
+        consecutive_challenges = 0
+        try:
+            max_consec_challenges = max(2, int(os.environ.get("FB_CONSECUTIVE_CHALLENGE_LIMIT", "3") or "3"))
+        except Exception:
+            max_consec_challenges = 3
+        try:
+            gap_min = max(1.0, float(os.environ.get("FB_MIN_ACCOUNT_GAP", "8") or "8"))
+            gap_max = max(gap_min, float(os.environ.get("FB_MAX_ACCOUNT_GAP", "18") or "18"))
+        except Exception:
+            gap_min, gap_max = 8.0, 18.0
+        circuit_tripped = False
 
         for idx, acc in enumerate(target_accounts, 1):
             # التحقق الفوري أثناء التشغيل تحسباً لحظْر أو سحب الصلاحيات في المنتصف
@@ -4582,10 +4593,17 @@ def execute_mission_worker(chat_id: int, user_id: int):
             with lock, _browser_semaphore:
                 with sync_playwright() as p:
                     try:
-                        ctx = launch_account_browser(p, acc["profile_dir"], visible=False)
+                        acc_proxy = str(acc.get("proxy") or "").strip()
+                        ctx = (
+                            launch_account_browser(p, acc["profile_dir"], visible=False, proxy=acc_proxy)
+                            if acc_proxy
+                            else launch_account_browser(p, acc["profile_dir"], visible=False)
+                        )
                         try:
                             page = ctx.pages[0] if ctx.pages else ctx.new_page()
                             acc_actions = 0
+                            logged = False
+                            challenge_hit_this_acc = False
 
                             def _record_issue(step_lbl: str, fallback_msg: str):
                                 diag = get_page_diag(page) or fallback_msg
@@ -4600,6 +4618,11 @@ def execute_mission_worker(chat_id: int, user_id: int):
                                     f"⚙️ <b>تقدم الخلفية ({idx}/{total_accounts}):</b> {esc(label_acc)} — {step_lbl}"
                                 )
 
+                            can_fix_acc = is_super_admin(user_id) or (
+                                int(acc.get("owner_id") or 0) == int(user_id)
+                                and (has_permission(user_id, "can_add_accounts") or has_permission(user_id, "can_use_accounts"))
+                            )
+
                             is_ck_acc = acc.get("password") == "[SESSION_COOKIES]"
                             logged = auto_login_facebook(
                                 ctx,
@@ -4608,8 +4631,15 @@ def execute_mission_worker(chat_id: int, user_id: int):
                                 "" if is_ck_acc else acc.get("password", ""),
                                 max_wait=35,
                             )
+                            proceed_actions = True
                             if not logged:
                                 login_err = get_login_error(ctx) or "الحساب غير مسجل دخوله أو الجلسة منتهية"
+                                try:
+                                    d_fail = diagnose_facebook_challenge(page)
+                                except Exception:
+                                    d_fail = {}
+                                if d_fail.get("is_challenge") or any(k in login_err.lower() for k in ("recaptcha", "arkose", "checkpoint", "2fa", "تحقق أمان", "تأكيد أنك إنسان")):
+                                    challenge_hit_this_acc = True
                                 run_issues.append(f"• <b>{esc(label_acc)} (الدخول):</b> {esc(login_err)}")
                                 update_live_status(f"⚠️ <b>{esc(label_acc)}:</b> {esc(login_err)}")
                                 try:
@@ -4619,10 +4649,6 @@ def execute_mission_worker(chat_id: int, user_id: int):
                                     }, sync_git=False)
                                 except Exception:
                                     pass
-                                can_fix_acc = is_super_admin(user_id) or (
-                                    int(acc.get("owner_id") or 0) == int(user_id)
-                                    and (has_permission(user_id, "can_add_accounts") or has_permission(user_id, "can_use_accounts"))
-                                )
                                 shot_mk = _build_hitl_action_markup(acc["id"], can_otp=True, can_del=False) if can_fix_acc else None
                                 try:
                                     page.screenshot(path=shot_path)
@@ -4635,20 +4661,36 @@ def execute_mission_worker(chat_id: int, user_id: int):
                                         )
                                 except Exception:
                                     pass
-                                continue
-
-                            if not navigate_to_target(page, target_url):
-                                _record_issue("فتح الرابط", "تعذر فتح الرابط المستهدف أو أنه مقيد/غير متاح")
+                                proceed_actions = False
+                            elif not navigate_to_target(page, target_url):
+                                try:
+                                    d_nav = diagnose_facebook_challenge(page)
+                                except Exception:
+                                    d_nav = {}
+                                nav_reason = d_nav.get("message") or get_page_diag(page) or "تعذر فتح الرابط المستهدف أو أنه مقيد/غير متاح"
+                                if d_nav.get("is_challenge"):
+                                    challenge_hit_this_acc = True
+                                    try:
+                                        update_account(acc["id"], {"diagnostic_reason": nav_reason}, sync_git=False)
+                                    except Exception:
+                                        pass
+                                _record_issue("فتح الرابط", nav_reason)
+                                nav_mk = _build_hitl_action_markup(acc["id"], can_otp=bool(d_nav.get("can_otp")), can_del=False) if (can_fix_acc and d_nav.get("can_hitl")) else None
                                 try:
                                     page.screenshot(path=shot_path)
                                     with open(shot_path, "rb") as shot_file:
-                                        bot.send_photo(chat_id, shot_file, caption=f"❌ <b>لقطة تعذر فتح الرابط ({esc(label_acc)})</b>")
+                                        bot.send_photo(
+                                            chat_id,
+                                            shot_file,
+                                            caption=f"❌ <b>لقطة تعذر فتح الرابط ({esc(label_acc)}):</b>\n{esc(nav_reason)}",
+                                            reply_markup=nav_mk,
+                                        )
                                 except Exception:
                                     pass
-                                continue
+                                proceed_actions = False
 
                             # عمليات مستوى البروفايل (صداقة، متابعة، مراسلة، بلاغ حساب، حظر)
-                            if has_permission(user_id, "can_friend_follow"):
+                            if proceed_actions and has_permission(user_id, "can_friend_follow"):
                                 if st["friend"]:
                                     if send_friend_request(page):
                                         actions_done += 1
@@ -4679,7 +4721,7 @@ def execute_mission_worker(chat_id: int, user_id: int):
                                     else:
                                         _record_issue("إلغاء المتابعة", "لم يتم العثور على زر إلغاء المتابعة")
 
-                            if has_permission(user_id, "can_message") and st["message"] and st["message_text"]:
+                            if proceed_actions and has_permission(user_id, "can_message") and st["message"] and st["message_text"]:
                                 if send_direct_message(page, st["message_text"], target_url=target_url):
                                     actions_done += 1
                                     acc_actions += 1
@@ -4687,7 +4729,7 @@ def execute_mission_worker(chat_id: int, user_id: int):
                                 else:
                                     _record_issue("رسالة خاصة", "تعذر إرسال الرسالة بالماسنجر أو الحساب يمنع الرسائل")
 
-                            if has_permission(user_id, "can_report") and st["report_profile"]:
+                            if proceed_actions and has_permission(user_id, "can_report") and st["report_profile"]:
                                 update_live_status(f"🛡️ <b>جاري تنفيذ بلاغ الحساب بـ {esc(label_acc)}...</b>")
                                 if report_profile(page, reason=st["rep_reason"], victim=st["rep_victim"]):
                                     actions_done += 1
@@ -4696,7 +4738,7 @@ def execute_mission_worker(chat_id: int, user_id: int):
                                 else:
                                     _record_issue("بلاغ حساب", "تعذر إتمام خطوات بلاغ الحساب")
 
-                            if has_permission(user_id, "can_report") and st["block"]:
+                            if proceed_actions and has_permission(user_id, "can_report") and st["block"]:
                                 if block_profile(page):
                                     actions_done += 1
                                     acc_actions += 1
@@ -4706,7 +4748,7 @@ def execute_mission_worker(chat_id: int, user_id: int):
 
                             # عمليات مستوى المنشور والتعليقات
                             on_custom_url = False
-                            if has_permission(user_id, "can_react") and st["like"]:
+                            if proceed_actions and has_permission(user_id, "can_react") and st["like"]:
                                 r_lim = st.get("react_acc_count", 0)
                                 if r_lim == 0 or idx <= r_lim:
                                     r_url = st.get("react_post_url", "").strip()
@@ -4722,7 +4764,7 @@ def execute_mission_worker(chat_id: int, user_id: int):
                                     else:
                                         _record_issue("التفاعل", "لم يتم العثور على المنشور أو زر التفاعل")
 
-                            if has_permission(user_id, "can_comment") and st["comment"] and st["comment_text"]:
+                            if proceed_actions and has_permission(user_id, "can_comment") and st["comment"] and st["comment_text"]:
                                 c_lim = st.get("comment_acc_count", 0)
                                 if c_lim == 0 or idx <= c_lim:
                                     c_url = st.get("comment_post_url", "").strip()
@@ -4744,7 +4786,7 @@ def execute_mission_worker(chat_id: int, user_id: int):
                                     else:
                                         _record_issue("التعليق", "التعليقات مقيدة أو تعذر الوصول لصندوق التعليق")
 
-                            if has_permission(user_id, "can_interact_comments") and st["interact_cmt"]:
+                            if proceed_actions and has_permission(user_id, "can_interact_comments") and st["interact_cmt"]:
                                 if on_custom_url:
                                     navigate_to_target(page, target_url)
                                     on_custom_url = False
@@ -4761,7 +4803,7 @@ def execute_mission_worker(chat_id: int, user_id: int):
                                 else:
                                     _record_issue("رد على تعليق", "لم يتم العثور على التعليق المطابق")
 
-                            if has_permission(user_id, "can_report") and st["report_post"]:
+                            if proceed_actions and has_permission(user_id, "can_report") and st["report_post"]:
                                 if on_custom_url:
                                     navigate_to_target(page, target_url)
                                 update_live_status(f"🛡️ <b>جاري تنفيذ بلاغ المنشور بـ {esc(label_acc)}...</b>")
@@ -4773,22 +4815,43 @@ def execute_mission_worker(chat_id: int, user_id: int):
                                     _record_issue("بلاغ منشور", "تعذر إتمام خطوات بلاغ المنشور")
 
                             # تقليل الإشعارات: إرفاق لقطة الشاشة فقط عند تعذر تنفيذ أي إجراء (0) لتشخيص السبب
-                            if acc_actions == 0:
+                            if proceed_actions and acc_actions == 0:
+                                try:
+                                    d_zero = diagnose_facebook_challenge(page)
+                                except Exception:
+                                    d_zero = {}
+                                if d_zero.get("is_challenge"):
+                                    challenge_hit_this_acc = True
+                                    try:
+                                        update_account(acc["id"], {"diagnostic_reason": d_zero.get("message") or ""}, sync_git=False)
+                                    except Exception:
+                                        pass
+                                zero_mk = _build_hitl_action_markup(acc["id"], can_otp=bool(d_zero.get("can_otp")), can_del=False) if (can_fix_acc and d_zero.get("can_hitl")) else None
+                                zero_reason = d_zero.get("message") or get_page_diag(page) or ""
+                                zero_cap = f"📸 <b>لقطة تشخيصية (0 إجراءات بالحساب):</b> {esc(label_acc)}" + (f"\n{esc(zero_reason)}" if zero_reason else "")
                                 try:
                                     page.screenshot(path=shot_path)
                                     with open(shot_path, "rb") as shot_file:
                                         bot.send_photo(
                                             chat_id,
                                             shot_file,
-                                            caption=f"📸 <b>لقطة تشخيصية (0 إجراءات بالحساب):</b> {esc(label_acc)}"
+                                            caption=zero_cap,
+                                            reply_markup=zero_mk,
                                         )
                                 except Exception:
                                     pass
 
-                            human_delay(1.5, 2.5)
+                            if proceed_actions:
+                                human_delay(1.5, 2.5)
                         finally:
                             try:
-                                if acc_actions > 0:
+                                page_ok = True
+                                if proceed_actions and acc_actions == 0:
+                                    try:
+                                        page_ok = bool(diagnose_facebook_challenge(page).get("is_ok", True))
+                                    except Exception:
+                                        page_ok = True
+                                if acc_actions > 0 or (logged and page_ok):
                                     save_account_storage_state(ctx, acc["profile_dir"])
                             except Exception:
                                 pass
@@ -4796,6 +4859,12 @@ def execute_mission_worker(chat_id: int, user_id: int):
                                 ctx.close()
                             except Exception:
                                 pass
+                            if acc_actions > 0:
+                                consecutive_challenges = 0
+                            elif challenge_hit_this_acc:
+                                consecutive_challenges += 1
+                            else:
+                                consecutive_challenges = 0
                     except Exception as err:
                         err_txt = f"• <b>{esc(label_acc)} (خطأ متصفح):</b> <code>{esc(err)}</code>"
                         run_issues.append(err_txt)
@@ -4807,8 +4876,15 @@ def execute_mission_worker(chat_id: int, user_id: int):
                             except Exception:
                                 pass
 
+            if consecutive_challenges >= max_consec_challenges and idx < total_accounts:
+                circuit_tripped = True
+                run_issues.append(
+                    f"• <b>حماية القطيع:</b> تم إيقاف الموجة عند الحساب ({idx}/{total_accounts}) بعد {consecutive_challenges} فحوصات أمان متتالية لحماية بقية الحسابات."
+                )
+                break
+
             if idx < total_accounts:
-                time.sleep(3)
+                human_delay(gap_min, gap_max)
 
         if actions_done > 0:
             done_block = ""
@@ -4817,17 +4893,27 @@ def execute_mission_worker(chat_id: int, user_id: int):
             notes_block = ""
             if run_issues:
                 notes_block = "\n\n⚠️ <b>ملاحظات لبعض المحاولات:</b>\n" + "\n".join(run_issues[:5])
+            stop_banner = (
+                "\n\n🛡️ <b>تم تفعيل حماية القطيع:</b> أوقف البوت بقية الحسابات مؤقتاً لتفادي فحوصات الأمان المتتالية على نفس الشبكة. "
+                "افتح الشاشة الحية لحل العوائق أو أضف بروكسي <code>FB_PROXY</code>."
+                if circuit_tripped else ""
+            )
             update_live_status(
                 "🎉 <b>اكتملت المهمة بنجاح!</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━\n"
                 f"✅ <b>إجمالي الإجراءات المنفذة:</b> {actions_done}\n"
                 f"👥 <b>الحسابات المشاركة:</b> {total_accounts}"
                 f"{done_block}"
-                f"{notes_block}",
+                f"{notes_block}{stop_banner}",
                 reply_markup=_back_home_markup()
             )
         else:
             reasons_txt = "\n".join(run_issues[:6]) if run_issues else "• لم تتطابق عناصر الصفحة المستهدفة أو الحسابات لم تكن مسجلة."
+            stop_hint = (
+                "🛡️ <i>أوقف البوت بقية الحسابات تلقائياً بعد فحوصات متتالية لحمايتها. حلّها عبر الشاشة الحية أو فعّل بروكسي سكني عبر FB_PROXY.</i>"
+                if circuit_tripped
+                else "💡 <i>تحقق من لقطة الشاشة المرفقة، وافحص الجلسات عبر (🔄 فحص الجلسات) أو تأكد أن الرابط عام ومتاح.</i>"
+            )
             update_live_status(
                 "⚠️ <b>انتهت المهمة دون تنفيذ أي إجراء فعلي (0)</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━\n"
@@ -4835,7 +4921,7 @@ def execute_mission_worker(chat_id: int, user_id: int):
                 f"👥 <b>الحسابات المفحوصة:</b> {total_accounts}\n"
                 "━━━━━━━━━━━━━━━━━━━━\n"
                 f"📋 <b>الأسباب المسجلة:</b>\n{reasons_txt}\n\n"
-                "💡 <i>تحقق من لقطة الشاشة المرفقة، وافحص الجلسات عبر (🔄 فحص الجلسات) أو تأكد أن الرابط عام ومتاح.</i>",
+                f"{stop_hint}",
                 reply_markup=_back_home_markup()
             )
 

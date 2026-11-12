@@ -315,7 +315,7 @@ def diagnose_facebook_challenge(page: Page) -> dict:
             "is_challenge": True,
             "can_otp": False,
             "can_hitl": True,
-            "message": "تحدي تحقق من الإنسان (يرجى تأكيد أنك إنسان / Arkose CAPTCHA) — افتح الشاشة الحية لإكماله بنفسك",
+            "message": "تحدي تحقق من الإنسان (يرجى تأكيد أنك إنسان / Arkose Labs CAPTCHA) — افتح الشاشة الحية لإكماله بنفسك",
         }
 
     if any(x in curr_url for x in ("suspended", "disabled", "/account_status")) or any(
@@ -613,13 +613,24 @@ def launch_account_browser(
                     if (param === 37446) return _r;
                     return getParameterProto.apply(this, arguments);
                 };
-                if (typeof WebGL2RenderingContext !== 'undefined') {
-                    const getParameterProto2 = WebGL2RenderingContext.prototype.getParameter;
-                    WebGL2RenderingContext.prototype.getParameter = function(param) {
-                        if (param === 37445) return _v;
-                        if (param === 37446) return _r;
-                        return getParameterProto2.apply(this, arguments);
-                    };
+                    if (typeof WebGL2RenderingContext !== 'undefined') {
+                        const getParameterProto2 = WebGL2RenderingContext.prototype.getParameter;
+                        WebGL2RenderingContext.prototype.getParameter = function(param) {
+                            if (param === 37445) return _v;
+                            if (param === 37446) return _r;
+                            return getParameterProto2.apply(this, arguments);
+                        };
+                    }
+            } catch (e) {}
+
+            try {
+                if (navigator.permissions && navigator.permissions.query) {
+                    const origQuery = navigator.permissions.query.bind(navigator.permissions);
+                    navigator.permissions.query = (params) => (
+                        params && params.name === 'notifications'
+                            ? Promise.resolve({ state: Notification.permission === 'denied' ? 'prompt' : Notification.permission })
+                            : origQuery(params)
+                    );
                 }
             } catch (e) {}
         }
@@ -712,44 +723,74 @@ def _curved_mouse_move(page: Page, tx: float, ty: float) -> None:
         pass
 
 
-def _human_type_text(page: Page, locator, text: str) -> None:
-    """كتابة بشرية حقيقية بتوقيت متغير لكل حرف وتوقفات طبيعية دون مسح برمجي فجائي"""
+def human_type_text(page: Page, locator, text: str, clear_existing: bool = False, fast: bool = False) -> None:
+    """كتابة بشرية متدرجة الإيقاع على الحقول العادية ومربعات contenteditable مع إزاحة بصرية طبيعية"""
     human_click(page, locator, timeout=3000)
-    time.sleep(random.uniform(0.28, 0.65))
-    try:
-        existing = locator.input_value(timeout=800)
-    except Exception:
+    time.sleep(random.uniform(0.22, 0.52) if fast else random.uniform(0.28, 0.65))
+    if clear_existing:
         existing = ""
-    if existing:
         try:
-            page.keyboard.press("Control+a")
-            time.sleep(random.uniform(0.08, 0.18))
-            page.keyboard.press("Backspace")
-            time.sleep(random.uniform(0.15, 0.35))
+            existing = locator.input_value(timeout=600)
         except Exception:
-            locator.fill("")
+            try:
+                existing = (locator.inner_text(timeout=600) or "").strip()
+            except Exception:
+                existing = ""
+        if existing:
+            try:
+                page.keyboard.press("Control+a")
+                time.sleep(random.uniform(0.08, 0.18))
+                page.keyboard.press("Backspace")
+                time.sleep(random.uniform(0.15, 0.35))
+            except Exception:
+                try:
+                    locator.fill("")
+                except Exception:
+                    pass
 
-    for idx, ch in enumerate(text):
+    chunk_pause = random.randint(5, 9)
+    for idx, ch in enumerate(str(text or "")):
         page.keyboard.type(ch)
-        if ch in ("@", ".", "_", "-", "+"):
-            time.sleep(random.uniform(0.15, 0.30))
-        elif idx > 0 and idx % random.randint(5, 8) == 0:
-            time.sleep(random.uniform(0.12, 0.25))
+        if ch in ("@", ".", "_", "-", "+", "،", "؟", "!", "\n"):
+            time.sleep(random.uniform(0.10, 0.22) if fast else random.uniform(0.15, 0.30))
+        elif ch == " ":
+            time.sleep(random.uniform(0.06, 0.14) if fast else random.uniform(0.09, 0.18))
+        elif idx > 0 and idx % chunk_pause == 0:
+            chunk_pause = random.randint(5, 9)
+            time.sleep(random.uniform(0.09, 0.19) if fast else random.uniform(0.12, 0.25))
         else:
-            time.sleep(random.uniform(0.045, 0.145))
+            time.sleep(random.uniform(0.028, 0.095) if fast else random.uniform(0.045, 0.145))
 
 
-def _warmup_human_presence(page: Page) -> None:
-    """تمهيد حركي وتصفح طبيعي قبل لمس نموذج الدخول"""
+def _human_type_text(page: Page, locator, text: str) -> None:
+    """الاسم الداخلي المحفوظ للتوافق مع نموذج تسجيل الدخول"""
+    human_type_text(page, locator, text, clear_existing=True, fast=False)
+
+
+def _warmup_human_presence(page: Page, feed_browse: bool = False) -> None:
+    """تمهيد حركي وتصفح طبيعي للخلاصة قبل الدخول أو تنفيذ أي إجراء"""
     try:
-        vw = (page.viewport_size or {}).get("width", 1280)
-        vh = (page.viewport_size or {}).get("height", 800)
-        _curved_mouse_move(page, random.uniform(vw * 0.25, vw * 0.68), random.uniform(vh * 0.22, vh * 0.52))
-        time.sleep(random.uniform(0.45, 0.95))
-        page.mouse.wheel(0, random.randint(50, 130))
-        time.sleep(random.uniform(0.45, 0.9))
-        page.mouse.wheel(0, -random.randint(50, 130))
-        time.sleep(random.uniform(0.35, 0.7))
+        if not hasattr(page, "mouse") or not hasattr(page.mouse, "wheel"):
+            return
+        vp = getattr(page, "viewport_size", None) or {}
+        vw = float(vp.get("width", 1280))
+        vh = float(vp.get("height", 800))
+        _curved_mouse_move(page, random.uniform(vw * 0.22, vw * 0.68), random.uniform(vh * 0.20, vh * 0.55))
+        time.sleep(random.uniform(0.35, 0.75))
+        if feed_browse:
+            for _ in range(random.randint(2, 3)):
+                page.mouse.wheel(0, random.randint(220, 460))
+                time.sleep(random.uniform(0.55, 1.15))
+                if random.random() < 0.4:
+                    _curved_mouse_move(page, random.uniform(vw * 0.20, vw * 0.72), random.uniform(vh * 0.24, vh * 0.65))
+            if random.random() < 0.5:
+                page.mouse.wheel(0, -random.randint(90, 190))
+                time.sleep(random.uniform(0.35, 0.75))
+        else:
+            page.mouse.wheel(0, random.randint(50, 130))
+            time.sleep(random.uniform(0.45, 0.9))
+            page.mouse.wheel(0, -random.randint(50, 130))
+            time.sleep(random.uniform(0.35, 0.7))
     except Exception:
         pass
 
@@ -783,6 +824,7 @@ def auto_login_facebook(context: BrowserContext, page: Page, email: str, passwor
         diag = diagnose_facebook_challenge(page)
         is_still_logged, _ = check_facebook_login_cookies(context)
         if is_still_logged and diag["is_ok"]:
+            _warmup_human_presence(page, feed_browse=True)
             save_account_storage_state(context)
             log("تم التحقق من الجلسة الحية: الحساب نشط ومسجل دخوله بنجاح.")
             return True
@@ -806,6 +848,7 @@ def auto_login_facebook(context: BrowserContext, page: Page, email: str, passwor
     diag_after = diagnose_facebook_challenge(page)
     is_logged, _ = check_facebook_login_cookies(context)
     if is_logged and diag_after["is_ok"]:
+        _warmup_human_presence(page, feed_browse=True)
         save_account_storage_state(context)
         log("تم التحقق من الجلسة، الحساب مسجل دخوله بالفعل.")
         return True
