@@ -20,6 +20,7 @@ from telebot import types
 
 from fb_operator.webapp_ui import get_miniapp_html
 from fb_operator.state_events import get_seq, publish_event, wait_for_relevant_events
+import fb_operator.admin_manager as adm
 import fb_operator.economy_manager as eco
 import fb_operator.hitl_manager as hitl
 
