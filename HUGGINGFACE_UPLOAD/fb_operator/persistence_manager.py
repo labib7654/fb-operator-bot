@@ -38,6 +38,9 @@ WHITELIST_JSON_FILES = (
     "ui_states.json",
     "proxies.json",
     "announcements.json",
+    "feature_gates.json",
+    "temp_emails.json",
+    "trash_emails.json",
 )
 
 _SESSION_ENTRY_RE = re.compile(r"^sessions/(acc_\d+)\.json$")
@@ -334,11 +337,15 @@ def _active_paths() -> tuple[dict[str, Path], Path, Path]:
     raw_ui = Path(cfg_m.UI_STATES_FILE)
     raw_proxies = Path(getattr(cfg_m, "PROXIES_FILE", Path(cfg_m.DATA_DIR) / "proxies.json"))
     raw_ann = Path(getattr(cfg_m, "ANNOUNCEMENTS_FILE", Path(cfg_m.DATA_DIR) / "announcements.json"))
+    raw_temp = Path(getattr(cfg_m, "TEMP_EMAILS_FILE", Path(cfg_m.DATA_DIR) / "temp_emails.json"))
+    raw_trash = Path(getattr(cfg_m, "TRASH_EMAILS_FILE", Path(cfg_m.DATA_DIR) / "trash_emails.json"))
     base_data_dir = Path(cfg_m.DATA_DIR)
     meta_path = (active_data_dir / "backup_meta.json") if (raw_meta.parent == base_data_dir and active_data_dir != base_data_dir) else raw_meta
     ui_path = (active_data_dir / "ui_states.json") if (raw_ui.parent == base_data_dir and active_data_dir != base_data_dir) else raw_ui
     proxies_path = (active_data_dir / "proxies.json") if (raw_proxies.parent == base_data_dir and active_data_dir != base_data_dir) else raw_proxies
     ann_path = (active_data_dir / "announcements.json") if (raw_ann.parent == base_data_dir and active_data_dir != base_data_dir) else raw_ann
+    temp_path = (active_data_dir / "temp_emails.json") if (raw_temp.parent == base_data_dir and active_data_dir != base_data_dir) else raw_temp
+    trash_path = (active_data_dir / "trash_emails.json") if (raw_trash.parent == base_data_dir and active_data_dir != base_data_dir) else raw_trash
 
     json_map = {
         "accounts.json": Path(acc_m.ACCOUNTS_FILE),
@@ -352,6 +359,8 @@ def _active_paths() -> tuple[dict[str, Path], Path, Path]:
         "ui_states.json": ui_path,
         "proxies.json": proxies_path,
         "announcements.json": ann_path,
+        "temp_emails.json": temp_path,
+        "trash_emails.json": trash_path,
     }
     profiles_dir = Path(acc_m.PROFILES_DIR)
     sessions_dir = Path(acc_m.SESSIONS_DIR)
@@ -587,9 +596,12 @@ def _parse_and_validate_backup_zip(raw_bytes: bytes) -> dict:
                         parsed = json.loads(content.decode("utf-8"))
                     except Exception:
                         return {"ok": False, "error": f"ملف JSON تالف داخل النسخة: {clean_name}"}
-                    if clean_name in ("accounts.json", "audit_logs.json", "points_ledger.json", "invite_codes.json", "support_tickets.json") and not isinstance(parsed, list):
-                        return {"ok": False, "error": f"بنية غير صحيحة للملف: {clean_name}"}
-                    if clean_name in ("users.json", "economy_settings.json", "backup_meta.json", "ui_states.json", "proxies.json", "announcements.json") and not isinstance(parsed, dict):
+                    if clean_name in ("accounts.json", "audit_logs.json", "points_ledger.json", "invite_codes.json", "support_tickets.json", "trash_emails.json") and not isinstance(parsed, list):
+                        if clean_name == "trash_emails.json" and isinstance(parsed, dict):
+                            pass  # Allow dict wrapper if exported that way
+                        else:
+                            return {"ok": False, "error": f"بنية غير صحيحة للملف: {clean_name}"}
+                    if clean_name in ("users.json", "economy_settings.json", "backup_meta.json", "ui_states.json", "proxies.json", "announcements.json", "temp_emails.json") and not isinstance(parsed, dict):
                         return {"ok": False, "error": f"بنية غير صحيحة للملف: {clean_name}"}
                     staged_json[clean_name] = content
                 else:
@@ -776,6 +788,8 @@ def _merge_staged_payload(staged_json: dict[str, bytes], staged_sessions: dict[s
         cur_meta: dict = _safe_parse(json_map["backup_meta.json"].read_bytes() if json_map["backup_meta.json"].exists() else None, {})
         cur_proxies: dict = _safe_parse(json_map["proxies.json"].read_bytes() if json_map["proxies.json"].exists() else None, {})
         cur_ann: dict = _safe_parse(json_map["announcements.json"].read_bytes() if json_map["announcements.json"].exists() else None, {})
+        cur_temp: dict = _safe_parse(json_map["temp_emails.json"].read_bytes() if json_map["temp_emails.json"].exists() else None, {})
+        cur_trash: list = _safe_parse(json_map["trash_emails.json"].read_bytes() if json_map["trash_emails.json"].exists() else None, [])
 
         inc_accounts = _safe_parse(staged_json.get("accounts.json"), [])
         inc_users = _safe_parse(staged_json.get("users.json"), {})
@@ -788,6 +802,8 @@ def _merge_staged_payload(staged_json: dict[str, bytes], staged_sessions: dict[s
         inc_meta = _safe_parse(staged_json.get("backup_meta.json"), {})
         inc_proxies = _safe_parse(staged_json.get("proxies.json"), {})
         inc_ann = _safe_parse(staged_json.get("announcements.json"), {})
+        inc_temp = _safe_parse(staged_json.get("temp_emails.json"), {})
+        inc_trash = _safe_parse(staged_json.get("trash_emails.json"), [])
 
         stats = {
             "accounts_added": 0,
@@ -803,6 +819,8 @@ def _merge_staged_payload(staged_json: dict[str, bytes], staged_sessions: dict[s
             "ui_states_added": 0,
             "announcements_added": 0,
             "proxies_added": 0,
+            "temp_emails_merged": 0,
+            "trash_emails_merged": 0,
         }
 
         # 1) دمج الحسابات والجلسات مع إعادة ترقيم التصادمات
@@ -1169,6 +1187,37 @@ def _merge_staged_payload(staged_json: dict[str, bytes], staged_sessions: dict[s
                     stats["announcements_added"] += 1
             cur_ann["announcements"] = cur_a_list[-100:]
             _atomic_write_bytes(json_map["announcements.json"], json.dumps(cur_ann, ensure_ascii=False, indent=2).encode("utf-8"))
+
+        if inc_temp and isinstance(inc_temp, dict):
+            if not isinstance(cur_temp, dict):
+                cur_temp = {"users": {}, "history": [], "seen_messages": {}}
+            cur_temp.setdefault("users", {})
+            cur_temp.setdefault("history", [])
+            cur_temp.setdefault("seen_messages", {})
+            for uid, mb in (inc_temp.get("users") or {}).items():
+                if uid not in cur_temp["users"] and isinstance(mb, dict):
+                    cur_temp["users"][uid] = mb
+                    stats["temp_emails_merged"] += 1
+            seen_hist_emails = {h.get("email", "").lower() for h in cur_temp["history"] if isinstance(h, dict) and h.get("email")}
+            for h in (inc_temp.get("history") or []):
+                if isinstance(h, dict) and h.get("email") and h.get("email").lower() not in seen_hist_emails:
+                    cur_temp["history"].append(h)
+                    seen_hist_emails.add(h.get("email").lower())
+                    stats["temp_emails_merged"] += 1
+            cur_temp["history"] = cur_temp["history"][:300]
+            _atomic_write_bytes(json_map["temp_emails.json"], json.dumps(cur_temp, ensure_ascii=False, indent=2).encode("utf-8"))
+
+        if inc_trash:
+            inc_trash_list = inc_trash.get("trash", []) if isinstance(inc_trash, dict) else (inc_trash if isinstance(inc_trash, list) else [])
+            cur_trash_list = cur_trash.get("trash", []) if isinstance(cur_trash, dict) else (cur_trash if isinstance(cur_trash, list) else [])
+            seen_trash = {t.get("email", "").lower() for t in cur_trash_list if isinstance(t, dict) and t.get("email")}
+            for t in inc_trash_list:
+                if isinstance(t, dict) and t.get("email") and t.get("email").lower() not in seen_trash:
+                    cur_trash_list.append(t)
+                    seen_trash.add(t.get("email").lower())
+                    stats["trash_emails_merged"] += 1
+            cur_trash_list = cur_trash_list[:200]
+            _atomic_write_bytes(json_map["trash_emails.json"], json.dumps(cur_trash_list, ensure_ascii=False, indent=2).encode("utf-8"))
 
         docs_now, sess_now = _collect_snapshot_unlocked(json_map, sessions_dir)
         cloud_db.write_local_sqlite_mirror(docs_now, sess_now)
@@ -1930,6 +1979,8 @@ def get_persistence_status() -> dict:
         "tickets_count": _safe_json_len(json_map["support_tickets.json"], list),
         "audit_count": _safe_json_len(json_map["audit_logs.json"], list),
         "ui_states_count": _safe_json_len(json_map["ui_states.json"], dict),
+        "temp_emails_count": _safe_json_len(json_map["temp_emails.json"], dict),
+        "trash_emails_count": _safe_json_len(json_map["trash_emails.json"], list),
         "backup_channel": bkp_cfg,
         "cloud_db": cloud_db.get_cloud_db_status_summary(),
         "last_backup_iso": bkp_cfg.get("last_channel_backup_iso") or _last_backup_iso or "لم يُصدر بعد في هذه الجلسة",

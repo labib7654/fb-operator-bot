@@ -138,6 +138,7 @@ def _normalize_settings(raw: dict | None) -> dict:
         "suppliers_can_invite": bool(raw.get("suppliers_can_invite", True)),
         "invited_suppliers_can_invite": bool(raw.get("invited_suppliers_can_invite", True)),
         "public_allow_report": bool(raw.get("public_allow_report", False)),
+        "public_account_addition": bool(raw.get("public_account_addition", True)),
         "referral_trigger": ref_trigger,
         "yer_per_point": _clamp_int(raw.get("yer_per_point", 10), 10, 1, 1000000),
         "active_account_reward": _clamp_int(raw.get("active_account_reward", 1), 1, 0, 10000),
@@ -167,6 +168,7 @@ def update_economy_settings(patch: dict, actor_uid: int = 0) -> dict:
                 "suppliers_can_invite",
                 "invited_suppliers_can_invite",
                 "public_allow_report",
+                "public_account_addition",
             ):
                 if bool_k in patch:
                     cur[bool_k] = bool(patch[bool_k])

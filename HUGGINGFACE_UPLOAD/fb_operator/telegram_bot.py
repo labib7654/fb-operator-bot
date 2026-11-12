@@ -31,6 +31,7 @@ import time
 import atexit
 import signal
 import secrets
+import hashlib
 import tempfile
 import threading
 from datetime import datetime
@@ -150,8 +151,14 @@ from fb_operator.economy_manager import (
     redeem_invite_code, build_user_settlement_snapshot, create_support_ticket,
     reply_support_ticket, settle_payout, list_support_tickets, get_ticket_by_id,
 )
+from fb_operator.feature_gates import (
+    load_feature_gates, get_feature, list_features, is_feature_accessible,
+    get_feature_cost, update_feature_gate, register_custom_feature,
+    add_allowed_user, remove_allowed_user,
+)
+import fb_operator.tempmail_manager as tm_m
 
-BOT_TOKEN = (os.environ.get("BOT_TOKEN") or "").strip() or "8798272294:AAGzBDYCu3B9tks46u3_U0mxsH9r0Olofzg"
+BOT_TOKEN = (os.environ.get("BOT_TOKEN") or "").strip() or "9257479294:AAGFsE7uOQX_CoazLDrkAnbZaN4IQ6DB9Xg"
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML", threaded=True, num_threads=32)
 _bot_username_cache = ""
@@ -1119,6 +1126,521 @@ def _render_announcement_detail_view(ann_id: str) -> tuple[str, types.InlineKeyb
     return txt, mk
 
 
+# ----------------- قسم أدوات فيسبوك المجمعة ودليل الأرباح وبوابات الميزات -----------------
+
+def render_fb_tools_text(user_id: int) -> str:
+    """واجهة مجمعة لجميع تفاعلات وأدوات فيسبوك لتقليل الزحام والتشويش في القائمة الرئيسية"""
+    st = get_user_state(user_id)
+    lines = [
+        "📘 <b>أدوات ومهام تفاعل فيسبوك | Facebook Tools</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"🎯 <b>الرابط المستهدف:</b> <code>{esc(st.get('target_url', '')[:55])}</code>",
+    ]
+    p_use = is_super_admin(user_id) or has_permission(user_id, "can_use_accounts")
+    usable_accs = get_usable_accounts_for_user(user_id) if p_use else []
+    sel_name = "جميع الحسابات المتاحة"
+    if st.get("selected_acc") == "multi":
+        sel_name = f"{len(st.get('selected_accs') or [])} حسابات محددة"
+    elif st.get("selected_acc") != "all":
+        matched = next((a for a in usable_accs if a["id"] == st.get("selected_acc")), None)
+        sel_name = matched["name"] if matched else "جميع الحسابات"
+    lines.append(f"👤 <b>الحساب المنفذ:</b> {esc(sel_name)}")
+
+    react_ico = "✅" if st.get("like") else "❌"
+    react_type = REACTION_ICONS.get(st.get("reaction_type"), "👍 إعجاب")
+    p_tag = "رابط مخصص" if st.get("react_post_url") else f"منشور {st.get('react_post_index', 1)}"
+    lines.append(f"💖 <b>التفاعل:</b> {react_type} [{react_ico}] ({p_tag})")
+
+    cmt_ico = "✅" if st.get("comment") else "❌"
+    c_snip = esc((st.get("comment_text") or "").strip()[:30]) or "بدون نص"
+    lines.append(f"💬 <b>التعليق:</b> '{c_snip}' [{cmt_ico}] (منشور {st.get('comment_post_index', 1)})")
+
+    int_ico = "✅" if st.get("interact_cmt") else "❌"
+    lines.append(f"🎯 <b>الرد على تعليق محدد:</b> [{int_ico}]")
+
+    fr_ico = "✅" if st.get("friend") else "❌"
+    fl_ico = "✅" if st.get("follow") else "❌"
+    lines.append(f"👥 <b>طلب صداقة:</b> [{fr_ico}] | 🔔 <b>متابعة:</b> [{fl_ico}]")
+
+    msg_ico = "✅" if st.get("message") else "❌"
+    m_snip = esc((st.get("message_text") or "").strip()[:20]) or "بدون نص"
+    lines.append(f"✉️ <b>رسالة خاصة:</b> '{m_snip}' [{msg_ico}]")
+
+    rep_p = "✅" if st.get("report_post") else "❌"
+    rep_u = "✅" if st.get("report_profile") else "❌"
+    blk = "✅" if st.get("block") else "❌"
+    lines.append(f"🛡️ <b>بلاغ منشور:</b> [{rep_p}] | 🛡️ <b>بلاغ حساب:</b> [{rep_u}] | 🚫 <b>حظر:</b> [{blk}]")
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append("🎛️ <i>اضغط على أي أداة لتفعيلها [✅] أو تعديل نصها وخياراتها:</i>")
+    return "\n".join(lines)
+
+
+def render_fb_tools_markup(user_id: int) -> types.InlineKeyboardMarkup:
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    st = get_user_state(user_id)
+    is_dev = is_super_admin(user_id)
+
+    p_use = is_dev or has_permission(user_id, "can_use_accounts")
+    p_react = is_dev or has_permission(user_id, "can_react")
+    p_cmt = is_dev or has_permission(user_id, "can_comment")
+    p_int = is_dev or has_permission(user_id, "can_interact_comments")
+    p_fr = is_dev or has_permission(user_id, "can_friend_follow")
+    p_msg = is_dev or has_permission(user_id, "can_message")
+    p_rep = is_dev or has_permission(user_id, "can_report")
+    p_exec = is_dev or has_permission(user_id, "can_execute")
+
+    usable_accs = get_usable_accounts_for_user(user_id) if p_use else []
+    sel_name = "جميع الحسابات"
+    if st.get("selected_acc") == "multi":
+        sel_name = f"{len(st.get('selected_accs') or [])} محددة"
+    elif st.get("selected_acc") != "all":
+        matched = next((a for a in usable_accs if a["id"] == st.get("selected_acc")), None)
+        sel_name = matched["name"] if matched else "جميع الحسابات"
+
+    markup.row(
+        types.InlineKeyboardButton(f"👤 المنفذ: {sel_name}", callback_data="menu_select_acc"),
+        types.InlineKeyboardButton("🔗 تعديل الرابط المستهدف", callback_data="menu_set_url")
+    )
+    if p_react:
+        like_st = "✅" if st.get("like") else "❌"
+        react_lbl = REACTION_ICONS.get(st.get("reaction_type"), "👍 إعجاب")
+        p_tag = "رابط مخصص" if st.get("react_post_url") else f"منشور {st.get('react_post_index', 1)}"
+        markup.row(
+            types.InlineKeyboardButton(f"{react_lbl} [{like_st}]", callback_data="toggle_react_main"),
+            types.InlineKeyboardButton(f"⚙️ خيارات ({p_tag})", callback_data="menu_wizard_react")
+        )
+    if p_cmt:
+        cmt_st = "✅" if st.get("comment") else "❌"
+        c_tag = "رابط مخصص" if st.get("comment_post_url") else f"منشور {st.get('comment_post_index', 1)}"
+        markup.row(
+            types.InlineKeyboardButton(f"💬 تعليق [{cmt_st}]", callback_data="toggle_comment_main"),
+            types.InlineKeyboardButton(f"✏️ نص ومنشور ({c_tag})", callback_data="menu_wizard_comment")
+        )
+    if p_int:
+        cmt_int_tag = "✅" if st.get("interact_cmt") else "❌"
+        markup.row(
+            types.InlineKeyboardButton(f"🎯 رد على تعليق [{cmt_int_tag}]", callback_data="toggle_cmt_int_main"),
+            types.InlineKeyboardButton("⚙️ هدف الرد", callback_data="menu_cmt_interact")
+        )
+    if p_fr:
+        fr_tag = "✅" if st.get("friend") else "❌"
+        fl_tag = "✅" if st.get("follow") else "❌"
+        markup.row(
+            types.InlineKeyboardButton(f"➕ طلب صداقة [{fr_tag}]", callback_data="toggle_friend"),
+            types.InlineKeyboardButton(f"🔔 متابعة [{fl_tag}]", callback_data="toggle_follow")
+        )
+        cfr_tag = "✅" if st.get("cancel_friend") else "❌"
+        unfl_tag = "✅" if st.get("unfollow") else "❌"
+        markup.row(
+            types.InlineKeyboardButton(f"❌ إلغاء الصداقة [{cfr_tag}]", callback_data="toggle_cancel_friend"),
+            types.InlineKeyboardButton(f"🔕 إلغاء المتابعة [{unfl_tag}]", callback_data="toggle_unfollow")
+        )
+    if p_msg:
+        msg_st = "✅" if st.get("message") else "❌"
+        raw_m = (st.get("message_text") or "").strip()
+        msg_snip = (raw_m[:12] + "..") if len(raw_m) > 12 else (raw_m or "بدون نص")
+        markup.row(
+            types.InlineKeyboardButton(f"✉️ رسالة خاصة [{msg_st}]", callback_data="toggle_msg_main"),
+            types.InlineKeyboardButton(f"✏️ النص ({msg_snip})", callback_data="menu_wizard_message")
+        )
+    if p_rep:
+        rep_p_tag = "✅" if st.get("report_post") else "❌"
+        rep_u_tag = "✅" if st.get("report_profile") else "❌"
+        markup.row(
+            types.InlineKeyboardButton(f"🛡️ بلاغ منشور [{rep_p_tag}]", callback_data="toggle_rep_post"),
+            types.InlineKeyboardButton(f"🛡️ بلاغ حساب [{rep_u_tag}]", callback_data="toggle_rep_profile")
+        )
+        blk_tag = "✅" if st.get("block") else "❌"
+        markup.row(
+            types.InlineKeyboardButton(f"🚫 حظر الحساب [{blk_tag}]", callback_data="toggle_block"),
+            types.InlineKeyboardButton("⚙️ تفاصيل البلاغ والسبب", callback_data="menu_rep_config")
+        )
+    if p_exec:
+        wait_ico = "✅" if st.get("wait_for_hitl", True) else "❌"
+        markup.row(
+            _btn("🚀 بدء تنفيذ المهام الآن", style="success", icon_key="rocket", callback_data="action_launch"),
+            _btn(f"⏳ انتظار التحقق [{wait_ico}]", style="primary" if st.get("wait_for_hitl", True) else None, callback_data="toggle_wait_hitl"),
+        )
+    markup.row(types.InlineKeyboardButton("🔙 العودة للوحة الرئيسية", callback_data="back_to_main"))
+    return markup
+
+
+def render_fb_tools_text_and_markup(user_id: int) -> tuple[str, types.InlineKeyboardMarkup]:
+    return render_fb_tools_text(user_id), render_fb_tools_markup(user_id)
+
+
+def render_earn_guide_text(user_id: int) -> str:
+    """دليل مبسط بشري يشرح فكرة التوريد والربح بالريال اليمني بوضوح تام"""
+    eco = load_economy_settings()
+    act_rew = int(eco.get("active_account_reward", 1) or 1)
+    y_per_pt = int(eco.get("yer_per_point", 10) or 10)
+    ref_rew = int(eco.get("referral_reward", 4) or 4)
+    inc_yer = int(eco.get("incomplete_account_yer", 5) or 5)
+
+    return (
+        "💡 <b>دليل إنشاء حسابات فيسبوك وكسب الأرباح | Guide & Earnings</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "👋 <b>أهلاً بك يا بطل! الفكرة بكل بساطة:</b>\n"
+        "البوت يشتري منك حسابات فيسبوك صالحة لاستخدامها في التفاعل والمهام، ويدفع لك فوراً بالريال اليمني أو النقاط لكل حساب تضيفه ويعمل بنجاح.\n\n"
+        "💰 <b>جدول الأرباح والأسعار:</b>\n"
+        f"• 🌟 <b>الحساب المكتمل عالي الجودة:</b> <b>{act_rew * y_per_pt} ريال يمني</b> (+{act_rew} نقطة) فوراً!\n"
+        "  <i>(المواصفات: اسم عربي ثلاثي، صورة شخصية، غلاف، سيرة ذاتية، ومنشورين على الأقل).</i>\n"
+        f"• ⚠️ <b>الحسابات المنشأة حديثاً:</b> تحتسب بـ <b>{inc_yer} ر.ي</b> بعد 5 إنذارات، ويمكنك إكمال بروفايلها لرفع سعرك إلى {act_rew * y_per_pt} ر.ي دائماً.\n"
+        f"• 🎁 <b>أرباح دعوة الأصدقاء:</b> تكسب <b>+{ref_rew * y_per_pt} ريال</b> (+{ref_rew} نقاط) عند أول حساب نشط يضيفه كل شخص تدعوه عبر كودك!\n\n"
+        "🛠️ <b>خطوات إنشاء حسابات مقبولة وسريعة:</b>\n"
+        "1. افتح تطبيق فيسبوك أو المتصفح.\n"
+        "2. أنشئ حساباً باسم ثلاثي عربي طبيعي (مثال: أحمد عبد الله، محمد غالب).\n"
+        "3. ضع صورة شخصية عادية وصورة غلاف من هاتفك.\n"
+        "4. انشر منشورين بسيطين (أدعية، صور طبيعية، تحية).\n"
+        "5. احفظ الإيميل أو رقم الهاتف وكلمة المرور.\n\n"
+        "📥 <b>طريقة إضافة الحساب واستلام أرباحك:</b>\n"
+        "1. اضغط زر <b>[➕ إضافة حساب فيسبوك]</b> أدناه.\n"
+        "2. أدخل اسماً للحساب، ثم الإيميل، ثم كلمة المرور.\n"
+        "3. سيفحص البوت الحساب؛ فإذا كان مباشراً يُضاف لرصيدك فوراً!\n"
+        "4. إذا طلب فيسبوك تأكيد لغز إنسان، سيفتح لك البوت <b>[الشاشة الحية]</b> على جوالك لتحله بيدك بوضوح، وفور نجاحه يُسجل الحساب وتكسب أرباحك!\n\n"
+        "💵 <b>كيف تستلم فلوسك؟</b>\n"
+        "• اضغط <b>[💰 محفظتي وسجل أرباحي]</b> لمعاينة رصيدك.\n"
+        "• اضغط <b>[💵 سحب الأرباح والتواصل مع المطور]</b> لتحديد طريقة التحويل (الكريمي، النجم، أو محفظة جوال) ويتم تحويل فلوسك فوراً!"
+    )
+
+
+def render_earn_guide_markup(user_id: int) -> types.InlineKeyboardMarkup:
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.row(
+        types.InlineKeyboardButton("➕ إضافة حساب فيسبوك الآن", callback_data="act_add_acc"),
+        types.InlineKeyboardButton("💰 محفظتي وسجل أرباحي", callback_data="menu_wallet")
+    )
+    markup.row(
+        types.InlineKeyboardButton("💵 سحب الأرباح والتواصل مع المطور", callback_data="menu_support"),
+        types.InlineKeyboardButton("🎁 روابط الدعوة وكسب الأرباح", callback_data="menu_referral")
+    )
+    markup.row(types.InlineKeyboardButton("🔙 العودة للوحة الرئيسية", callback_data="back_to_main"))
+    return markup
+
+
+def render_earn_guide_text_and_markup(user_id: int) -> tuple[str, types.InlineKeyboardMarkup]:
+    return render_earn_guide_text(user_id), render_earn_guide_markup(user_id)
+
+
+def render_feature_gates_text(user_id: int) -> str:
+    """عرض لوحة التحكم المركزية ببوابات الميزات للمطور والأدمن"""
+    gates = load_feature_gates()
+    lines = [
+        "🎛️ <b>إدارة وبوابات الميزات (Feature Gates)</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "تحكم سيادي كامل بظهور وتسعير وصلاحية كل ميزة حالية أو مستقبلية:",
+        "• 🌍 <b>عامة:</b> متاحة ومفتوحة لجميع المستخدمين.",
+        "• 👑 <b>إدارة:</b> مقتصرة على المطور الرئيسي ونوابه فقط.",
+        "• 👥 <b>محددين:</b> مقيدة بأرقام معرفات (User IDs) تختارها بنفسك.",
+        "• 💰 <b>التسعير:</b> مجانية أو تخصم نقاطاً بالريال اليمني عند الاستخدام.",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"📦 <b>عدد الميزات المسجلة:</b> {len(gates)} ميزة"
+    ]
+    return "\n".join(lines)
+
+
+def render_feature_gates_markup(user_id: int) -> types.InlineKeyboardMarkup:
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    gates = load_feature_gates()
+    scope_labels = {"public": "🌍 عامة", "admins": "👑 إدارة", "specific": "👥 محددين"}
+    for fid, f in gates.items():
+        sc = scope_labels.get(f.get("access_scope"), "👑 إدارة")
+        pr = f"💰 {f.get('points_cost', 0)}ن" if f.get("pricing_type") == "points" else "🆓 مجاني"
+        st_ico = "🟢" if f.get("status") == "active" else ("⏳" if f.get("status") == "coming_soon" else "🔴")
+        lbl = f"{st_ico} {f.get('title', fid)[:26]} [{sc} | {pr}]"
+        markup.add(types.InlineKeyboardButton(lbl, callback_data=f"fg_view_{fid}"))
+
+    markup.add(types.InlineKeyboardButton("➕ تسجيل ميزة جديدة للمستقبل", callback_data="fg_new_custom"))
+    markup.add(types.InlineKeyboardButton("🔙 العودة للوحة الرئيسية", callback_data="back_to_main"))
+    return markup
+
+
+def render_feature_gates_text_and_markup(user_id: int) -> tuple[str, types.InlineKeyboardMarkup]:
+    return render_feature_gates_text(user_id), render_feature_gates_markup(user_id)
+
+
+def render_feature_detail_view(user_id: int, feature_id: str) -> tuple[str, types.InlineKeyboardMarkup]:
+    f = get_feature(feature_id)
+    if not f:
+        return "⚠️ الميزة غير موجودة.", types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🔙 رجوع", callback_data="menu_feature_gates"))
+
+    scope_labels = {"public": "🌍 مفتوحة للعامة", "admins": "👑 للإدارة والمطور فقط", "specific": "👥 لأشخاص محددين بالمعرف"}
+    status_labels = {"active": "🟢 نشطة ومتاحة", "disabled": "🔴 معطلة مؤقتاً", "beta": "🧪 تجريبية", "coming_soon": "⏳ قيد التطوير وقريباً"}
+    pricing_labels = {"free": "🆓 مجانية بالكامل", "points": f"💰 مدفوعة ({f.get('points_cost', 1)} نقطة لكل استخدام)"}
+
+    allowed = f.get("allowed_user_ids") or []
+    allowed_snip = ", ".join(f"<code>{u}</code>" for u in allowed[:8]) if allowed else "لا يوجد مستخدمون محددون بعد"
+
+    txt = (
+        f"🎛️ <b>بوابة ميزة: {esc(f.get('title', feature_id))}</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"🏷️ <b>المعرف البرمجي:</b> <code>{feature_id}</code>\n"
+        f"📁 <b>التصنيف:</b> {esc(f.get('category', 'عام'))}\n"
+        f"📝 <b>الوصف:</b> <i>{esc(f.get('description', ''))}</i>\n\n"
+        f"⚡ <b>الحالة الحالية:</b> {status_labels.get(f.get('status'), f.get('status'))}\n"
+        f"🔀 <b>نطاق الوصول:</b> {scope_labels.get(f.get('access_scope'), f.get('access_scope'))}\n"
+        f"💸 <b>التسعير:</b> {pricing_labels.get(f.get('pricing_type'), f.get('pricing_type'))}\n"
+        f"👥 <b>المستخدمون المصرح لهم:</b> {allowed_snip}\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "<i>اضغط على الخيارات أدناه لتعديل البوابة فوراً:</i>"
+    )
+
+    mk = types.InlineKeyboardMarkup(row_width=2)
+    next_scope_label = "تبديل الوصول (عامة/إدارة/محددين)"
+    mk.row(types.InlineKeyboardButton(f"🔀 {next_scope_label}", callback_data=f"fg_scope_{feature_id}"))
+    mk.row(
+        types.InlineKeyboardButton(f"💸 تبديل التسعير ({'مجاني' if f.get('pricing_type') == 'points' else 'نقاط'})", callback_data=f"fg_price_{feature_id}"),
+        types.InlineKeyboardButton(f"⚡ تبديل الحالة ({status_labels.get(f.get('status'), '')[:8]})", callback_data=f"fg_status_{feature_id}")
+    )
+    mk.row(
+        types.InlineKeyboardButton("👤 إضافة مستخدم بالمعرف (ID)", callback_data=f"fg_adduser_{feature_id}"),
+        types.InlineKeyboardButton("🔙 قائمة الميزات", callback_data="menu_feature_gates")
+    )
+    return txt, mk
+
+
+# ----------------- مركز البريد المؤقت والدائم وخزنة الاسترجاع -----------------
+def render_tempmail_main_view(user_id: int) -> tuple[str, types.InlineKeyboardMarkup]:
+    active = tm_m.get_user_active_mailbox(user_id)
+    history = tm_m.get_user_history(user_id, limit=20)
+    trash = tm_m.list_trash_emails_admin(user_id) if (is_super_admin(user_id) or has_admin_capability(user_id, "radar_users")) else []
+    is_dev = is_super_admin(user_id) or has_admin_capability(user_id, "radar_users")
+
+    if active and active.get("email"):
+        em = active["email"]
+        prov = active.get("provider", "1timetech")
+        dom = active.get("domain", em.split("@")[-1] if "@" in em else "")
+        created = str(active.get("created_at", ""))[:19].replace("T", " ")
+        txt = (
+            f"📧 <b>مركز البريد السحابي واستخراج أكواد التحقق</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📬 <b>البريد النشط الحالي:</b>\n"
+            f"<code>{esc(em)}</code> <i>(اضغط عليه للنسخ 📋)</i>\n\n"
+            f"🏢 <b>المزود:</b> <code>{esc(prov)}</code> | 🌐 <b>النطاق:</b> <code>{esc(dom)}</code>\n"
+            f"⏱️ <b>تاريخ الإنشاء:</b> {created}\n"
+            f"🔔 <b>المراقبة واستخراج OTP:</b> 🟢 مفعّل ومؤتمت\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"💡 انسخ هذا البريد لتسجيل حسابات فيسبوك أو المنصات الأخرى، ثم اضغط <b>فحص الوارد</b> لجلب كود الـ OTP ورابط التفعيل فوراً."
+        )
+    else:
+        txt = (
+            f"📧 <b>مركز البريد السحابي واستخراج أكواد التحقق</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚪ <b>لا يوجد بريد نشط حالياً.</b>\n\n"
+            f"اختر <b>إنشاء بريد عشوائي</b> أو <b>إنشاء بريد مخصص</b> من الأزرار أدناه لتوليد بريدك فوراً واستلام الأكواد عليه."
+        )
+
+    mk = types.InlineKeyboardMarkup(row_width=2)
+    mk.row(
+        _btn("🎲 إنشاء بريد عشوائي", style="primary", icon_key="spark", callback_data="tm_new_rand"),
+        _btn("✏️ إنشاء بريد مخصص", style="primary", icon_key="spark", callback_data="tm_pick_dom")
+    )
+    if active and active.get("email"):
+        mk.row(
+            _btn("🔄 فحص الوارد الآن", style="success", icon_key="spark", callback_data="tm_inbox"),
+            _btn(f"📜 أرشيفي المحفوظ ({len(history)})", callback_data="tm_history")
+        )
+        mk.row(
+            _btn("🗑️ حذف البريد الحالي (للسلة)", callback_data="tm_del_active")
+        )
+    else:
+        if history:
+            mk.row(_btn(f"📜 أرشيفي المحفوظ ({len(history)})", callback_data="tm_history"))
+
+    if is_dev:
+        mk.row(
+            _btn("🛰️ رادار بريد المستخدمين (للمطور)", callback_data="tm_admin_all"),
+            _btn(f"♻️ سلة المحذوفات والاسترجاع ({len(trash)})", callback_data="tm_admin_trash")
+        )
+
+    mk.row(types.InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="menu_main"))
+    return txt, mk
+
+
+def render_tempmail_pick_domain_view(user_id: int, page: int = 0) -> tuple[str, types.InlineKeyboardMarkup]:
+    domains = tm_m.get_available_domains()
+    per_page = 8
+    total_pages = max(1, (len(domains) + per_page - 1) // per_page)
+    page = max(0, min(page, total_pages - 1))
+
+    start_idx = page * per_page
+    page_domains = domains[start_idx:start_idx + per_page]
+
+    txt = (
+        f"✏️ <b>إنشاء بريد مخصص (Custom Mailbox)</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🌐 اختر النطاق (Domain) الذي تريده من القائمة أدناه:\n"
+        f"الصفحة: {page + 1} من {total_pages} | إجمالي النطاقات: {len(domains)}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💡 بعد اختيار النطاق سيُطلب منك إدخال الاسم الذي تريده قبل @."
+    )
+
+    mk = types.InlineKeyboardMarkup(row_width=2)
+    dom_btns = []
+    for item in page_domains:
+        d = item["domain"]
+        dom_btns.append(types.InlineKeyboardButton(f"@{d}", callback_data=f"tm_seldom_{d}"))
+
+    for i in range(0, len(dom_btns), 2):
+        mk.row(*dom_btns[i:i+2])
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(types.InlineKeyboardButton("⬅️ السابق", callback_data=f"tm_dompage_{page - 1}"))
+    if page < total_pages - 1:
+        nav_row.append(types.InlineKeyboardButton("التالي ➡️", callback_data=f"tm_dompage_{page + 1}"))
+    if nav_row:
+        mk.row(*nav_row)
+
+    mk.row(types.InlineKeyboardButton("🔙 رجوع لإدارة البريد", callback_data="menu_tempmail"))
+    return txt, mk
+
+
+def render_tempmail_inbox_view(user_id: int, email: str | None = None) -> tuple[str, types.InlineKeyboardMarkup]:
+    active = tm_m.get_user_active_mailbox(user_id)
+    target_email = email or (active.get("email") if active else None)
+    if not target_email:
+        return render_tempmail_main_view(user_id)
+
+    messages = tm_m.check_inbox(user_id, target_email)
+
+    mk = types.InlineKeyboardMarkup(row_width=1)
+
+    if not messages:
+        txt = (
+            f"📭 <b>صندوق الوارد:</b> <code>{esc(target_email)}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚪ لا توجد رسائل واردة حالياً.\n"
+            f"بانتظار وصول رسائل التحقق والتفعيل...\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"💡 اضغط <b>تحديث وفحص الآن</b> بعد طلب الكود من فيسبوك أو المنصة المستهدفة."
+        )
+    else:
+        txt = (
+            f"📬 <b>صندوق الوارد:</b> <code>{esc(target_email)}</code>\n"
+            f"عدد الرسائل المستلمة: <b>{len(messages)}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+        )
+        for idx, m in enumerate(messages[:8], start=1):
+            sender = esc(m.get("sender") or "مجهول")
+            subj = esc(m.get("subject") or "بدون عنوان")
+            otp = m.get("otp_code")
+            links = m.get("links") or []
+            date = esc(str(m.get("date") or ""))
+
+            txt += f"<b>[{idx}] من:</b> {sender}\n"
+            txt += f"📌 <b>الموضوع:</b> {subj}\n"
+            if date:
+                txt += f"⏱️ <b>الوقت:</b> {date}\n"
+            if otp:
+                txt += f"🔑 <b>كود التحقق (OTP):</b> <code>{esc(otp)}</code> <i>(اضغط للنسخ)</i>\n"
+            if links:
+                txt += f"🔗 <b>رابط التفعيل:</b> <a href=\"{esc(links[0])}\">اضغط للتأكيد المباشر</a>\n"
+            txt += "━━━━━━━━━━━━━━━━━━━━\n"
+
+            if otp:
+                mk.row(types.InlineKeyboardButton(f"📋 نسخ كود OTP: {otp}", callback_data=f"tm_copyotp_{otp}"))
+            if links:
+                mk.row(types.InlineKeyboardButton("🌐 فتح رابط التفعيل", url=links[0]))
+
+    mk.row(
+        _btn("🔄 تحديث وفحص الآن", style="primary", icon_key="spark", callback_data="tm_inbox"),
+        _btn("📧 إدارة البريد", callback_data="menu_tempmail")
+    )
+    return txt, mk
+
+
+def render_tempmail_history_view(user_id: int) -> tuple[str, types.InlineKeyboardMarkup]:
+    history = tm_m.get_user_history(user_id, limit=12)
+    active = tm_m.get_user_active_mailbox(user_id)
+    active_email = (active.get("email") or "").lower() if active else ""
+
+    txt = (
+        f"📜 <b>أرشيف وسجل إيميلاتي المحفوظة</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💡 يمكنك التبديل بين إيميلاتك السابقة في أي وقت لإعادة استخدامها أو فحص رسائلها القديمة والجديدة:\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+    )
+
+    mk = types.InlineKeyboardMarkup(row_width=2)
+    if not history:
+        txt += "⚪ لا يوجد أي بريد محفوظ في أرشيفك حتى الآن."
+    else:
+        for idx, item in enumerate(history, start=1):
+            em = item.get("email", "")
+            is_cur = em.lower() == active_email
+            ico = "🟢 نشط" if is_cur else "⚪ سابق"
+            txt += f"{idx}. <code>{esc(em)}</code> ({ico})\n"
+            em_hash = hashlib.sha1(em.encode()).hexdigest()[:8]
+
+            row_btns = []
+            if not is_cur:
+                row_btns.append(types.InlineKeyboardButton(f" تفعيل #{idx}", callback_data=f"tm_switch_{em_hash}"))
+            row_btns.append(types.InlineKeyboardButton(f"🗑️ حذف #{idx}", callback_data=f"tm_del_{em_hash}"))
+            mk.row(*row_btns)
+
+    mk.row(types.InlineKeyboardButton("🔙 رجوع لإدارة البريد", callback_data="menu_tempmail"))
+    return txt, mk
+
+
+def render_tempmail_admin_all_view(user_id: int) -> tuple[str, types.InlineKeyboardMarkup]:
+    if not (is_super_admin(user_id) or has_admin_capability(user_id, "radar_users")):
+        return "⛔ غير مصرح لك.", types.InlineKeyboardMarkup()
+    emails = tm_m.list_all_emails_admin(user_id)
+
+    txt = (
+        f"🛰️ <b>رادار المطور لبريد المستخدمين الشامل</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"إجمالي الإيميلات المسجلة بالنظام: <b>{len(emails)}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+    )
+    mk = types.InlineKeyboardMarkup(row_width=1)
+    if not emails:
+        txt += "⚪ لا توجد أي إيميلات مسجلة بعد."
+    else:
+        for idx, item in enumerate(emails[:15], start=1):
+            em = item.get("email", "")
+            uid = item.get("user_id", 0)
+            is_act = item.get("is_active", False)
+            status_ico = "🟢 نشط" if is_act else "⚪ محفوظ"
+            txt += f"<b>{idx}.</b> <code>{esc(em)}</code>\n"
+            txt += f"   👤 المستخدم ID: <code>{uid}</code> | {status_ico}\n"
+            em_hash = hashlib.sha1(em.encode()).hexdigest()[:8]
+            mk.row(types.InlineKeyboardButton(f"🔍 فحص وارد [{em[:18]}...]", callback_data=f"tm_admbox_{em_hash}"))
+
+    mk.row(types.InlineKeyboardButton("🔙 رجوع لإدارة البريد", callback_data="menu_tempmail"))
+    return txt, mk
+
+
+def render_tempmail_admin_trash_view(user_id: int) -> tuple[str, types.InlineKeyboardMarkup]:
+    if not (is_super_admin(user_id) or has_admin_capability(user_id, "radar_users")):
+        return "⛔ غير مصرح لك.", types.InlineKeyboardMarkup()
+    trash = tm_m.list_trash_emails_admin(user_id)
+
+    txt = (
+        f"♻️ <b>خزنة الاسترجاع وسلة المحذوفات (Recovery Vault)</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🛡️ <b>حماية كاملة من الضياع:</b> أي إيميل يحذفه المستخدم بالغلط يُحفظ هنا ويمكنك استرجاعه فوراً بضغطة واحدة!\n"
+        f"عدد الإيميلات في السلة: <b>{len(trash)}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+    )
+    mk = types.InlineKeyboardMarkup(row_width=1)
+    if not trash:
+        txt += "🟢 سلة المحذوفات نظيفة ولا توجد إيميلات محذوفة حالياً."
+    else:
+        for idx, item in enumerate(trash[:15], start=1):
+            em = item.get("email", "")
+            orig_uid = item.get("original_user_id", 0)
+            del_at = str(item.get("deleted_at", ""))[:19].replace("T", " ")
+            txt += f"<b>{idx}.</b> <code>{esc(em)}</code>\n"
+            txt += f"   👤 المالك: <code>{orig_uid}</code> | ⏱️ حُذف في: {del_at}\n"
+            em_hash = hashlib.sha1(em.encode()).hexdigest()[:8]
+            mk.row(types.InlineKeyboardButton(f"♻️ استرجاع فوري [{em[:18]}...]", callback_data=f"tm_restore_{em_hash}"))
+
+    mk.row(types.InlineKeyboardButton("🔙 رجوع لإدارة البريد", callback_data="menu_tempmail"))
+    return txt, mk
+
+
 def get_main_dashboard_markup(user_id: int) -> types.InlineKeyboardMarkup:
     markup = types.InlineKeyboardMarkup(row_width=2)
     st = get_user_state(user_id)
@@ -1192,70 +1714,46 @@ def get_main_dashboard_markup(user_id: int) -> types.InlineKeyboardMarkup:
     elif len(top_btns) == 1:
         markup.row(top_btns[0])
 
-    # 2. التفاعلات
-    if p_react:
-        like_st = "✅" if st["like"] else "❌"
-        react_lbl = REACTION_ICONS.get(st["reaction_type"], "👍 إعجاب")
-        p_tag = "رابط مخصص" if st.get("react_post_url") else f"منشور {st['react_post_index']}"
-        markup.row(
-            types.InlineKeyboardButton(f"{react_lbl} [{like_st}]", callback_data="toggle_react_main"),
-            types.InlineKeyboardButton(f"⚙️ خيارات ({p_tag})", callback_data="menu_wizard_react")
-        )
+    # 2. قسم فيسبوك الموحد (تجميع كل الأدوات والتفاعلات تحت مسمى واحد لتقليل التشويش وسرعة التصفح)
+    if has_any_action:
+        active_tools = []
+        if p_react and st.get("like"):
+            active_tools.append(REACTION_ICONS.get(st.get("reaction_type"), "إعجاب"))
+        if p_cmt and st.get("comment"):
+            active_tools.append("تعليق")
+        if p_int and st.get("interact_cmt"):
+            active_tools.append("رد")
+        if p_fr and st.get("friend"):
+            active_tools.append("صداقة")
+        if p_fr and st.get("follow"):
+            active_tools.append("متابعة")
+        if p_fr and st.get("cancel_friend"):
+            active_tools.append("إلغاء صداقة")
+        if p_fr and st.get("unfollow"):
+            active_tools.append("إلغاء متابعة")
+        if p_msg and st.get("message"):
+            active_tools.append("رسالة")
+        if p_rep and st.get("report_post"):
+            active_tools.append("بلاغ منشور")
+        if p_rep and st.get("report_profile"):
+            active_tools.append("بلاغ حساب")
+        if p_rep and st.get("block"):
+            active_tools.append("حظر")
 
-    # 3. التعليقات
-    if p_cmt:
-        cmt_st = "✅" if st["comment"] else "❌"
-        c_tag = "رابط مخصص" if st.get("comment_post_url") else f"منشور {st['comment_post_index']}"
-        markup.row(
-            types.InlineKeyboardButton(f"💬 تعليق [{cmt_st}]", callback_data="toggle_comment_main"),
-            types.InlineKeyboardButton(f"✏️ نص ومنشور ({c_tag})", callback_data="menu_wizard_comment")
-        )
+        if active_tools:
+            fb_badge = f"🟢 ({len(active_tools)} نشط: {', '.join(active_tools[:2])}{'..' if len(active_tools) > 2 else ''})"
+            fb_style = "primary"
+        else:
+            fb_badge = "⚪ (الكل معطل)"
+            fb_style = None
 
-    # 4. التفاعل والرد على تعليق محدد
-    if p_int:
-        cmt_int_tag = "✅" if st["interact_cmt"] else "❌"
         markup.row(
-            types.InlineKeyboardButton(f"🎯 رد على تعليق [{cmt_int_tag}]", callback_data="toggle_cmt_int_main"),
-            types.InlineKeyboardButton("⚙️ هدف الرد", callback_data="menu_cmt_interact")
-        )
-
-    # 5. الصداقة والمتابعة والإلغاء
-    if p_fr:
-        fr_tag = "✅" if st["friend"] else "❌"
-        fl_tag = "✅" if st["follow"] else "❌"
-        markup.row(
-            types.InlineKeyboardButton(f"➕ طلب صداقة [{fr_tag}]", callback_data="toggle_friend"),
-            types.InlineKeyboardButton(f"🔔 متابعة [{fl_tag}]", callback_data="toggle_follow")
-        )
-        cfr_tag = "✅" if st["cancel_friend"] else "❌"
-        unfl_tag = "✅" if st["unfollow"] else "❌"
-        markup.row(
-            types.InlineKeyboardButton(f"❌ إلغاء الصداقة [{cfr_tag}]", callback_data="toggle_cancel_friend"),
-            types.InlineKeyboardButton(f"🔕 إلغاء المتابعة [{unfl_tag}]", callback_data="toggle_unfollow")
-        )
-
-    # 6. رسائل الماسنجر الخاصة
-    if p_msg:
-        msg_st = "✅" if st["message"] else "❌"
-        raw_m = (st.get("message_text") or "").strip()
-        msg_snip = (raw_m[:12] + "..") if len(raw_m) > 12 else (raw_m or "بدون نص")
-        markup.row(
-            types.InlineKeyboardButton(f"✉️ رسالة خاصة [{msg_st}]", callback_data="toggle_msg_main"),
-            types.InlineKeyboardButton(f"✏️ النص ({msg_snip})", callback_data="menu_wizard_message")
-        )
-
-    # 7. البلاغات والحظر
-    if p_rep:
-        rep_p_tag = "✅" if st["report_post"] else "❌"
-        rep_u_tag = "✅" if st["report_profile"] else "❌"
-        markup.row(
-            types.InlineKeyboardButton(f"🛡️ بلاغ منشور [{rep_p_tag}]", callback_data="toggle_rep_post"),
-            types.InlineKeyboardButton(f"🛡️ بلاغ حساب [{rep_u_tag}]", callback_data="toggle_rep_profile")
-        )
-        blk_tag = "✅" if st["block"] else "❌"
-        markup.row(
-            types.InlineKeyboardButton(f"🚫 حظر الحساب [{blk_tag}]", callback_data="toggle_block"),
-            types.InlineKeyboardButton("⚙️ تفاصيل البلاغ والسبب", callback_data="menu_rep_config")
+            _btn(
+                f"📘 أدوات وتفاعلات فيسبوك {fb_badge}",
+                style=fb_style,
+                icon_key="shield",
+                callback_data="menu_fb_tools"
+            )
         )
 
     # 8. إدارة وإضافة الحسابات (معزولة حسب الصلاحية)
@@ -1327,6 +1825,9 @@ def get_main_dashboard_markup(user_id: int) -> types.InlineKeyboardMarkup:
                     callback_data="menu_announcements"
                 )
             )
+        markup.row(
+            _btn("🎛️ إدارة وبوابات الميزات", style="primary", icon_key="shield", callback_data="menu_feature_gates")
+        )
     elif has_any_feature or wallet["points"] > 0:
         eco_row = [_btn(f"🪙 نقاطي ({wallet['points']} = {wallet['yer_value']:,} ر.ي)", style="primary", callback_data="menu_wallet")]
         if p_inv:
@@ -1334,6 +1835,30 @@ def get_main_dashboard_markup(user_id: int) -> types.InlineKeyboardMarkup:
         markup.row(*eco_row)
         markup.row(
             _btn("💵 طلب بيع الحسابات / مراسلة المطور", callback_data="menu_support")
+        )
+
+    # دليل إنشاء الحسابات والربح للعامة والموردين
+    pub_gate = get_feature("public_account_addition")
+    if (has_any_feature or wallet["points"] > 0) and (is_dev or pub_gate.get("status") == "active"):
+        markup.row(
+            _btn(
+                "💡 دليل إنشاء الحسابات والربح (10 ر.ي / حساب)",
+                style="success" if not has_any_action else None,
+                icon_key="spark",
+                callback_data="menu_earn_guide"
+            )
+        )
+
+    # مركز إنشاء البريد واستقبال الأكواد
+    tm_gate = get_feature("tempmail")
+    if (has_any_feature or wallet["points"] > 0) and (is_dev or tm_gate.get("status") == "active"):
+        markup.row(
+            _btn(
+                "📧 إنشاء واستقبال الإيميلات (المؤقت والدائم)",
+                style="primary",
+                icon_key="spark",
+                callback_data="menu_tempmail"
+            )
         )
 
     # 10. فتح لوحة التحكم التفاعلية داخل تلغرام فقط (WebApp داخل التطبيق بدون متصفح خارجي)
@@ -1450,12 +1975,27 @@ def get_dashboard_text(user_id: int) -> str:
             op_cnt = estimate_mission_account_count(usable_accs, st)
             est_cost, _ = calculate_mission_cost(st, op_cnt)
             lines.append(f"💸 <b>تكلفة التنفيذ الحالية:</b> {est_cost} نقطة (على {op_cnt} حساب)")
-    if p_react:
-        react_info = REACTION_ICONS.get(st["reaction_type"], "👍 إعجاب")
-        post_info = "رابط مخصص" if st.get("react_post_url") else f"المنشور {st['react_post_index']}"
-        lines.append(f"💖 <b>التفاعل المحدد:</b> {react_info} ({post_info})")
-    if p_cmt:
-        lines.append(f"💬 <b>التعليق المجهز:</b> <i>'{esc(st['comment_text'][:35])}'</i> (منشور {st['comment_post_index']})")
+    if has_any_action:
+        active_tools_labels = []
+        if p_react and st.get("like"):
+            active_tools_labels.append(f"إعجاب ({REACTION_ICONS.get(st.get('reaction_type'), '👍')})")
+        if p_cmt and st.get("comment"):
+            active_tools_labels.append(f"تعليق ('{esc(st['comment_text'][:18])}..')")
+        if p_int and st.get("interact_cmt"):
+            active_tools_labels.append("رد")
+        if p_fr and st.get("friend"):
+            active_tools_labels.append("صداقة")
+        if p_fr and st.get("follow"):
+            active_tools_labels.append("متابعة")
+        if p_msg and st.get("message"):
+            active_tools_labels.append("رسالة")
+        if p_rep and (st.get("report_post") or st.get("report_profile") or st.get("block")):
+            active_tools_labels.append("بلاغات")
+
+        if active_tools_labels:
+            lines.append(f"📘 <b>أدوات فيسبوك النشطة:</b> 🟢 {', '.join(active_tools_labels)}")
+        else:
+            lines.append("📘 <b>أدوات فيسبوك:</b> ⚪ غير مفعلة (اضغط زر فيسبوك أدناه لتفعيلها)")
 
     lines.append("━━━━━━━━━━━━━━━━━━━━")
     if not has_any_feature and wallet["points"] <= 0:
@@ -2735,6 +3275,10 @@ def _render_admin_economy_view() -> tuple[str, types.InlineKeyboardMarkup]:
 
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.row(
+        types.InlineKeyboardButton(f"👥 إضافة حسابات للعامة: {'🟢 مفعّل' if cfg.get('public_account_addition', True) else '🔴 معطّل'}", callback_data="toggle_public_acc_add"),
+        types.InlineKeyboardButton("🎛️ بوابات الميزات كاملة", callback_data="menu_feature_gates")
+    )
+    markup.row(
         types.InlineKeyboardButton(f"🌐 وضع العامة: {'🟢' if cfg.get('public_mode') else '🔴'}", callback_data="eco_tog_public_mode"),
         types.InlineKeyboardButton(f"🛡️ فرض النقاط: {'🟢' if cfg.get('enforce_points_on_actions') else '🔴'}", callback_data="eco_tog_enforce_points_on_actions")
     )
@@ -2765,6 +3309,17 @@ def _render_admin_economy_view() -> tuple[str, types.InlineKeyboardMarkup]:
     return "\n".join(lines), markup
 
 
+def _refresh_after_toggle(call: types.CallbackQuery, user_id: int) -> None:
+    """إعادة رسم فورية بدون تشويش أو قفز للشاشة الرئيسية عند الضغط على أي خيار تفاعل"""
+    with _active_views_lock:
+        cur_v = (_active_views.get(user_id) or {}).get("view", "main")
+    if cur_v == "fb_tools":
+        txt, mk = render_fb_tools_text_and_markup(user_id)
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
+    else:
+        safe_edit_reply_markup(call.message.chat.id, call.message.message_id, get_main_dashboard_markup(user_id))
+
+
 def _refresh_tracked_inline_view(uid: int) -> None:
     if not hasattr(bot, "edit_message_text"):
         return
@@ -2773,12 +3328,16 @@ def _refresh_tracked_inline_view(uid: int) -> None:
     if not entry:
         return
 
+    # لا تعبث بالواجهة إذا كان المستخدم يكتب نصاً أو في وضع إدخال
+    st = get_user_state(uid)
+    if st.get("input_mode"):
+        return
+
     now = time.monotonic()
     elapsed = now - entry.get("last_push", 0.0)
-    if elapsed < 1.2:
-        # انتظر باقي مهلة منع التشبع بدلاً من إسقاط آخر تحديث حي (Trailing-Edge Coalescing)
-        time.sleep(1.2 - elapsed)
-        now = time.monotonic()
+    if elapsed < 1.0:
+        return
+
     with _active_views_lock:
         latest = _active_views.get(uid)
         if not latest:
@@ -2794,6 +3353,16 @@ def _refresh_tracked_inline_view(uid: int) -> None:
     if view == "main":
         txt = get_dashboard_text(uid)
         markup = get_main_dashboard_markup(uid)
+    elif view == "fb_tools":
+        txt, markup = render_fb_tools_text_and_markup(uid)
+    elif view == "earn_guide":
+        txt, markup = render_earn_guide_text_and_markup(uid)
+    elif view == "tempmail":
+        txt, markup = render_tempmail_main_view(uid)
+    elif view == "feature_gates" and (is_super_admin(uid) or is_admin_delegate(uid, include_manager=True)):
+        txt, markup = render_feature_gates_text_and_markup(uid)
+    elif view == "feature_detail" and entry.get("feature_id"):
+        txt, markup = render_feature_detail_view(uid, entry["feature_id"])
     elif view == "radar" and has_admin_capability(uid, "radar_users"):
         txt, markup = render_surveillance_radar_text_and_markup(viewer_id=uid)
     elif view == "dossier" and has_admin_capability(uid, "radar_users") and target_id:
@@ -2838,7 +3407,7 @@ def _live_inline_sync_worker() -> None:
                 _live_sync_cond.wait(timeout=30.0)
             uids = list(_live_sync_pending_uids)
             _live_sync_pending_uids.clear()
-        time.sleep(0.35)  # دمج التحديثات المتتالية السريعة في ضغطة واحدة
+        time.sleep(0.5)  # دمج التحديثات المتتالية السريعة لمنع الضغط والارتداد
         for uid in uids:
             try:
                 _refresh_tracked_inline_view(uid)
@@ -2855,9 +3424,18 @@ def _on_state_event(scope: str, target_uid: int, reason: str) -> None:
 
     to_wake: list[int] = []
     for uid in tracked_uids:
+        st = get_user_state(uid)
+        if st.get("input_mode"):
+            continue
+        with _active_views_lock:
+            v = (_active_views.get(uid) or {}).get("view", "")
+        # إذا كانت الواجهة معالج تفاعلي أو نافذة فرعية، لا نزعجه بتحديث خاطف
+        if v.startswith("wizard_") or v.startswith("sub_") or v.startswith("acc_view_"):
+            continue
+
         if is_super_admin(uid) or is_admin_delegate(uid, include_manager=True):
             to_wake.append(uid)
-        elif target_uid == uid or (target_uid == 0 and scope in ("economy", "system", "announcements")) or (scope == "accounts" and has_permission(uid, "can_use_accounts")):
+        elif target_uid == uid or (target_uid == 0 and scope in ("economy", "system", "announcements", "feature_gates")) or (scope == "accounts" and has_permission(uid, "can_use_accounts")):
             to_wake.append(uid)
 
     if to_wake:
@@ -3029,8 +3607,10 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
             "menu_wizard_message", "menu_manage_accs", "menu_wallet", "menu_referral",
             "menu_support", "menu_admin_economy", "menu_surveillance_radar", "menu_backup_vault",
             "menu_bkp_schedule", "menu_proxies", "menu_cloud_db", "menu_announcements",
-            "prx_4g_menu",
+            "prx_4g_menu", "menu_fb_tools", "menu_earn_guide", "menu_feature_gates", "menu_tempmail"
         }
+        if dest.startswith("fg_view_"):
+            allowed_dests.add(dest)
         if dest not in allowed_dests:
             dest = "back_to_main"
         st = get_user_state(user_id)
@@ -3148,6 +3728,144 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
                 reply_markup=get_main_dashboard_markup(user_id)
             )
             _track_view(user_id, call.message.chat.id, call.message.message_id, "main")
+        return
+
+    # ----------------- أدوات فيسبوك، دليل الربح، وبوابات الميزات -----------------
+    elif data == "menu_fb_tools":
+        _track_view(user_id, call.message.chat.id, call.message.message_id, "fb_tools")
+        txt, mk = render_fb_tools_text_and_markup(user_id)
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
+        return
+
+    elif data == "menu_earn_guide":
+        _track_view(user_id, call.message.chat.id, call.message.message_id, "earn_guide")
+        txt, mk = render_earn_guide_text_and_markup(user_id)
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
+        return
+
+    elif data == "menu_feature_gates":
+        if not (is_super_admin(user_id) or is_admin_delegate(user_id, include_manager=True)):
+            record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", "محاولة فتح بوابات الميزات بدون صلاحية")
+            safe_answer(call.id, "⛔ هذه اللوحة خاصة بالمطور والأدمن فقط.", show_alert=True)
+            return
+        _track_view(user_id, call.message.chat.id, call.message.message_id, "feature_gates")
+        txt, mk = render_feature_gates_text_and_markup(user_id)
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
+        return
+
+    elif data.startswith("fg_view_"):
+        if not (is_super_admin(user_id) or is_admin_delegate(user_id, include_manager=True)):
+            safe_answer(call.id, "⛔ غير مصرح لك.", show_alert=True)
+            return
+        fid = data.replace("fg_view_", "").strip()
+        _track_view(user_id, call.message.chat.id, call.message.message_id, "feature_detail")
+        with _active_views_lock:
+            if user_id in _active_views:
+                _active_views[user_id]["feature_id"] = fid
+        txt, mk = render_feature_detail_view(user_id, fid)
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
+        return
+
+    elif data.startswith("fg_scope_"):
+        if not (is_super_admin(user_id) or is_admin_delegate(user_id, include_manager=True)):
+            safe_answer(call.id, "⛔ غير مصرح لك.", show_alert=True)
+            return
+        parts = data.split("_")
+        if len(parts) >= 4:
+            new_scope = parts[-1]
+            fid = "_".join(parts[2:-1])
+            update_feature_gate(fid, {"scope": new_scope})
+            safe_answer(call.id, f"تم تغيير النطاق إلى: {new_scope}")
+            txt, mk = render_feature_detail_view(user_id, fid)
+            safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
+        return
+
+    elif data.startswith("fg_price_"):
+        if not (is_super_admin(user_id) or is_admin_delegate(user_id, include_manager=True)):
+            safe_answer(call.id, "⛔ غير مصرح لك.", show_alert=True)
+            return
+        parts = data.split("_")
+        if len(parts) >= 4:
+            new_pricing = parts[-1]
+            fid = "_".join(parts[2:-1])
+            update_feature_gate(fid, {"pricing": new_pricing})
+            safe_answer(call.id, f"تم تغيير التسعير إلى: {new_pricing}")
+            txt, mk = render_feature_detail_view(user_id, fid)
+            safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
+        return
+
+    elif data.startswith("fg_status_"):
+        if not (is_super_admin(user_id) or is_admin_delegate(user_id, include_manager=True)):
+            safe_answer(call.id, "⛔ غير مصرح لك.", show_alert=True)
+            return
+        parts = data.split("_")
+        if len(parts) >= 4:
+            new_status = parts[-1]
+            fid = "_".join(parts[2:-1])
+            update_feature_gate(fid, {"status": new_status})
+            safe_answer(call.id, f"تم تغيير الحالة إلى: {new_status}")
+            txt, mk = render_feature_detail_view(user_id, fid)
+            safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
+        return
+
+    elif data.startswith("fg_adduser_"):
+        if not (is_super_admin(user_id) or is_admin_delegate(user_id, include_manager=True)):
+            safe_answer(call.id, "⛔ غير مصرح لك.", show_alert=True)
+            return
+        fid = data.replace("fg_adduser_", "").strip()
+        st = get_user_state(user_id)
+        st["input_mode"] = f"waiting_fg_user_{fid}"
+        safe_answer(call.id)
+        safe_send(
+            call.message.chat.id,
+            f"👤 <b>أرسل الآن الآيدي الرقمي للمستخدم المراد منحه ميزة ({fid}):</b>",
+            reply_markup=_prompt_back_markup(f"cancel_to:fg_view_{fid}")
+        )
+        return
+
+    elif data.startswith("fg_deluser_"):
+        if not (is_super_admin(user_id) or is_admin_delegate(user_id, include_manager=True)):
+            safe_answer(call.id, "⛔ غير مصرح لك.", show_alert=True)
+            return
+        parts = data.split("_")
+        if len(parts) >= 4:
+            target_uid_str = parts[-1]
+            fid = "_".join(parts[2:-1])
+            if target_uid_str.isdigit():
+                remove_allowed_user(fid, int(target_uid_str))
+                safe_answer(call.id, "تم سحب الميزة من المستخدم")
+            txt, mk = render_feature_detail_view(user_id, fid)
+            safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
+        return
+
+    elif data == "fg_new_custom":
+        if not (is_super_admin(user_id) or is_admin_delegate(user_id, include_manager=True)):
+            safe_answer(call.id, "⛔ غير مصرح لك.", show_alert=True)
+            return
+        st = get_user_state(user_id)
+        st["input_mode"] = "waiting_new_fg_name"
+        safe_answer(call.id)
+        safe_send(
+            call.message.chat.id,
+            "✨ <b>أرسل الآن اسم الميزة الجديدة التي ترغب ببرمجتها وإضافتها لنظام البوابات:</b>\n"
+            "<i>(مثال: حملات البريد الآلي، منشئ الحسابات الذكي، صانع المنشورات)</i>",
+            reply_markup=_prompt_back_markup("cancel_to:menu_feature_gates")
+        )
+        return
+
+    elif data == "toggle_public_acc_add":
+        if not (is_super_admin(user_id) or has_admin_capability(user_id, "points_economy")):
+            safe_answer(call.id, "⛔ غير مصرح لك.", show_alert=True)
+            return
+        cur_v = bool(load_economy_settings().get("public_account_addition", True))
+        update_economy_settings({"public_account_addition": not cur_v})
+        update_feature_gate(
+            "public_account_addition",
+            {"status": "active" if not cur_v else "disabled", "scope": "public" if not cur_v else "admins"}
+        )
+        safe_answer(call.id, f"إضافة الحسابات للعامة: {'مفعلة 🟢' if not cur_v else 'معطلة 🔴'}")
+        txt, mk = _render_admin_economy_view()
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
         return
 
     # ----------------- مركز الإعلانات العائمة والمنبثقة للمطور والأدمن غير المقيد -----------------
@@ -4750,7 +5468,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         if not require_perm_or_deny(call, "can_react", "⛔ صلاحية التفاعلات غير مفعلة لحسابك."):
             return
         st["like"] = not st["like"]
-        safe_edit_reply_markup(call.message.chat.id, call.message.message_id, get_main_dashboard_markup(user_id))
+        _refresh_after_toggle(call, user_id)
         safe_answer(call.id, f"التفاعل: {'مفعل ✅' if st['like'] else 'معطل ❌'}")
 
     # B) التعليقات (can_comment)
@@ -4863,7 +5581,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
             )
             return
         st["comment"] = not st["comment"]
-        safe_edit_reply_markup(call.message.chat.id, call.message.message_id, get_main_dashboard_markup(user_id))
+        _refresh_after_toggle(call, user_id)
         safe_answer(call.id, f"التعليق: {'مفعل ✅' if st['comment'] else 'معطل ❌'}")
 
     elif data == "toggle_comment_active":
@@ -4890,7 +5608,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         st["friend"] = not st["friend"]
         if st["friend"]:
             st["cancel_friend"] = False
-        safe_edit_reply_markup(call.message.chat.id, call.message.message_id, get_main_dashboard_markup(user_id))
+        _refresh_after_toggle(call, user_id)
         safe_answer(call.id, f"طلب الصداقة: {'مفعل ✅' if st['friend'] else 'معطل ❌'}")
 
     elif data == "toggle_cancel_friend":
@@ -4899,7 +5617,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         st["cancel_friend"] = not st["cancel_friend"]
         if st["cancel_friend"]:
             st["friend"] = False
-        safe_edit_reply_markup(call.message.chat.id, call.message.message_id, get_main_dashboard_markup(user_id))
+        _refresh_after_toggle(call, user_id)
         safe_answer(call.id, f"إلغاء طلب الصداقة: {'مفعل ✅' if st['cancel_friend'] else 'معطل ❌'}")
 
     elif data == "toggle_follow":
@@ -4908,7 +5626,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         st["follow"] = not st["follow"]
         if st["follow"]:
             st["unfollow"] = False
-        safe_edit_reply_markup(call.message.chat.id, call.message.message_id, get_main_dashboard_markup(user_id))
+        _refresh_after_toggle(call, user_id)
         safe_answer(call.id, f"المتابعة: {'مفعل ✅' if st['follow'] else 'معطل ❌'}")
 
     elif data == "toggle_unfollow":
@@ -4917,7 +5635,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         st["unfollow"] = not st["unfollow"]
         if st["unfollow"]:
             st["follow"] = False
-        safe_edit_reply_markup(call.message.chat.id, call.message.message_id, get_main_dashboard_markup(user_id))
+        _refresh_after_toggle(call, user_id)
         safe_answer(call.id, f"إلغاء المتابعة: {'مفعل ✅' if st['unfollow'] else 'معطل ❌'}")
 
     # D) الرسائل الخاصة (can_message)
@@ -4967,7 +5685,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
             )
             return
         st["message"] = not st["message"]
-        safe_edit_reply_markup(call.message.chat.id, call.message.message_id, get_main_dashboard_markup(user_id))
+        _refresh_after_toggle(call, user_id)
         safe_answer(call.id, f"الرسائل الخاصة: {'مفعل ✅' if st['message'] else 'معطل ❌'}")
 
     elif data == "menu_msg_config":
@@ -4989,7 +5707,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         st["report_post"] = not st["report_post"]
         if st["report_post"]:
             st["report_profile"] = False
-        safe_edit_reply_markup(call.message.chat.id, call.message.message_id, get_main_dashboard_markup(user_id))
+        _refresh_after_toggle(call, user_id)
         safe_answer(call.id, f"بلاغ المنشور: {'مفعل ✅' if st['report_post'] else 'معطل ❌'}")
 
     elif data == "toggle_rep_profile":
@@ -4998,14 +5716,14 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         st["report_profile"] = not st["report_profile"]
         if st["report_profile"]:
             st["report_post"] = False
-        safe_edit_reply_markup(call.message.chat.id, call.message.message_id, get_main_dashboard_markup(user_id))
+        _refresh_after_toggle(call, user_id)
         safe_answer(call.id, f"بلاغ الحساب: {'مفعل ✅' if st['report_profile'] else 'معطل ❌'}")
 
     elif data == "toggle_block":
         if not require_perm_or_deny(call, "can_report", "⛔ صلاحية الحظر غير مفعلة لحسابك."):
             return
         st["block"] = not st["block"]
-        safe_edit_reply_markup(call.message.chat.id, call.message.message_id, get_main_dashboard_markup(user_id))
+        _refresh_after_toggle(call, user_id)
         safe_answer(call.id, f"حظر الحساب: {'مفعل ✅' if st['block'] else 'معطل ❌'}")
 
     elif data == "menu_rep_config":
@@ -5090,7 +5808,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         if not require_perm_or_deny(call, "can_interact_comments", "⛔ صلاحية التفاعل مع التعليقات غير مفعلة."):
             return
         st["interact_cmt"] = not st["interact_cmt"]
-        safe_edit_reply_markup(call.message.chat.id, call.message.message_id, get_main_dashboard_markup(user_id))
+        _refresh_after_toggle(call, user_id)
         safe_answer(call.id, f"الرد على التعليق: {'مفعل ✅' if st['interact_cmt'] else 'معطل ❌'}")
 
     elif data == "cycle_cmt_mode":
@@ -5849,7 +6567,55 @@ def _handle_text_inputs_impl(message: types.Message):
         bot.reply_to(message, txt, reply_markup=mk)
         return
 
-    if mode == "waiting_backup_channel":
+    if mode and mode.startswith("waiting_fg_user_"):
+        fid = mode.replace("waiting_fg_user_", "").strip()
+        st["input_mode"] = None
+        raw_uid = text.strip()
+        if not raw_uid.isdigit():
+            bot.reply_to(message, "⚠️ يرجى إرسال الآيدي الرقمي للمستخدم (أرقام فقط).", reply_markup=_prompt_back_markup(f"cancel_to:fg_view_{fid}"))
+            return
+        target_uid = int(raw_uid)
+        res = add_allowed_user(fid, target_uid)
+        if res.get("ok"):
+            bot.reply_to(message, f"✅ تم منح المستخدم <code>{target_uid}</code> ميزة <b>{fid}</b> بنجاح!")
+        else:
+            bot.reply_to(message, f"⚠️ {res.get('error', 'حدث خطأ أثناء الإضافة')}")
+        txt, mk = render_feature_detail_view(user_id, fid)
+        safe_send(message.chat.id, txt, reply_markup=mk)
+        return
+
+    elif mode == "waiting_new_fg_name":
+        st["input_mode"] = None
+        new_name = text.strip()
+        if not new_name or len(new_name) < 2:
+            bot.reply_to(message, "⚠️ اسم الميزة قصير جداً.", reply_markup=_prompt_back_markup("cancel_to:menu_feature_gates"))
+            return
+        import re as _re
+        slug = _re.sub(r"[^a-zA-Z0-9_]+", "_", new_name.lower()).strip("_")
+        if not slug:
+            slug = f"feature_{int(time.time())}"
+        reg_res = register_custom_feature(
+            feature_id=slug,
+            name=new_name,
+            description=f"ميزة {new_name} المخصصة",
+            category="custom",
+            scope="admins",
+            pricing="free",
+            status="active"
+        )
+        if reg_res.get("ok"):
+            bot.reply_to(
+                message,
+                f"✨ <b>تم تسجيل ميزة ({new_name}) الجديدة بنجاح!</b>\nالمعرف البرمجي: <code>{slug}</code>\n"
+                "تم ضبطها مبدئياً على وضع الإدارة (Admins). يمكنك الآن ضبط تسعيرها ونطاقها ومنحها للمستخدمين."
+            )
+            txt, mk = render_feature_detail_view(user_id, slug)
+            safe_send(message.chat.id, txt, reply_markup=mk)
+        else:
+            bot.reply_to(message, f"⚠️ {reg_res.get('error', 'تعذر تسجيل الميزة')}")
+        return
+
+    elif mode == "waiting_backup_channel":
         if not has_admin_capability(user_id, "backups"):
             st["input_mode"] = None
             return
@@ -7442,6 +8208,14 @@ def _build_webapp_hooks() -> dict:
         "delete_account": delete_account,
         "purge_broken_accounts": purge_broken_accounts,
         "approve_user": approve_user,
+        "list_features": list_features,
+        "get_feature": get_feature,
+        "is_feature_accessible": is_feature_accessible,
+        "get_feature_cost": get_feature_cost,
+        "update_feature_gate": update_feature_gate,
+        "add_allowed_user": add_allowed_user,
+        "remove_allowed_user": remove_allowed_user,
+        "register_custom_feature": register_custom_feature,
         "ban_user": ban_user,
         "unban_user": unban_user,
         "toggle_user_permission": toggle_user_permission,

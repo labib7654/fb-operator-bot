@@ -68,6 +68,9 @@ UI_STATES_FILE = DATA_DIR / "ui_states.json"
 CLOUD_DB_CONFIG_FILE = DATA_DIR / "cloud_db_config.json"
 PROXIES_FILE = DATA_DIR / "proxies.json"
 ANNOUNCEMENTS_FILE = DATA_DIR / "announcements.json"
+FEATURE_GATES_FILE = DATA_DIR / "feature_gates.json"
+TEMP_EMAILS_FILE = DATA_DIR / "temp_emails.json"
+TRASH_EMAILS_FILE = DATA_DIR / "trash_emails.json"
 SQLITE_MIRROR_FILE = DATA_DIR / "fb_operator.db"
 
 # ملف قاعدة البيانات الخارجي المعزول خارج مجلد الأكواد (بجانب HUGGINGFACE_UPLOAD/ في جذر المستودع)
