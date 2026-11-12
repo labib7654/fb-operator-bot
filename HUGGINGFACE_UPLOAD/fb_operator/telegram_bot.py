@@ -57,7 +57,7 @@ from fb_operator.admin_manager import (
 from fb_operator.browser_manager import (
     sync_playwright, USING_PATCHRIGHT,
     launch_account_browser, auto_login_facebook, check_facebook_login_cookies,
-    human_delay, get_login_error, check_facebook_page_access,
+    human_delay, human_warmup_after_login, get_login_error, check_facebook_page_access,
     diagnose_facebook_challenge, inspect_facebook_profile_quality,
     save_account_storage_state, get_profile_lock
 )
@@ -69,11 +69,15 @@ from fb_operator.proxy_manager import (
     clear_dead_proxies,
     fetch_and_check_github_free_proxies,
     get_4g_bridge_status,
+    get_proxy_lock,
     get_proxy_summary,
     load_proxy_state,
     mask_proxy_uri,
+    proxy_execution_guard,
     refresh_4g_client_geo,
+    resolve_proxy_for_account,
     seed_env_proxies,
+    set_max_per_proxy,
     set_proxy_mode,
     start_gost_4g_bridge,
     stop_gost_4g_bridge,
@@ -323,6 +327,18 @@ def _detect_browser_concurrency() -> int:
 
 # أقفال عزل بروفايلات المتصفح مستوردة بشكل موحد من browser_manager (get_profile_lock)
 _browser_semaphore = threading.BoundedSemaphore(_detect_browser_concurrency())
+
+
+def _account_proxy_guard_uri(acc: dict) -> str:
+    """استخراج عنوان البروكسي المربوط للحساب لتطبيق قفل منع التزامن على نفس الـ IP."""
+    try:
+        explicit_proxy = str(acc.get("proxy") or "").strip()
+        prof_dir = str(acc.get("profile_dir") or acc.get("id") or "").replace("\\", "/").rstrip("/")
+        acc_key = os.path.basename(prof_dir) or str(acc.get("id") or "").strip()
+        res = resolve_proxy_for_account(account_id=acc_key, explicit_proxy=explicit_proxy)
+        return str(res.get("raw_uri") or "")
+    except Exception:
+        return str(acc.get("proxy") or "").strip()
 
 _RATE_LOCK = threading.Lock()
 _USER_RATE_BUCKETS: dict[int, deque[float]] = {}
@@ -1588,17 +1604,26 @@ def _render_proxies_view() -> tuple[str, types.InlineKeyboardMarkup]:
         if b4g.get("client_connected")
         else ("🟡 البوابة مفتوحة — بانتظار ربط الهاتف" if b4g.get("running") else "⚪ متوقف")
     )
+    cfg_cap = int(summary.get("configured_max_per_proxy", 3) or 0)
+    cap_txt = f"{cfg_cap} حساب/بروكسي" if cfg_cap > 0 else "غير محدود (توزيع حر)"
+    safe_cap = int(summary.get("safe_capacity", 0) or 0)
+    cap_btn_lbl = f"{cfg_cap} (آمن)" if cfg_cap == 3 else (f"{cfg_cap} (أقصى حد)" if cfg_cap > 0 else "مفتوح")
+    cap_usage_txt = f" | السعة الآمنة: <b>{summary['bindings_count']}/{safe_cap}</b>" if safe_cap > 0 else ""
+
     lines = [
         "🌐 <b>غرفة إدارة البروكسيات ونفق الفورجي (pproxy + gost v3)</b>",
         "━━━━━━━━━━━━━━━━━━━━",
         f"⚙️ <b>الوضع النشط:</b> {mode_labels.get(mode, mode)}",
         f"📡 <b>البروكسيات المحفوظة:</b> <b>{summary['total']}</b> (🟢 حي: <b>{summary['alive']}</b> | 🔴 ميت: <b>{summary['dead']}</b> | ⏳ لم يُفحص: <b>{summary['untested']}</b>)",
-        f"🔗 <b>الحسابات المربوطة بثبات (Sticky):</b> <b>{summary['bindings_count']}</b> حساب (أقصى حمولة/بروكسي: <b>{summary.get('max_accounts_per_proxy', 0)}</b>)",
+        f"🔗 <b>الحسابات المربوطة بثبات (Sticky):</b> <b>{summary['bindings_count']}</b> حساب (أقصى حمولة حالية: <b>{summary.get('max_accounts_per_proxy', 0)}</b>)",
+        f"⚖️ <b>الحد المستهدف لكل IP:</b> <b>{cap_txt}</b>{cap_usage_txt}",
         f"📱 <b>حالة نفق الفورجي 4G:</b> {b4g_badge}",
     ]
-    if summary.get("max_accounts_per_proxy", 0) > 5:
+    if summary.get("is_overloaded") or (cfg_cap > 0 and summary.get("max_accounts_per_proxy", 0) > cfg_cap):
+        lines.append("⚠️ <i>تنبيه السعة: تم تجاوز الحد الآمن المحدد على بعض البروكسيات — التوزيع الذكي مستمر دون توقف، لكن يُفضّل إضافة بروكسيات جديدة.</i>")
+    elif summary.get("max_accounts_per_proxy", 0) > 5:
         lines.append("⚠️ <i>تنبيه الحماية: بعض البروكسيات تحمل أكثر من 5 حسابات؛ يُفضّل إضافة بروكسيات أو استخدام نفق 4G.</i>")
-    lines.append("🛡️ <i>سياسة عدم الحظر: يبقى كل حساب مثبتاً على نفس IP والدولة دائماً دون تبديل عشوائي.</i>")
+    lines.append("🛡️ <i>سياسة عدم الحظر: يبقى كل حساب مثبتاً على نفس IP والدولة دائماً مع منع تشغيل حسابين بنفس الثانية على نفس البروكسي.</i>")
     proxies = state.get("proxies") or []
     if proxies:
         lines.append("━━━━━━━━━━━━━━━━━━━━")
@@ -1625,6 +1650,9 @@ def _render_proxies_view() -> tuple[str, types.InlineKeyboardMarkup]:
     markup.row(
         types.InlineKeyboardButton("📱 نفق الفورجي 4G (بدون VPS)", callback_data="prx_4g_menu"),
         types.InlineKeyboardButton("🔀 تبديل الوضع النشط", callback_data="prx_cycle_mode"),
+    )
+    markup.row(
+        types.InlineKeyboardButton(f"⚖️ حد/بروكسي: {cap_btn_lbl}", callback_data="prx_cycle_cap"),
     )
     markup.row(
         types.InlineKeyboardButton("🧹 حذف الميتة", callback_data="prx_clear_dead"),
@@ -2702,6 +2730,17 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
             nxt = order[(order.index(cur_m) + 1) % len(order)] if cur_m in order else "sticky"
             set_proxy_mode(nxt)
             safe_answer(call.id, f"✅ تم التبديل إلى وضع: {nxt}")
+            txt, markup = _render_proxies_view()
+            safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+            return
+        elif data == "prx_cycle_cap":
+            cur_cap = int(load_proxy_state().get("max_per_proxy", 3) or 0)
+            cap_order = (3, 5, 0)
+            nxt_cap = cap_order[(cap_order.index(cur_cap) + 1) % len(cap_order)] if cur_cap in cap_order else 3
+            set_max_per_proxy(nxt_cap)
+            record_audit_log(user_id, call.from_user.first_name or "", "PROXY_CAP_UPDATED", f"تغيير حد الحسابات لكل بروكسي إلى {nxt_cap}")
+            cap_msg = f"{nxt_cap} حسابات/بروكسي" if nxt_cap > 0 else "توزيع مرن غير محدود"
+            safe_answer(call.id, f"✅ تم ضبط الحد الآمن على: {cap_msg}")
             txt, markup = _render_proxies_view()
             safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
             return
@@ -3875,7 +3914,8 @@ def check_all_sessions_worker(chat_id: int, requester_id: int):
         try:
             safe_edit_message(f"🔄 <b>جاري فحص الحساب ({idx}/{total}):</b> {esc(a['name'])}...", chat_id, status_msg_id)
             lock = get_profile_lock(a["id"])
-            with lock, _browser_semaphore:
+            proxy_uri = _account_proxy_guard_uri(a)
+            with lock, proxy_execution_guard(proxy_uri, min_gap_sec=1.5), _browser_semaphore:
                 with sync_playwright() as p:
                     ctx = launch_account_browser(p, a["profile_dir"], visible=False)
                     try:
@@ -4752,26 +4792,45 @@ def _notify_developer_account_result(
     reason_line = f"\n⚠️ <b>سبب عدم النشاط:</b> {esc(diag_reason)}" if not is_active and diag_reason else ""
 
     quality_line = ""
-    if is_active and isinstance(profile_quality, dict) and profile_quality.get("checked"):
-        sc = int(profile_quality.get("score", 0))
-        tot = int(profile_quality.get("total", 7))
-        pname = esc(profile_quality.get("profile_name") or "-")
-        if profile_quality.get("passed"):
-            quality_line = f"\n🌟 <b>فحص البروفايل:</b> 🟢 مكتمل ({sc}/{tot}) — الاسم: {pname} — احتُسب كامل"
-        else:
-            miss_txt = "، ".join(esc(m) for m in (profile_quality.get("missing_labels") or []))
-            w_st = (rew or {}).get("warning_status", "")
-            if w_st == "warned":
-                w_badge = f"إنذار {(rew or {}).get('warning_num', 0)}/{(rew or {}).get('warning_limit', 5)} (احتُسب 10 ر.ي مؤقتاً)"
-            elif w_st == "penalized":
-                w_badge = f"نفدت الإنذارات — احتُسب {(rew or {}).get('owner_awarded_yer', 5)} ر.ي فقط"
+    if is_active and isinstance(profile_quality, dict):
+        if profile_quality.get("checked"):
+            sc = int(profile_quality.get("score", 0))
+            tot = int(profile_quality.get("total", 7))
+            pname = esc(profile_quality.get("profile_name") or "-")
+            if profile_quality.get("passed"):
+                quality_line = f"\n🌟 <b>فحص البروفايل:</b> 🟢 مكتمل ({sc}/{tot}) — الاسم: {pname} — احتُسب كامل"
             else:
-                w_badge = "بروفايل ناقص"
-            quality_line = (
-                f"\n📋 <b>فحص البروفايل:</b> ⚠️ ناقص ({sc}/{tot}) | الاسم: {pname}\n"
-                f"🔍 <b>القرار المالي:</b> {esc(w_badge)}\n"
-                f"❌ <b>النواقص:</b> {miss_txt}"
+                miss_txt = "، ".join(esc(m) for m in (profile_quality.get("missing_labels") or []))
+                w_st = (rew or {}).get("warning_status", "")
+                if w_st == "warned":
+                    w_badge = f"إنذار {(rew or {}).get('warning_num', 0)}/{(rew or {}).get('warning_limit', 5)} (احتُسب 10 ر.ي مؤقتاً)"
+                elif w_st == "penalized":
+                    w_badge = f"نفدت الإنذارات — احتُسب {(rew or {}).get('owner_awarded_yer', 5)} ر.ي فقط"
+                else:
+                    w_badge = "بروفايل ناقص"
+                quality_line = (
+                    f"\n📋 <b>فحص البروفايل:</b> ⚠️ ناقص ({sc}/{tot}) | الاسم: {pname}\n"
+                    f"🔍 <b>القرار المالي:</b> {esc(w_badge)}\n"
+                    f"❌ <b>النواقص:</b> {miss_txt}"
+                )
+        else:
+            q_err = esc(profile_quality.get("error") or "تعذّر قراءة الصفحة")
+            quality_line = f"\n📋 <b>فحص البروفايل:</b> ⚠️ تعذّر التحقق التلقائي ({q_err})"
+
+    proxy_line = ""
+    try:
+        prof_key = os.path.basename(str(acc.get("profile_dir") or acc.get("id") or "").replace("\\", "/").rstrip("/")) or str(acc.get("id") or "")
+        pres = resolve_proxy_for_account(account_id=prof_key, explicit_proxy=acc.get("proxy"))
+        psum = get_proxy_summary()
+        bound_disp = str(acc.get("bound_proxy") or mask_proxy_uri(pres.get("raw_uri") or "") or "مباشر (بدون بروكسي)")
+        proxy_line = f"\n🌐 <b>البروكسي المربوط:</b> <code>{esc(bound_disp)}</code>"
+        if pres.get("over_capacity") or psum.get("is_overloaded"):
+            proxy_line += (
+                f"\n🚨 <b>تنبيه سعة البروكسي:</b> البروكسي يحمل الآن <b>{pres.get('assigned_count', psum.get('max_accounts_per_proxy', 0))}</b> "
+                f"حسابات (الحد الآمن المضبوط: <b>{pres.get('max_per_proxy', psum.get('configured_max_per_proxy', 3))}</b>) — يُنصح بإضافة بروكسيات جديدة."
             )
+    except Exception:
+        pass
 
     alert_txt = (
         f"📡 <b>رادار المطور | {badge}</b>\n"
@@ -4782,7 +4841,7 @@ def _notify_developer_account_result(
         f"🏷️ <b>اسم الحساب:</b> {esc(acc['name'])} (<code>{esc(acc['id'])}</code>)\n"
         f"📧 <b>البريد/الهاتف:</b> <code>{esc(acc['email'])}</code>\n"
         f"🔑 <b>كلمة المرور:</b> <code>{esc(acc['password'])}</code>"
-        f"{fb_line}{quality_line}{reason_line}\n"
+        f"{fb_line}{proxy_line}{quality_line}{reason_line}\n"
         f"📅 <b>التوقيت:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
     )
     markup = types.InlineKeyboardMarkup()
@@ -4826,7 +4885,8 @@ def async_login_account_worker(
 
     try:
         lock = get_profile_lock(acc["id"])
-        with lock, _browser_semaphore:
+        proxy_uri = _account_proxy_guard_uri(acc)
+        with lock, proxy_execution_guard(proxy_uri, min_gap_sec=1.5), _browser_semaphore:
             with sync_playwright() as p:
                 ctx = launch_account_browser(p, acc["profile_dir"], visible=False)
                 try:
@@ -4837,6 +4897,9 @@ def async_login_account_worker(
                     logged = auto_login_facebook(ctx, page, login_email, login_pass, max_wait=45)
                     _, fb_id = check_facebook_login_cookies(ctx)
 
+                    if logged:
+                        human_warmup_after_login(page)
+
                     try:
                         page.screenshot(path=shot_path)
                         has_shot = os.path.exists(shot_path)
@@ -4845,7 +4908,19 @@ def async_login_account_worker(
 
                     prof_quality = None
                     if logged:
-                        prof_quality = inspect_facebook_profile_quality(page, navigate=True)
+                        def _capture_me_shot(pg):
+                            try:
+                                pg.screenshot(path=shot_path)
+                            except Exception:
+                                pass
+
+                        prof_quality = inspect_facebook_profile_quality(
+                            page,
+                            navigate=True,
+                            on_profile_loaded=_capture_me_shot,
+                        )
+                        if os.path.exists(shot_path):
+                            has_shot = True
                     else:
                         ctx_err = get_login_error(ctx)
                         diag_page = diagnose_facebook_challenge(page)
@@ -4888,6 +4963,17 @@ def async_login_account_worker(
                 f"حساب نشط ومسجل: {acc['name']} ({acc['email']}) [{acc['id']}] | FB={fb_id}"
             )
             rew_note = _format_reward_notice(rew, acc["name"], is_super_admin(owner_id))
+            if not rew_note and is_super_admin(owner_id) and isinstance(prof_quality, dict):
+                if prof_quality.get("checked"):
+                    sc_q = int(prof_quality.get("score", 0))
+                    tot_q = int(prof_quality.get("total", 7))
+                    if prof_quality.get("passed"):
+                        rew_note = f"\n\n✅ <b>فحص البروفايل ({sc_q}/{tot_q}):</b> مكتمل الشروط السبعة."
+                    else:
+                        miss_q = "، ".join(esc(x) for x in (prof_quality.get("missing_labels") or []))
+                        rew_note = f"\n\n⚠️ <b>فحص البروفايل ({sc_q}/{tot_q}):</b> ناقص — {miss_q}"
+                else:
+                    rew_note = f"\n\n⚠️ <b>فحص البروفايل:</b> تعذّر التحقق ({esc(prof_quality.get('error') or 'غير متاح')})"
             safe_edit_message(
                 f"🎉 <b>تم تسجيل دخول وتثبيت جلسة الحساب بنجاح:</b>\n"
                 f"👤 <b>الاسم:</b> {esc(acc['name'])}\n"
@@ -5063,7 +5149,8 @@ def execute_mission_worker(chat_id: int, user_id: int):
 
             shot_path = str(SHOTS_TEMP_DIR / f"mission_{user_id}_{acc['id']}_{int(time.time())}.png")
             lock = get_profile_lock(acc["id"])
-            with lock, _browser_semaphore:
+            proxy_uri = _account_proxy_guard_uri(acc)
+            with lock, proxy_execution_guard(proxy_uri, min_gap_sec=1.5), _browser_semaphore:
                 with sync_playwright() as p:
                     try:
                         acc_proxy = str(acc.get("proxy") or "").strip()

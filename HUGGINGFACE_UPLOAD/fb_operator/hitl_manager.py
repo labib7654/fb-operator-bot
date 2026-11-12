@@ -22,8 +22,10 @@ from fb_operator.browser_manager import (
     dismiss_dialogs,
     get_profile_lock,
     launch_account_browser,
+    resolve_cross_platform_profile,
     save_account_storage_state,
 )
+from fb_operator.proxy_manager import proxy_execution_guard, resolve_proxy_for_account
 
 HITL_VIEWPORT = (1280, 800)
 HITL_DESKTOP_VIEWPORT = (1280, 800)
@@ -125,7 +127,10 @@ def _hitl_worker(session: HITLSession, acc: dict) -> None:
     session.has_credentials = bool(email and real_pass)
 
     try:
-        with lock:
+        prof_name = resolve_cross_platform_profile(acc["profile_dir"]).name
+        proxy_res = resolve_proxy_for_account(account_id=prof_name, explicit_proxy=acc.get("proxy"))
+        proxy_uri = str(proxy_res.get("raw_uri") or "")
+        with lock, proxy_execution_guard(proxy_uri, min_gap_sec=0.0):
             with sync_playwright() as p:
                 ctx = launch_account_browser(
                     p,

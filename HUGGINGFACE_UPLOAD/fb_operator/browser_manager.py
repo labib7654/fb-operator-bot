@@ -1040,6 +1040,10 @@ def auto_login_facebook(context: BrowserContext, page: Page, email: str, passwor
         is_logged, _ = check_facebook_login_cookies(context)
         if is_logged and diag["is_ok"]:
             time.sleep(2.5)
+            try:
+                dismiss_dialogs(page)
+            except Exception:
+                pass
             save_account_storage_state(context)
             log("تم تسجيل الدخول وتثبيت الجلسة الدائمة بنجاح!")
             return True
@@ -1063,6 +1067,10 @@ def auto_login_facebook(context: BrowserContext, page: Page, email: str, passwor
     diag_final = diagnose_facebook_challenge(page)
     is_logged, _ = check_facebook_login_cookies(context)
     if is_logged and diag_final["is_ok"]:
+        try:
+            dismiss_dialogs(page)
+        except Exception:
+            pass
         save_account_storage_state(context)
         log("تم تسجيل الدخول بنجاح.")
         return True
@@ -1077,7 +1085,7 @@ def visible_page_has_live_human(context: BrowserContext) -> bool:
     return False
 
 def dismiss_dialogs(page: Page) -> None:
-    """إغلاق النوافذ المنبثقة ولافتات الموافقة على الكوكيز وحجب الشاشات الشائعة في فيسبوك"""
+    """إغلاق النوافذ المنبثقة ولافتات الموافقة على الكوكيز وحجب الشاشات الشائعة في فيسبوك بنقر بشري"""
     dismiss_selectors = [
         'button[data-cookiebanner="accept_button"]',
         'button[data-cookiebanner="accept_only_essential_button"]',
@@ -1086,24 +1094,29 @@ def dismiss_dialogs(page: Page) -> None:
         'button:has-text("السماح بكل ملفات")',
         'button:has-text("Allow all cookies")',
         'button:has-text("Allow essential and optional cookies")',
-        'div[role="button"]:has-text("إلغاء")',
-        'button:has-text("إلغاء")',
+        'div[role="dialog"] div[role="button"]:has-text("ليس الآن")',
+        'div[role="dialog"] button:has-text("ليس الآن")',
         'div[role="button"]:has-text("ليس الآن")',
         'div[role="button"]:has-text("Not Now")',
+        'button:has-text("ليس الآن")',
+        'button:has-text("Not Now")',
+        'a[role="button"]:has-text("ليس الآن")',
+        'a[role="button"]:has-text("Not Now")',
+        'div[role="button"]:has-text("إلغاء")',
+        'button:has-text("إلغاء")',
         'div[role="button"]:has-text("إغلاق")',
         'div[role="button"]:has-text("Close")',
         'div[aria-label="إغلاق"]',
         'div[aria-label="Close"]',
-        'button:has-text("ليس الآن")',
-        'button:has-text("Not Now")'
     ]
 
     for sel in dismiss_selectors:
         try:
             elem = page.locator(sel).first
-            if elem.is_visible(timeout=500):
-                elem.click(timeout=1000)
-                time.sleep(0.3)
+            if elem.is_visible(timeout=400):
+                if not human_click(page, elem, timeout=1000):
+                    elem.click(timeout=1000)
+                time.sleep(random.uniform(0.3, 0.7))
         except Exception:
             pass
 
@@ -1286,7 +1299,31 @@ def _extract_profile_dom_metrics(page: Page) -> dict:
     """)
 
 
-def inspect_facebook_profile_quality(page: Page, navigate: bool = True) -> dict:
+def human_warmup_after_login(page: Page) -> None:
+    """محاكاة تصفح بشري طبيعي قصير فور تسجيل الدخول قبل فحص البروفايل"""
+    try:
+        dismiss_dialogs(page)
+    except Exception:
+        pass
+    try:
+        smooth_scroll(page, scrolls=1)
+    except Exception:
+        pass
+    try:
+        _curved_mouse_move(page, random.uniform(280, 760), random.uniform(220, 520))
+    except Exception:
+        pass
+    try:
+        human_delay(0.9, 1.7)
+    except Exception:
+        pass
+
+
+def inspect_facebook_profile_quality(
+    page: Page,
+    navigate: bool = True,
+    on_profile_loaded=None,
+) -> dict:
     """
     فحص اكتمال وجودة البروفايل الشخصي لحساب فيسبوك بعد تسجيل الدخول:
     1) اسم عربي مناسب
@@ -1299,11 +1336,46 @@ def inspect_facebook_profile_quality(page: Page, navigate: bool = True) -> dict:
     """
     try:
         if navigate:
+            try:
+                dismiss_dialogs(page)
+            except Exception:
+                pass
             page.goto("https://www.facebook.com/me", wait_until="domcontentloaded", timeout=25000)
             human_delay(1.4, 2.3)
-            dismiss_overlays(page)
-            smooth_scroll(page, scrolls=1)
-            human_delay(0.8, 1.4)
+            try:
+                dismiss_dialogs(page)
+            except Exception:
+                pass
+            # انتظار اكتمال تحميل شجرة React للاسم/المحتوى الرئيسي قبل القراءة (حتى ~5.5 ث)
+            for _ in range(5):
+                try:
+                    hydrated = page.evaluate("""
+                        () => {
+                            const main = document.querySelector('div[role="main"]') || document.body;
+                            const h1 = main ? main.querySelector('h1') : null;
+                            const txt = (main && main.innerText) ? main.innerText.trim() : '';
+                            return Boolean((h1 && h1.innerText.trim().length >= 2) || txt.length > 260);
+                        }
+                    """)
+                    if hydrated:
+                        break
+                except Exception:
+                    break
+                time.sleep(0.9)
+            try:
+                smooth_scroll(page, scrolls=2)
+            except Exception:
+                pass
+            try:
+                _curved_mouse_move(page, random.uniform(320, 820), random.uniform(200, 480))
+            except Exception:
+                pass
+            human_delay(0.8, 1.5)
+            if callable(on_profile_loaded):
+                try:
+                    on_profile_loaded(page)
+                except Exception:
+                    pass
 
         m = _extract_profile_dom_metrics(page)
         raw_text = str(m.get("rawText") or "")

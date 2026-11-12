@@ -27,6 +27,7 @@ import urllib.parse
 import urllib.request
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -40,6 +41,9 @@ GOST_VERSION = "3.3.3"
 _proxy_lock = threading.RLock()
 _bridge_lock = threading.Lock()
 _4g_lock = threading.Lock()
+_proxy_exec_locks_guard = threading.Lock()
+_proxy_exec_locks: dict[str, threading.RLock] = {}
+_proxy_last_used: dict[str, float] = {}
 
 # جسر pproxy المشترك داخل العملية: uri_canonical -> {"port": int, "server": Any, "started_at": float}
 _pproxy_loop: asyncio.AbstractEventLoop | None = None
@@ -110,6 +114,7 @@ def _notify_change(reason: str = "proxies") -> None:
 def _default_state() -> dict[str, Any]:
     return {
         "mode": "sticky",  # sticky | 4g_bridge | direct
+        "max_per_proxy": 3,  # الحد الآمن الموصى به للحسابات لكل بروكسي (3=آمن، 5=حد أقصى، 0=غير محدود)
         "proxies": [],
         "bindings": {},    # account_id -> canonical_uri
         "bridge_4g": {
@@ -149,6 +154,13 @@ def load_proxy_state() -> dict[str, Any]:
         mode = str(data.get("mode") or "sticky").strip().lower()
         if mode not in ("sticky", "4g_bridge", "direct"):
             mode = "sticky"
+        try:
+            raw_max = data.get("max_per_proxy", 3)
+            max_per_proxy = int(raw_max) if raw_max is not None else 3
+            if max_per_proxy < 0:
+                max_per_proxy = 3
+        except Exception:
+            max_per_proxy = 3
         proxies = [p for p in (data.get("proxies") or []) if isinstance(p, dict) and p.get("uri")]
         bindings = {
             str(k): str(v)
@@ -160,6 +172,7 @@ def load_proxy_state() -> dict[str, Any]:
             b4g.update({k: v for k, v in data["bridge_4g"].items() if v not in (None, "")})
         return {
             "mode": mode,
+            "max_per_proxy": max_per_proxy,
             "proxies": proxies,
             "bindings": bindings,
             "bridge_4g": b4g,
@@ -341,6 +354,67 @@ def set_proxy_mode(mode: str) -> str:
         state["mode"] = clean
         save_proxy_state(state, notify=True)
     return clean
+
+
+def set_max_per_proxy(limit: int) -> int:
+    """تعيين الحد الآمن المستهدف لعدد الحسابات على كل بروكسي (3=آمن، 5=أقصى حد مستحسن، 0=مفتوح)."""
+    try:
+        val = int(limit)
+    except Exception:
+        val = 3
+    if val < 0:
+        val = 3
+    with _proxy_lock:
+        state = load_proxy_state()
+        state["max_per_proxy"] = val
+        save_proxy_state(state, notify=True)
+    return val
+
+
+def proxy_lock_key(proxy_uri: str | None) -> str:
+    """استخراج مفتاح قفل موحد حسب الـ IP والمنفذ لمنع تشغيل حسابين على نفس البروكسي بالثانية نفسها."""
+    raw = str(proxy_uri or "").strip()
+    if not raw:
+        return "direct"
+    parts = parse_proxy_parts(raw)
+    if parts and parts.get("host") and parts.get("port"):
+        return f"proxy:{parts['host'].lower()}:{parts['port']}"
+    return f"proxy:{raw.lower()}"
+
+
+def get_proxy_lock(proxy_uri: str | None) -> threading.RLock:
+    """قفل تسلسلي لكل IP بروكسي بحيث تعمل البروكسيات المختلفة بالتوازي وتتناوب الحسابات التي تشترك بنفس الـ IP."""
+    key = proxy_lock_key(proxy_uri)
+    with _proxy_exec_locks_guard:
+        if key not in _proxy_exec_locks:
+            _proxy_exec_locks[key] = threading.RLock()
+        return _proxy_exec_locks[key]
+
+
+@contextmanager
+def proxy_execution_guard(proxy_uri: str | None, min_gap_sec: float = 1.5):
+    """
+    حارس منع التزامن على نفس الـ IP:
+    يضمن عدم إرسال أي مهمتين في نفس الثانية من نفس البروكسي مع فاصل تهدئة إنساني بسيط.
+    يجب أن يُستدعى بترتيب ثابت: profile_lock -> proxy_execution_guard -> _browser_semaphore.
+    """
+    key = proxy_lock_key(proxy_uri)
+    plock = get_proxy_lock(key)
+    plock.acquire()
+    try:
+        gap = max(0.0, float(min_gap_sec or 0.0))
+        if gap > 0.0:
+            with _proxy_exec_locks_guard:
+                last_ts = _proxy_last_used.get(key, 0.0)
+            elapsed = time.monotonic() - last_ts if last_ts > 0.0 else gap
+            wait_s = gap - elapsed
+            if wait_s > 0.0:
+                time.sleep(min(wait_s, gap))
+        yield key
+    finally:
+        with _proxy_exec_locks_guard:
+            _proxy_last_used[key] = time.monotonic()
+        plock.release()
 
 
 def remove_proxy(uri_or_index: str | int) -> bool:
@@ -883,6 +957,8 @@ def resolve_proxy_for_account(
             if chosen:
                 pw_cfg = build_playwright_proxy_config(chosen["uri"])
                 if pw_cfg:
+                    max_cap = int(state.get("max_per_proxy", 3) or 0)
+                    assigned_cnt = sum(1 for u in state["bindings"].values() if u == chosen["uri"])
                     return {
                         "source": "sticky_pool",
                         "raw_uri": chosen["uri"],
@@ -891,6 +967,9 @@ def resolve_proxy_for_account(
                             str(chosen.get("country_code") or ""),
                             str(chosen.get("timezone") or ""),
                         ),
+                        "assigned_count": assigned_cnt,
+                        "max_per_proxy": max_cap,
+                        "over_capacity": bool(max_cap > 0 and assigned_cnt > max_cap),
                     }
 
     env_proxy = (os.environ.get("FB_PROXY") or "").strip()
@@ -1244,7 +1323,15 @@ def get_proxy_summary() -> dict[str, Any]:
     usage_counts: dict[str, int] = {}
     for p_uri in state["bindings"].values():
         usage_counts[p_uri] = usage_counts.get(p_uri, 0) + 1
-    max_per_proxy = max(usage_counts.values(), default=0)
+    max_assigned = max(usage_counts.values(), default=0)
+    configured_max = int(state.get("max_per_proxy", 3) or 0)
+    usable_pool = sum(1 for p in proxies if p.get("alive") is not False)
+    safe_capacity = (usable_pool * configured_max) if configured_max > 0 else 0
+    overloaded_proxies = (
+        sum(1 for cnt in usage_counts.values() if cnt > configured_max)
+        if configured_max > 0
+        else 0
+    )
     return {
         "mode": state["mode"],
         "total": len(proxies),
@@ -1252,6 +1339,10 @@ def get_proxy_summary() -> dict[str, Any]:
         "dead": dead,
         "untested": untested,
         "bindings_count": len(state["bindings"]),
-        "max_accounts_per_proxy": max_per_proxy,
+        "max_accounts_per_proxy": max_assigned,
+        "configured_max_per_proxy": configured_max,
+        "safe_capacity": safe_capacity,
+        "overloaded_proxies": overloaded_proxies,
+        "is_overloaded": bool(overloaded_proxies > 0 or (safe_capacity > 0 and len(state["bindings"]) > safe_capacity)),
         "bridge_4g": b4g,
     }
