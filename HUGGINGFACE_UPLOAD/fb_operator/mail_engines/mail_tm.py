@@ -93,16 +93,43 @@ class MailTmEngine:
                     msg_id = m.get("id")
                     from_obj = m.get("from", {})
                     sender = from_obj.get("address", "Unknown") if isinstance(from_obj, dict) else str(from_obj)
-                    
-                    # Fetch single message details if intro is empty
-                    intro = m.get("intro", "")
+                    subject = m.get("subject", "بدون عنوان")
+                    date = m.get("createdAt", "")
+                    body_text = m.get("intro", "")
+                    body_html = ""
+
+                    # Fetch single message details for full content
+                    if msg_id:
+                        try:
+                            s_url = f"{cls.BASE_URL}/messages/{msg_id}"
+                            s_req = urllib.request.Request(s_url, headers=headers)
+                            with urllib.request.urlopen(s_req, timeout=8) as s_resp:
+                                s_data = json.loads(s_resp.read().decode("utf-8"))
+                                body_text = s_data.get("text", "") or body_text
+                                html_list = s_data.get("html", [])
+                                if isinstance(html_list, list) and html_list:
+                                    body_html = html_list[0]
+                                elif isinstance(html_list, str):
+                                    body_html = html_list
+                        except Exception:
+                            pass
+
+                    # Clean text fallback from HTML if body_text is short or empty
+                    if body_html:
+                        import re, html as py_html
+                        no_style = re.sub(r'<(script|style)[^>]*>.*?</\1>', ' ', body_html, flags=re.DOTALL | re.IGNORECASE)
+                        clean = re.sub(r'<[^<]+?>', ' ', no_style)
+                        extracted_text = ' '.join(py_html.unescape(clean).split())
+                        if len(extracted_text) > len(body_text) or not body_text.strip():
+                            body_text = extracted_text
+
                     formatted.append({
-                        "id": msg_id,
+                        "id": str(msg_id),
                         "sender": sender,
-                        "subject": m.get("subject", "بدون عنوان"),
-                        "date": m.get("createdAt", ""),
-                        "body_text": intro,
-                        "body_html": ""
+                        "subject": subject,
+                        "date": date,
+                        "body_text": body_text,
+                        "body_html": body_html
                     })
                 return formatted
         except Exception:

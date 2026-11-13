@@ -429,6 +429,7 @@ def check_inbox(user_id: int, email: str | None = None) -> list[dict[str, Any]]:
                 "subject": subject,
                 "date": msg.get("date", ""),
                 "body_text": body_text,
+                "body_html": body_html,
                 "otp_code": otp_code,
                 "links": links,
                 "is_new": is_new,
@@ -436,10 +437,24 @@ def check_inbox(user_id: int, email: str | None = None) -> list[dict[str, Any]]:
             }
             parsed_messages.append(p_item)
 
-            # دمج الرسائل في الأرشيف الدائم لصندوق هذا البريد بالتحديد لمنع فقدان الأكواد نهائياً
-            existing_ids = {str(m.get("id", "")) for m in mb_history if m.get("id")}
-            if not msg_id or msg_id not in existing_ids:
+            # دمج وتحديث الرسائل في الأرشيف الدائم لصندوق هذا البريد بالتحديد لمنع فقدان الأكواد نهائياً
+            existing_idx = None
+            for idx_h, h_item in enumerate(mb_history):
+                if str(h_item.get("id", "")) == msg_id:
+                    existing_idx = idx_h
+                    break
+            if existing_idx is None:
                 mb_history.insert(0, p_item)
+            else:
+                # تحديث الرسالة القديمة بالأكواد والنصوص الأحدث إن كانت فارغة أو مقتضبة
+                if not mb_history[existing_idx].get("otp_code") and otp_code:
+                    mb_history[existing_idx]["otp_code"] = otp_code
+                if len(body_text) > len(mb_history[existing_idx].get("body_text", "")):
+                    mb_history[existing_idx]["body_text"] = body_text
+                if body_html and not mb_history[existing_idx].get("body_html"):
+                    mb_history[existing_idx]["body_html"] = body_html
+                if links and not mb_history[existing_idx].get("links"):
+                    mb_history[existing_idx]["links"] = links
 
         data["seen_messages"][uid_str] = list(seen_list)[-300:]
 

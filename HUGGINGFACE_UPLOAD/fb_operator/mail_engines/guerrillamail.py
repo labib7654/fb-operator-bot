@@ -78,13 +78,37 @@ class GuerrillaMailEngine:
                     # استبعاد الرسالة الترحيبية الافتراضية الخاصة بـ Guerrilla
                     if "welcome" in m.get("mail_subject", "").lower() or m.get("mail_from") == "no-reply@guerrillamail.com":
                         continue
+                    mid = str(m.get("mail_id", ""))
+                    body_text = m.get("mail_excerpt", "") or ""
+                    body_html = ""
+
+                    # Fetch full message body via fetch_email
+                    if mid:
+                        try:
+                            f_url = f"{cls.BASE_URL}?f=fetch_email&email_id={mid}&sid_token={token}"
+                            f_req = urllib.request.Request(f_url, headers=cls.HEADERS)
+                            with urllib.request.urlopen(f_req, timeout=8) as f_resp:
+                                f_data = json.loads(f_resp.read().decode("utf-8"))
+                                full_body = f_data.get("mail_body", "")
+                                if full_body:
+                                    if "<html" in full_body.lower() or "<div" in full_body.lower() or "<p" in full_body.lower():
+                                        body_html = full_body
+                                        import re, html as py_html
+                                        no_style = re.sub(r'<(script|style)[^>]*>.*?</\1>', ' ', body_html, flags=re.DOTALL | re.IGNORECASE)
+                                        clean = re.sub(r'<[^<]+?>', ' ', no_style)
+                                        body_text = ' '.join(py_html.unescape(clean).split())
+                                    else:
+                                        body_text = full_body
+                        except Exception:
+                            pass
+
                     formatted.append({
-                        "id": str(m.get("mail_id", "")),
+                        "id": mid,
                         "sender": m.get("mail_from", "Unknown"),
                         "subject": m.get("mail_subject", "بدون عنوان"),
                         "date": m.get("mail_date", ""),
-                        "body_text": m.get("mail_excerpt", "") or "",
-                        "body_html": ""
+                        "body_text": body_text,
+                        "body_html": body_html
                     })
                 return formatted
         except Exception:

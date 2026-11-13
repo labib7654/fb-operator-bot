@@ -12,7 +12,7 @@ class OtpExtractor:
 
     # أنماط الكلمات المفتاحية المصاحبة للكود
     OTP_KEYWORDS_PATTERN = re.compile(
-        r'(?:code|pin|otp|verification|verify|security|password|رمز|كود|التحقق|تأكيد)[\s:=_-]*([a-zA-Z0-9]{4,8})\b',
+        r'(?:code|pin|otp|verification|verify|security|password|رمز|كود|التحقق|تأكيد|المصادقة|مصادقة)[\s:=_\-\w\u0600-\u06FF]{0,45}?\b([a-zA-Z0-9]{4,8})\b',
         re.IGNORECASE
     )
 
@@ -30,8 +30,8 @@ class OtpExtractor:
         """إزالة وسوم الـ HTML والحصول على نص نقي"""
         if not raw_html:
             return ""
-        # إزالة سكريبتات وستايل
-        cleaned = re.sub(r'<(script|style).*?</\1>', '', raw_html, flags=re.DOTALL | re.IGNORECASE)
+        # إزالة سكريبتات وستايل مع كافة الخصائص
+        cleaned = re.sub(r'<(script|style)[^>]*>.*?</\1>', ' ', raw_html, flags=re.DOTALL | re.IGNORECASE)
         # إزالة باقي الوسوم
         cleaned = re.sub(r'<[^<]+?>', ' ', cleaned)
         # فك تشفير المحارف المرمزة

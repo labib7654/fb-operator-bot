@@ -1190,10 +1190,11 @@ def _merge_staged_payload(staged_json: dict[str, bytes], staged_sessions: dict[s
 
         if inc_temp and isinstance(inc_temp, dict):
             if not isinstance(cur_temp, dict):
-                cur_temp = {"users": {}, "history": [], "seen_messages": {}}
+                cur_temp = {"users": {}, "history": [], "seen_messages": {}, "mailbox_messages": {}}
             cur_temp.setdefault("users", {})
             cur_temp.setdefault("history", [])
             cur_temp.setdefault("seen_messages", {})
+            cur_temp.setdefault("mailbox_messages", {})
             for uid, mb in (inc_temp.get("users") or {}).items():
                 if uid not in cur_temp["users"] and isinstance(mb, dict):
                     cur_temp["users"][uid] = mb
@@ -1205,6 +1206,19 @@ def _merge_staged_payload(staged_json: dict[str, bytes], staged_sessions: dict[s
                     seen_hist_emails.add(h.get("email").lower())
                     stats["temp_emails_merged"] += 1
             cur_temp["history"] = cur_temp["history"][:300]
+
+            # دمج خزنة الرسائل المؤرشفة لكل صندوق بريد لمنع ضياع أكواد التفعيل
+            for em_k, msgs in (inc_temp.get("mailbox_messages") or {}).items():
+                if isinstance(msgs, list):
+                    cur_box = cur_temp["mailbox_messages"].setdefault(em_k.lower().strip(), [])
+                    seen_mids = {str(m.get("id", "")) for m in cur_box if isinstance(m, dict) and m.get("id")}
+                    for m_item in msgs:
+                        mid = str(m_item.get("id", "")) if isinstance(m_item, dict) else ""
+                        if mid and mid not in seen_mids:
+                            cur_box.append(dict(m_item))
+                            seen_mids.add(mid)
+                            stats["temp_emails_merged"] += 1
+
             _atomic_write_bytes(json_map["temp_emails.json"], json.dumps(cur_temp, ensure_ascii=False, indent=2).encode("utf-8"))
 
         if inc_trash:

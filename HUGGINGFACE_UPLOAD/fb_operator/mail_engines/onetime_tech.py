@@ -92,19 +92,48 @@ class OneTimeTechEngine:
 
     @classmethod
     def get_messages(cls, email: str, token: str = "") -> list[dict]:
-        """فحص الرسائل الواردة لبريد معين"""
+        """فحص الرسائل الواردة لبريد معين مع جلب التفاصيل الكاملة لكل رسالة"""
         clean_email = urllib.parse.quote(email.strip().lower())
         res = cls._request(f"/email/{clean_email}/messages")
         if isinstance(res, list):
             formatted = []
             for m in res:
+                mid = m.get("id")
+                body_text = m.get("text", "") or m.get("intro", "") or ""
+                body_html = m.get("html", "") or ""
+                subject = m.get("subject", "بدون عنوان")
+                sender = m.get("from", "Unknown")
+                date = m.get("date", "")
+
+                # Fetch full message details if mid is present to get full body and HTML
+                if mid:
+                    try:
+                        details = cls._request(f"/email/{clean_email}/messages/{mid}")
+                        if isinstance(details, dict):
+                            body_html = details.get("html", "") or body_html
+                            body_text = details.get("text", "") or body_text
+                            subject = details.get("subject", "") or subject
+                            sender = details.get("from", "") or details.get("fromText", "") or sender
+                            date = details.get("createdAt", "") or date
+                    except Exception:
+                        pass
+
+                # If body_html is present, extract clean text; prefer it if it's richer than truncated body_text
+                if body_html:
+                    import re, html as py_html
+                    no_style = re.sub(r'<(script|style)[^>]*>.*?</\1>', ' ', body_html, flags=re.DOTALL | re.IGNORECASE)
+                    clean = re.sub(r'<[^<]+?>', ' ', no_style)
+                    extracted_text = ' '.join(py_html.unescape(clean).split())
+                    if len(extracted_text) > len(body_text) or not body_text.strip():
+                        body_text = extracted_text
+
                 formatted.append({
-                    "id": m.get("id", str(random.random())),
-                    "sender": m.get("from", "Unknown"),
-                    "subject": m.get("subject", "بدون عنوان"),
-                    "date": m.get("date", ""),
-                    "body_text": m.get("text", "") or m.get("intro", "") or "",
-                    "body_html": m.get("html", "") or ""
+                    "id": str(mid or random.random()),
+                    "sender": sender,
+                    "subject": subject,
+                    "date": date,
+                    "body_text": body_text,
+                    "body_html": body_html
                 })
             return formatted
         return []

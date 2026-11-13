@@ -1553,6 +1553,8 @@ def render_tempmail_inbox_view(user_id: int, email: str | None = None) -> tuple[
             otp = m.get("otp_code")
             links = m.get("links") or []
             date = esc(str(m.get("date") or ""))
+            mid = str(m.get("id") or idx)
+            msg_hash = hashlib.sha1(f"{target_email}_{mid}".encode()).hexdigest()[:8]
 
             txt += f"<b>[{idx}] من:</b> {sender}\n"
             txt += f"📌 <b>الموضوع:</b> {subj}\n"
@@ -1560,12 +1562,22 @@ def render_tempmail_inbox_view(user_id: int, email: str | None = None) -> tuple[
                 txt += f"⏱️ <b>الوقت:</b> {date}\n"
             if otp:
                 txt += f"🔑 <b>كود التحقق (OTP):</b> <code>{esc(otp)}</code> <i>(اضغط للنسخ)</i>\n"
+
+            # عرض مقتطف من نص الرسالة مباشرة
+            body_txt = (m.get("body_text") or "").strip()
+            if body_txt:
+                snippet = esc(body_txt[:120]) + ("..." if len(body_txt) > 120 else "")
+                txt += f"💬 <b>المحتوى:</b> <i>{snippet}</i>\n"
+
             if links:
                 txt += f"🔗 <b>رابط التفعيل:</b> <a href=\"{esc(links[0])}\">اضغط للتأكيد المباشر</a>\n"
             txt += "━━━━━━━━━━━━━━━━━━━━\n"
 
+            msg_btns = []
             if otp:
-                mk.row(types.InlineKeyboardButton(f"📋 نسخ كود OTP: {otp}", callback_data=f"tm_copyotp_{otp}"))
+                msg_btns.append(types.InlineKeyboardButton(f"📋 نسخ OTP: {otp}", callback_data=f"tm_copyotp_{otp}"))
+            msg_btns.append(types.InlineKeyboardButton(f"📖 قراءة الرسالة [{idx}]", callback_data=f"tm_read_{em_hash}_{msg_hash}"))
+            mk.row(*msg_btns)
             if links:
                 mk.row(types.InlineKeyboardButton("🌐 فتح رابط التفعيل", url=links[0]))
 
@@ -1579,6 +1591,59 @@ def render_tempmail_inbox_view(user_id: int, email: str | None = None) -> tuple[
         types.InlineKeyboardButton("📜 أرشيف كافة الإيميلات", callback_data="menu_tm_history"),
         types.InlineKeyboardButton("🔙 إدارة البريد", callback_data="menu_tempmail")
     )
+    return txt, mk
+
+
+def render_tempmail_single_message_view(user_id: int, target_email: str, msg: dict) -> tuple[str, types.InlineKeyboardMarkup]:
+    """عرض نص الرسالة الكاملة مع تفاصيل المرسل والأكواد والروابط وأزرار سريعة للنسخ والرجوع"""
+    em_hash = hashlib.sha1(target_email.encode()).hexdigest()[:8]
+    mk = types.InlineKeyboardMarkup(row_width=1)
+
+    sender = esc(msg.get("sender") or "مجهول")
+    subj = esc(msg.get("subject") or "بدون عنوان")
+    date = esc(str(msg.get("date") or ""))
+    otp = msg.get("otp_code")
+    links = msg.get("links") or []
+    body_text = (msg.get("body_text") or "").strip()
+
+    txt = (
+        f"📖 <b>تفاصيل الرسالة الكاملة</b>\n"
+        f"📭 <b>صندوق البريد:</b> <code>{esc(target_email)}</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 <b>المرسل:</b> {sender}\n"
+        f"📌 <b>الموضوع:</b> {subj}\n"
+    )
+    if date:
+        txt += f"⏱️ <b>التاريخ:</b> {date}\n"
+
+    if otp:
+        txt += (
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔑 <b>كود التحقق والتفعيل (OTP):</b>\n"
+            f"<code>{esc(otp)}</code>\n"
+        )
+        mk.row(types.InlineKeyboardButton(f"📋 نسخ كود التحقق: {otp}", callback_data=f"tm_copyotp_{otp}"))
+
+    if links:
+        txt += (
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔗 <b>روابط التفعيل المستخرجة:</b>\n"
+        )
+        for i, l in enumerate(links[:3], 1):
+            txt += f"[{i}] <a href=\"{esc(l)}\">رابط التفعيل المباشر</a>\n"
+            mk.row(types.InlineKeyboardButton(f"🌐 فتح الرابط [{i}]", url=l))
+
+    txt += f"━━━━━━━━━━━━━━━━━━━━\n"
+    txt += f"📄 <b>نص الرسالة:</b>\n\n"
+
+    if body_text:
+        display_body = body_text if len(body_text) <= 3000 else body_text[:3000] + "\n...(تم اختصار الرسالة لطولها)"
+        txt += f"<blockquote>{esc(display_body)}</blockquote>\n"
+    else:
+        txt += "<i>(لا يوجد نص إضافي في الرسالة)</i>\n"
+
+    mk.row(_btn("🔙 العودة لصندوق الوارد", style="primary", icon_key="back", callback_data=f"tm_inbox_{em_hash}"))
+    mk.row(types.InlineKeyboardButton("🏠 إدارة البريد", callback_data="menu_tempmail"))
     return txt, mk
 
 
@@ -4138,12 +4203,16 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
     elif data.startswith("tm_inbox_"):
         h = data.replace("tm_inbox_", "").strip()
         hist = tm_m.get_user_history(user_id, limit=50)
+        active = tm_m.get_user_active_mailbox(user_id)
         target_em = None
-        for item in hist:
-            em = item.get("email", "")
-            if hashlib.sha1(em.encode()).hexdigest()[:8] == h:
-                target_em = em
-                break
+        if active and hashlib.sha1(active.get("email", "").encode()).hexdigest()[:8] == h:
+            target_em = active.get("email")
+        if not target_em:
+            for item in hist:
+                em = item.get("email", "")
+                if hashlib.sha1(em.encode()).hexdigest()[:8] == h:
+                    target_em = em
+                    break
         safe_answer(call.id, "🔄 جاري فحص وتحديث الصندوق...")
         txt, mk = render_tempmail_inbox_view(user_id, email=target_em)
         safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
@@ -4152,18 +4221,65 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
     elif data.startswith("tm_viewbox_"):
         h = data.replace("tm_viewbox_", "").strip()
         hist = tm_m.get_user_history(user_id, limit=50)
+        active = tm_m.get_user_active_mailbox(user_id)
         target_em = None
-        for item in hist:
-            em = item.get("email", "")
-            if hashlib.sha1(em.encode()).hexdigest()[:8] == h:
-                target_em = em
-                break
+        if active and hashlib.sha1(active.get("email", "").encode()).hexdigest()[:8] == h:
+            target_em = active.get("email")
+        if not target_em:
+            for item in hist:
+                em = item.get("email", "")
+                if hashlib.sha1(em.encode()).hexdigest()[:8] == h:
+                    target_em = em
+                    break
         if target_em:
             safe_answer(call.id, f"📬 فتح صندوق البريد")
             txt, mk = render_tempmail_inbox_view(user_id, email=target_em)
             safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
         else:
             safe_answer(call.id, "لم يتم العثور على هذا البريد في الأرشيف.")
+        return
+
+    elif data.startswith("tm_read_"):
+        parts = data.replace("tm_read_", "").split("_")
+        if len(parts) >= 2:
+            em_h, msg_h = parts[0], parts[1]
+            hist = tm_m.get_user_history(user_id, limit=50)
+            active = tm_m.get_user_active_mailbox(user_id)
+            target_em = None
+            if active and hashlib.sha1(active.get("email", "").encode()).hexdigest()[:8] == em_h:
+                target_em = active.get("email")
+            if not target_em:
+                for item in hist:
+                    em = item.get("email", "")
+                    if hashlib.sha1(em.encode()).hexdigest()[:8] == em_h:
+                        target_em = em
+                        break
+            if not target_em and (is_super_admin(user_id) or has_admin_capability(user_id, "radar_users")):
+                for item in tm_m.list_all_emails_admin(user_id):
+                    em = item.get("email", "")
+                    if hashlib.sha1(em.encode()).hexdigest()[:8] == em_h:
+                        target_em = em
+                        break
+
+            target_msg = None
+            if target_em:
+                msgs = tm_m.get_mailbox_messages(target_em)
+                if not msgs:
+                    msgs = tm_m.check_inbox(user_id, email=target_em)
+                for m in msgs:
+                    mid = str(m.get("id") or "")
+                    if hashlib.sha1(f"{target_em}_{mid}".encode()).hexdigest()[:8] == msg_h or mid == msg_h:
+                        target_msg = m
+                        break
+                if not target_msg and msgs:
+                    target_msg = msgs[0]
+
+            if target_em and target_msg:
+                safe_answer(call.id, "📖 جاري فتح نص الرسالة...")
+                txt, mk = render_tempmail_single_message_view(user_id, target_em, target_msg)
+                safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
+            else:
+                safe_answer(call.id, "⚠️ لم يتم العثور على الرسالة.", show_alert=True)
         return
 
     elif data in ("tm_history", "menu_tm_history"):
@@ -9000,6 +9116,7 @@ def _tempmail_auto_poller_worker() -> None:
                         otp = msg.get("otp_code")
                         links = msg.get("links") or []
 
+                        body_txt = (msg.get("body_text") or "").strip()
                         alert_txt = (
                             f"🔔 <b>وصلت رسالة جديدة إلى بريدك المؤقت!</b>\n"
                             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -9012,14 +9129,21 @@ def _tempmail_auto_poller_worker() -> None:
                                 f"━━━━━━━━━━━━━━━━━━━━\n"
                                 f"🔑 <b>كود التحقق (OTP):</b> <code>{esc(otp)}</code> <i>(اضغط للنسخ)</i>\n"
                             )
+                        if body_txt:
+                            snippet = esc(body_txt[:120]) + ("..." if len(body_txt) > 120 else "")
+                            alert_txt += f"💬 <b>المحتوى:</b> <i>{snippet}</i>\n"
+
+                        em_h = hashlib.sha1(target_email.encode()).hexdigest()[:8]
+                        msg_h = hashlib.sha1(f"{target_email}_{msg.get('id', '')}".encode()).hexdigest()[:8]
 
                         mk = types.InlineKeyboardMarkup(row_width=1)
                         if otp:
                             mk.row(types.InlineKeyboardButton(f"📋 نسخ كود OTP: {otp}", callback_data=f"tm_copyotp_{otp}"))
+                        mk.row(types.InlineKeyboardButton("📖 قراءة الرسالة كاملة", callback_data=f"tm_read_{em_h}_{msg_h}"))
                         if links:
                             mk.row(types.InlineKeyboardButton("🌐 فتح رابط التفعيل", url=links[0]))
                         mk.row(
-                            _btn("📥 عرض صندوق الوارد", style="primary", icon_key="spark", callback_data="tm_inbox")
+                            _btn("📥 عرض صندوق الوارد", style="primary", icon_key="spark", callback_data=f"tm_inbox_{em_h}")
                         )
 
                         safe_send(uid, alert_txt, reply_markup=mk)
