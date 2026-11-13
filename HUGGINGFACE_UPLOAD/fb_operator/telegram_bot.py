@@ -1453,7 +1453,7 @@ def render_tempmail_main_view(user_id: int) -> tuple[str, types.InlineKeyboardMa
             _btn(f"♻️ سلة المحذوفات والاسترجاع ({len(trash)})", callback_data="tm_admin_trash")
         )
 
-    mk.row(types.InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="menu_main"))
+    mk.row(types.InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="back_to_main"))
     return txt, mk
 
 
@@ -3866,6 +3866,172 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         safe_answer(call.id, f"إضافة الحسابات للعامة: {'مفعلة 🟢' if not cur_v else 'معطلة 🔴'}")
         txt, mk = _render_admin_economy_view()
         safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
+        return
+
+    # ----------------- مركز البريد المؤقت والدائم وسلة الاسترجاع -----------------
+    elif data == "menu_tempmail":
+        if not is_feature_enabled(user_id, "tempmail") and not is_super_admin(user_id):
+            safe_answer(call.id, "⛔ ميزة البريد مغلقة حالياً أو تتطلب إذناً من الإدارة.", show_alert=True)
+            return
+        _track_view(user_id, call.message.chat.id, call.message.message_id, "tempmail")
+        txt, mk = render_tempmail_main_view(user_id)
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
+        return
+
+    elif data == "tm_new_rand":
+        if not is_feature_enabled(user_id, "tempmail") and not is_super_admin(user_id):
+            safe_answer(call.id, "⛔ ميزة البريد مغلقة حالياً.", show_alert=True)
+            return
+        mb = tm_m.create_random_email(user_id)
+        safe_answer(call.id, f"✅ تم إنشاء وتفعيل البريد: {mb.get('email')}")
+        txt, mk = render_tempmail_main_view(user_id)
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
+        return
+
+    elif data == "tm_pick_dom":
+        if not is_feature_enabled(user_id, "tempmail") and not is_super_admin(user_id):
+            safe_answer(call.id, "⛔ ميزة البريد مغلقة حالياً.", show_alert=True)
+            return
+        txt, mk = render_tempmail_pick_domain_view(user_id, page=0)
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
+        return
+
+    elif data.startswith("tm_dompage_"):
+        page_str = data.replace("tm_dompage_", "").strip()
+        page = int(page_str) if page_str.isdigit() else 0
+        txt, mk = render_tempmail_pick_domain_view(user_id, page=page)
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
+        return
+
+    elif data.startswith("tm_seldom_"):
+        dom = data.replace("tm_seldom_", "").strip()
+        st = get_user_state(user_id)
+        st["tm_pending_domain"] = dom
+        st["input_mode"] = "waiting_tm_custom_name"
+        safe_answer(call.id)
+        safe_send(
+            call.message.chat.id,
+            f"✏️ <b>أرسل الآن اسم المستخدم المطلوب للبريد:</b>\n\n"
+            f"🌐 النطاق المختار: <code>@{esc(dom)}</code>\n"
+            f"مثال: أرسل <code>john.dev</code> ليكون البريد <code>john.dev@{esc(dom)}</code>",
+            reply_markup=_prompt_back_markup("cancel_to:menu_tempmail")
+        )
+        return
+
+    elif data == "tm_inbox":
+        txt, mk = render_tempmail_inbox_view(user_id)
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
+        return
+
+    elif data == "tm_history":
+        txt, mk = render_tempmail_history_view(user_id)
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
+        return
+
+    elif data == "tm_del_active":
+        act = tm_m.get_user_active_mailbox(user_id)
+        if act and act.get("email"):
+            tm_m.delete_user_email(user_id, act["email"], deleted_by=user_id)
+            safe_answer(call.id, "🗑️ تم نقل البريد إلى سلة المحذوفات بنجاح!", show_alert=True)
+        else:
+            safe_answer(call.id, "لا يوجد بريد نشط لحذفه.")
+        txt, mk = render_tempmail_main_view(user_id)
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
+        return
+
+    elif data.startswith("tm_switch_"):
+        h = data.replace("tm_switch_", "").strip()
+        hist = tm_m.get_user_history(user_id, limit=50)
+        target_em = None
+        for item in hist:
+            em = item.get("email", "")
+            if hashlib.sha1(em.encode()).hexdigest()[:8] == h:
+                target_em = em
+                break
+        if target_em:
+            tm_m.set_user_active_mailbox(user_id, target_em)
+            safe_answer(call.id, f"✅ تم تفعيل البريد: {target_em}")
+        else:
+            safe_answer(call.id, "لم يتم العثور على هذا البريد.")
+        txt, mk = render_tempmail_main_view(user_id)
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
+        return
+
+    elif data.startswith("tm_del_"):
+        h = data.replace("tm_del_", "").strip()
+        hist = tm_m.get_user_history(user_id, limit=50)
+        target_em = None
+        for item in hist:
+            em = item.get("email", "")
+            if hashlib.sha1(em.encode()).hexdigest()[:8] == h:
+                target_em = em
+                break
+        if target_em:
+            tm_m.delete_user_email(user_id, target_em, deleted_by=user_id)
+            safe_answer(call.id, "🗑️ تم نقل البريد إلى سلة المحذوفات!")
+        txt, mk = render_tempmail_history_view(user_id)
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
+        return
+
+    elif data == "tm_admin_all":
+        if not (is_super_admin(user_id) or has_admin_capability(user_id, "radar_users")):
+            safe_answer(call.id, "⛔ غير مصرح لك.", show_alert=True)
+            return
+        txt, mk = render_tempmail_admin_all_view(user_id)
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
+        return
+
+    elif data.startswith("tm_admbox_"):
+        if not (is_super_admin(user_id) or has_admin_capability(user_id, "radar_users")):
+            safe_answer(call.id, "⛔ غير مصرح لك.", show_alert=True)
+            return
+        h = data.replace("tm_admbox_", "").strip()
+        all_emails = tm_m.list_all_emails_admin(user_id)
+        target_em = None
+        for item in all_emails:
+            em = item.get("email", "")
+            if hashlib.sha1(em.encode()).hexdigest()[:8] == h:
+                target_em = em
+                break
+        if target_em:
+            txt, mk = render_tempmail_inbox_view(user_id, email=target_em)
+            safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
+        else:
+            safe_answer(call.id, "البريد غير موجود.")
+        return
+
+    elif data == "tm_admin_trash":
+        if not (is_super_admin(user_id) or has_admin_capability(user_id, "radar_users")):
+            safe_answer(call.id, "⛔ غير مصرح لك.", show_alert=True)
+            return
+        txt, mk = render_tempmail_admin_trash_view(user_id)
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
+        return
+
+    elif data.startswith("tm_restore_"):
+        if not (is_super_admin(user_id) or has_admin_capability(user_id, "radar_users")):
+            safe_answer(call.id, "⛔ غير مصرح لك.", show_alert=True)
+            return
+        h = data.replace("tm_restore_", "").strip()
+        trash = tm_m.list_trash_emails_admin(user_id)
+        target_em = None
+        for item in trash:
+            em = item.get("email", "")
+            if hashlib.sha1(em.encode()).hexdigest()[:8] == h:
+                target_em = em
+                break
+        if target_em:
+            tm_m.restore_deleted_email(target_em, restored_by=user_id)
+            safe_answer(call.id, f"✅ تم استرجاع البريد بنجاح: {target_em}", show_alert=True)
+        else:
+            safe_answer(call.id, "لم يتم العثور على البريد في السلة.")
+        txt, mk = render_tempmail_admin_trash_view(user_id)
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
+        return
+
+    elif data.startswith("tm_copyotp_"):
+        otp = data.replace("tm_copyotp_", "").strip()
+        safe_answer(call.id, f"كود OTP:\n{otp}", show_alert=True)
         return
 
     # ----------------- مركز الإعلانات العائمة والمنبثقة للمطور والأدمن غير المقيد -----------------
@@ -6775,6 +6941,28 @@ def _handle_text_inputs_impl(message: types.Message):
         st["input_mode"] = None
         bot.reply_to(message, f"✅ تم تحديث الرابط المستهدف إلى:\n<code>{esc(text)}</code>")
         cmd_start(message)
+
+    elif mode == "waiting_tm_custom_name":
+        st["input_mode"] = None
+        domain = st.get("tm_pending_domain", "voewo.com")
+        clean_name = re.sub(r'[^a-zA-Z0-9._-]', '', text.strip().lower())
+        if not clean_name:
+            clean_name = f"user{int(user_id) % 10000}"
+        mb = tm_m.create_custom_email(user_id, clean_name, domain)
+        mk = types.InlineKeyboardMarkup(row_width=2)
+        mk.row(
+            _btn("🔄 فحص الوارد الآن", style="primary", icon_key="spark", callback_data="tm_inbox"),
+            _btn("📧 إدارة البريد", callback_data="menu_tempmail")
+        )
+        bot.reply_to(
+            message,
+            f"✅ <b>تم إنشاء بريدك المخصص بنجاح وتفعيله!</b>\n\n"
+            f"📬 <code>{esc(mb['email'])}</code> <i>(اضغط للنسخ 📋)</i>\n"
+            f"🏢 المزود: <code>{esc(mb.get('provider', '1timetech'))}</code> | 🌐 النطاق: <code>{esc(domain)}</code>\n\n"
+            f"💡 يمكنك استخدام هذا البريد في أي منصة، ثم فحص الوارد مباشرة من الزر أدناه.",
+            reply_markup=mk
+        )
+        return
 
     elif mode == "waiting_msg_text":
         if not (is_super_admin(user_id) or has_permission(user_id, "can_message")):
