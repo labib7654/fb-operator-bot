@@ -1,7 +1,5 @@
 """
-المحرك المالي، منظومة النقاط القانونية (10 ريال يمني / نقطة)، روابط وأكواد الإحالة (+4 نقاط)،
-بوابة الوضع العام المدفوع بالنقاط، وتذاكر الدعم والمحاسبة وبيع الحسابات ثنائية الاتجاه.
-يعمل بتوافق ذري (Thread-Safe RLock + os.replace + Idempotency Keys) لمنع السباق أو التكرار.
+إدارة النقاط والإحالات والدعم.
 """
 
 import json
@@ -55,6 +53,41 @@ OP_COST_LABELS_AR: dict[str, str] = {
     "block": "حظر حساب",
 }
 
+DEFAULT_WALLETS = [
+    {
+        "id": "jeeb",
+        "name": "محفظة جيب",
+        "number": "771172888",
+        "beneficiary": "لبيب فهد رعدان",
+        "notes": "تحويل مباشر لرقم المحفظة",
+        "active": True
+    },
+    {
+        "id": "jawali",
+        "name": "محفظة جوالي",
+        "number": "771172888",
+        "beneficiary": "لبيب فهد رعدان",
+        "notes": "تحويل مباشر لرقم المحفظة",
+        "active": True
+    },
+    {
+        "id": "kuraimi",
+        "name": "بنك الكريمي",
+        "number": "300000000",
+        "beneficiary": "لبيب فهد رعدان",
+        "notes": "إرسال الحوالة بالريال اليمني",
+        "active": True
+    },
+    {
+        "id": "onecash",
+        "name": "ون كاش",
+        "number": "771172888",
+        "beneficiary": "لبيب فهد رعدان",
+        "notes": "تحويل لمحفظة ون كاش",
+        "active": True
+    }
+]
+
 DEFAULT_ECONOMY_SETTINGS: dict = {
     "public_mode": False,
     "enforce_points_on_actions": False,
@@ -68,6 +101,9 @@ DEFAULT_ECONOMY_SETTINGS: dict = {
     "profile_warning_limit": 5,
     "referral_reward": 4,
     "operation_costs": dict(DEFAULT_OP_COSTS),
+    "wallets": list(DEFAULT_WALLETS),
+    "sales_recipient_id": 7411444902,
+    "sales_recipient_username": "",
 }
 
 
@@ -132,6 +168,31 @@ def _normalize_settings(raw: dict | None) -> dict:
     if ref_trigger not in ("first_active", "instant"):
         ref_trigger = "first_active"
     pub = bool(raw.get("public_mode", False))
+    raw_wallets = raw.get("wallets")
+    norm_wallets = []
+    if isinstance(raw_wallets, list) and len(raw_wallets) > 0:
+        for idx_w, w in enumerate(raw_wallets):
+            if isinstance(w, dict) and w.get("name"):
+                w_id = str(w.get("id") or f"w_{idx_w+1}").strip().lower()
+                norm_wallets.append({
+                    "id": w_id,
+                    "name": str(w.get("name", "")).strip(),
+                    "number": str(w.get("number", "")).strip(),
+                    "beneficiary": str(w.get("beneficiary", "")).strip(),
+                    "notes": str(w.get("notes", "")).strip(),
+                    "active": bool(w.get("active", True))
+                })
+    if not norm_wallets:
+        norm_wallets = [dict(w) for w in DEFAULT_WALLETS]
+
+    raw_sales_id = raw.get("sales_recipient_id")
+    try:
+        sales_id = int(raw_sales_id) if raw_sales_id else 7411444902
+    except Exception:
+        sales_id = 7411444902
+
+    sales_uname = str(raw.get("sales_recipient_username") or "").strip().lstrip("@")
+
     return {
         "public_mode": pub,
         "enforce_points_on_actions": True if pub else bool(raw.get("enforce_points_on_actions", False)),
@@ -146,6 +207,9 @@ def _normalize_settings(raw: dict | None) -> dict:
         "profile_warning_limit": _clamp_int(raw.get("profile_warning_limit", 5), 5, 0, 20),
         "referral_reward": _clamp_int(raw.get("referral_reward", 4), 4, 0, 10000),
         "operation_costs": norm_costs,
+        "wallets": norm_wallets,
+        "sales_recipient_id": sales_id,
+        "sales_recipient_username": sales_uname,
     }
 
 
@@ -184,6 +248,12 @@ def update_economy_settings(patch: dict, actor_uid: int = 0) -> dict:
                 cur["profile_warning_limit"] = _clamp_int(patch["profile_warning_limit"], cur.get("profile_warning_limit", 5), 0, 20)
             if "referral_reward" in patch:
                 cur["referral_reward"] = _clamp_int(patch["referral_reward"], cur["referral_reward"], 0, 10000)
+            if "wallets" in patch and isinstance(patch["wallets"], list):
+                cur["wallets"] = patch["wallets"]
+            if "sales_recipient_id" in patch:
+                cur["sales_recipient_id"] = patch["sales_recipient_id"]
+            if "sales_recipient_username" in patch:
+                cur["sales_recipient_username"] = patch["sales_recipient_username"]
             if isinstance(patch.get("operation_costs"), dict):
                 for op_k, default_v in DEFAULT_OP_COSTS.items():
                     if op_k in patch["operation_costs"]:
@@ -226,7 +296,7 @@ def can_user_invite(uid: int) -> bool:
 def ensure_public_access_if_enabled(user_id: int) -> bool:
     """
     في حال فتح المطور 'الوضع العام': يتم اعتماد المستخدم غير المحظور تلقائياً
-    بصلاحيات العضو العام، مع إبقاء خصم النقاط إجبارياً عند تنفيذ العمليات.
+    بصلاحيات العضو العام، مع إبقاء خصم النقاط إلزامياً عند تنفيذ العمليات.
     """
     if adm_mgr.is_super_admin(user_id):
         return True
@@ -1085,3 +1155,104 @@ def get_ticket_by_id(ticket_id: str) -> dict | None:
             copy_t["live_snapshot"] = build_user_settlement_snapshot(int(t.get("user_id", 0)))
             return copy_t
     return None
+
+
+def list_active_wallets() -> list[dict]:
+    """قائمة المحافظ المفعلة والمتاحة للمستخدمين لشراء النقاط."""
+    cfg = load_economy_settings()
+    return [w for w in cfg.get("wallets", []) if w.get("active", True)]
+
+
+def get_all_wallets() -> list[dict]:
+    """كافة المحافظ المضافة (المفعلة والمعطلة) لإدارة المطور."""
+    cfg = load_economy_settings()
+    return list(cfg.get("wallets", []))
+
+
+def get_wallet_by_id(w_id: str) -> dict | None:
+    """جلب بيانات محفظة معينة عبر معرفها."""
+    cfg = load_economy_settings()
+    target = str(w_id).strip().lower()
+    for w in cfg.get("wallets", []):
+        if str(w.get("id", "")).strip().lower() == target:
+            return w
+    return None
+
+
+def add_custom_wallet(name: str, number: str, beneficiary: str, notes: str = "", actor_uid: int = 0) -> dict:
+    """إضافة محفظة دفع جديدة بواسطة المطور."""
+    cfg = load_economy_settings()
+    wallets = list(cfg.get("wallets", []))
+    w_id = f"w_{int(time.time())}"
+    new_w = {
+        "id": w_id,
+        "name": str(name).strip(),
+        "number": str(number).strip(),
+        "beneficiary": str(beneficiary).strip(),
+        "notes": str(notes).strip(),
+        "active": True
+    }
+    wallets.append(new_w)
+    update_economy_settings({"wallets": wallets}, actor_uid=actor_uid)
+    if actor_uid:
+        adm_mgr.record_audit_log(actor_uid, "المطور", "WALLET_ADD", f"إضافة محفظة دفع جديدة: {name} ({number})")
+    return new_w
+
+
+def delete_custom_wallet(w_id: str, actor_uid: int = 0) -> bool:
+    """حذف محفظة مخصصة بواسطة المطور."""
+    cfg = load_economy_settings()
+    wallets = list(cfg.get("wallets", []))
+    target = str(w_id).strip().lower()
+    new_wallets = [w for w in wallets if str(w.get("id", "")).strip().lower() != target]
+    if len(new_wallets) != len(wallets):
+        update_economy_settings({"wallets": new_wallets}, actor_uid=actor_uid)
+        if actor_uid:
+            adm_mgr.record_audit_log(actor_uid, "المطور", "WALLET_DELETE", f"حذف محفظة الدفع: {w_id}")
+        return True
+    return False
+
+
+def toggle_wallet(w_id: str, actor_uid: int = 0) -> bool:
+    """تفعيل أو تعطيل ظهور المحفظة للمستخدمين."""
+    cfg = load_economy_settings()
+    wallets = list(cfg.get("wallets", []))
+    target = str(w_id).strip().lower()
+    new_status = False
+    found = False
+    for w in wallets:
+        if str(w.get("id", "")).strip().lower() == target:
+            w["active"] = not bool(w.get("active", True))
+            new_status = w["active"]
+            found = True
+            break
+    if found:
+        update_economy_settings({"wallets": wallets}, actor_uid=actor_uid)
+        if actor_uid:
+            adm_mgr.record_audit_log(actor_uid, "المطور", "WALLET_TOGGLE", f"تغيير حالة المحفظة {w_id} إلى: {new_status}")
+    return new_status
+
+
+def get_sales_recipient() -> tuple[int, str]:
+    """معرف وحساب تليجرام المخصص لاستقبال استفسارات وسندات شراء النقاط."""
+    cfg = load_economy_settings()
+    raw_id = cfg.get("sales_recipient_id")
+    try:
+        s_id = int(raw_id) if raw_id else 7411444902
+    except Exception:
+        s_id = 7411444902
+    s_uname = str(cfg.get("sales_recipient_username") or "").strip().lstrip("@")
+    return s_id, s_uname
+
+
+def set_sales_recipient(sales_id: int, username: str = "", actor_uid: int = 0) -> dict:
+    """تغيير وجهة استقبال المبيعات إلى أي حساب تليجرام آخر عبر الآيدي."""
+    patch = {
+        "sales_recipient_id": int(sales_id),
+        "sales_recipient_username": str(username).strip().lstrip("@")
+    }
+    update_economy_settings(patch, actor_uid=actor_uid)
+    if actor_uid:
+        adm_mgr.record_audit_log(actor_uid, "المطور", "SALES_RECIPIENT", f"تعيين وجهة المبيعات: ID={sales_id}, User=@{username}")
+    return patch
+

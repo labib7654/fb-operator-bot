@@ -1,13 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-جسر كاشف الأرقام اليمنية المتقدم (Yemen Caller ID Master UserBot Bridge)
------------------------------------------------------------------
-يقوم بالربط البرمجي بين بوتك وبوت كاشف الأرقام الرسمي (@Yemennumber_bot)
-لسحب الأسماء الحقيقية الكاملة بدون قيود، مع:
-1. استخراج الاسم الأكثر شهرة + عدد السجلات + قائمة الأسماء الصافية.
-2. تنقية وتطهير الردود من كافة الإعلانات وروابط القنوات والاشتراكات الإجبارية.
-3. كاش محلي فوري فائق السرعة عبر SQLite (Zero-Delay Local Cache).
-4. معالجة متقدمة لضغط الطلبات وتجنب حظر التيليجرام (FloodWait Resilience).
+جسر كاشف الأرقام عبر تيليجرام.
 """
 from __future__ import annotations
 
@@ -107,7 +100,7 @@ class YemenNumberBridge:
             logger.error(f"Error initializing SQLite cache: {e}")
 
     def get_cached(self, phone: str) -> Optional[Dict[str, Any]]:
-        """التحقق مما إذا كان الرقم محفوظاً مسبقاً في الكاش المحلي فائق السرعة"""
+        """التحقق مما إذا كان الرقم محفوظاً مسبقاً في السجل"""
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
@@ -267,7 +260,7 @@ class YemenNumberBridge:
                 "primary_name": parsed["primary_name"],
                 "records_count": parsed["records_count"],
                 "names": parsed["names"],
-                "source": "الدليل السحابي الرسمي 🌐"
+                "source": "كاشف الأرقام 🌐"
             }
         except FloodWaitError as e:
             return {"success": False, "error": f"يرجى الانتظار {e.seconds} ثانية بسبب ضغط تليجرام."}

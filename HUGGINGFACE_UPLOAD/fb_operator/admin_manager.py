@@ -1,8 +1,5 @@
 """
-نظام إدارة المستخدمين، بوابة الموافقة الصارمة، والرادار الشامل للمطور الأكبر
-(Omniscient Surveillance, Strict Granular Permissions & Audit Log Engine)
-يضمن سيادة أمنية مطلقة للمطور الأكبر ويمنع أي اختراق أو تصعيد صلاحيات،
-ويتحكم بكل أداة وميزة بشكل منفصل مع تسجيل فوري لكل حساب نشط أو فاشل يتم إضافته.
+نظام إدارة المستخدمين والصلاحيات.
 """
 
 import json
@@ -20,7 +17,7 @@ _audit_lock = threading.RLock()
 _USERS_CACHE_KEY: tuple[str, int, int] | None = None
 _USERS_CACHE_DATA: dict = {}
 
-# الآيدي السيادي للمطور الأكبر — محمي برمجياً ولا يمكن تغييره أو انتحاله أبداً
+# آيدي المطور الرئيسي
 SUPER_ADMIN_ID = 7411444902
 
 # مصفوفة الصلاحيات الدقيقة (كل ميزة مغلقة تماماً افتراضياً حتى يفتحها المطور بنفسه)
@@ -48,25 +45,25 @@ PERMISSION_LABELS = {
     "can_message": "الرسائل الخاصة",
     "can_report": "البلاغات والحظر",
     "can_delete_accounts": "حذف الحسابات المضافة",
-    "can_execute": "التنفيذ الميداني (الإطلاق)",
+    "can_execute": "تشغيل المهام",
     "can_invite": "روابط وأكواد الإحالة"
 }
 
 ALL_TRUE_PERMISSIONS = {k: True for k in DEFAULT_PERMISSIONS}
 
-# رتب التفويض الإداري (تحفظ role='user' لمنع كسر فحوصات الأمان المخصصة للمطور الحصين 7411444902)
+# رتب التفويض الإداري
 ADMIN_TIERS = ("none", "manager", "super_delegate")
 ADMIN_TIER_LABELS = {
     "none": "👤 مستخدم عادي",
     "manager": "🛡️ مدير / أدمن مساعد",
-    "super_delegate": "👑 أدمن فوق الأدمن (نائب المطور)",
+    "super_delegate": "👑 نائب المطور",
 }
 
 ADMIN_RESTRICTION_LABELS = {
     "block_payment_notices": "حجب رسائل الدفع والمحاسبة والتذاكر المالية",
     "block_points_economy": "منع إدارة الاقتصاد والنقاط والأسعار",
     "block_new_user_notices": "حجب إشعارات المسجلين الجدد وطلبات الانضمام",
-    "block_radar_users": "منع فتح رادار المستخدمين والتعديل",
+    "block_radar_users": "منع إدارة المستخدمين والصلاحيات",
     "block_account_notices": "حجب إشعارات إضافة الحسابات الجديدة ولقطاتها",
     "block_accounts_pool": "منع مشاهدة وإدارة كل حسابات البوت",
     "block_proxies": "منع دخول إدارة البروكسيات ونفق 4G",
@@ -91,7 +88,7 @@ def _atomic_write_json(path: Path, data) -> None:
 
 
 def is_super_admin(user_id: int | str) -> bool:
-    """التحقق الصارم من الهوية السيادية للمطور الأكبر"""
+    """التحقق من هوية المطور الرئيسي"""
     if isinstance(user_id, bool):
         return False
     try:
@@ -263,7 +260,7 @@ def save_users(data: dict, sync_git: bool = False) -> None:
 
 def register_or_update_user(user_id: int, name: str, username: str = "", touch_login: bool = True) -> tuple[dict, bool]:
     """
-    تسجيل أو تحديث بيانات المستخدم في الرادار الشامل.
+    تسجيل أو تحديث بيانات المستخدم.
     يعود بـ (بيانات المستخدم، هل هو مستخدم جديد؟)
     """
     is_new = False

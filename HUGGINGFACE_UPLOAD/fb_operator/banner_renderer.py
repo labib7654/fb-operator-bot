@@ -64,7 +64,7 @@ def build_announcement_card_html(ann: dict[str, Any], phase: float = 0.0) -> str
     badge = str(ann.get("badge") or "ميزة جديدة").strip()
     accent, accent_soft, tag_en = _BADGE_THEMES.get(badge, ("#2ea043", "rgba(46, 160, 67, 0.16)", "LIVE UPDATE"))
 
-    title = html.escape(str(ann.get("title") or "تحديث جديد في المنظومة")[:110], quote=True)
+    title = html.escape(str(ann.get("title") or "تحديث جديد")[:110], quote=True)
     body_raw = str(ann.get("body") or "")[:360]
     body_lines = [html.escape(line.strip(), quote=True) for line in body_raw.splitlines() if line.strip()][:5]
     body_html = "<br>".join(body_lines) if body_lines else "افتح لوحة التحكم لاستعراض الميزة الجديدة."

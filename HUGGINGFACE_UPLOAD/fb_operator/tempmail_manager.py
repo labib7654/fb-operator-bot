@@ -469,8 +469,8 @@ def check_inbox(user_id: int, email: str | None = None) -> list[dict[str, Any]]:
 
 def list_all_emails_admin(viewer_id: int) -> list[dict[str, Any]]:
     """
-    رادار المطور الشامل:
-    عرض كافة الإيميلات المنشأة لجميع المستخدمين مع تفاصيل كل مستخدم وصندوقه النشط.
+    بريد المستخدمين:
+    عرض الإيميلات المنشأة لجميع المستخدمين.
     """
     with _tm_lock:
         data = _get_data()
@@ -506,13 +506,13 @@ def list_all_emails_admin(viewer_id: int) -> list[dict[str, Any]]:
 
 
 def list_trash_emails_admin(viewer_id: int) -> list[dict[str, Any]]:
-    """خزنة استرجاع الإيميلات المحذوفة المخصصة للمطور"""
+    """استرجاع الإيميلات المحذوفة للمطور"""
     with _tm_lock:
         return _get_trash()
 
 
 def get_telemetry_stats() -> dict[str, int]:
-    """إحصائيات تيليميتري للمنظومة"""
+    """إحصائيات النظام"""
     with _tm_lock:
         data = _get_data()
         trash = _get_trash()

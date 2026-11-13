@@ -134,7 +134,7 @@ class MultiSessionPoolManager:
             logger.error(f"Error initializing SQLite in MultiSessionPool: {e}")
 
     def discover_sessions(self) -> List[Dict[str, Any]]:
-        """اكتشاف كافة ملفات الجلسات (.session) الصالحة عبر مجلدات المنظومة"""
+        """اكتشاف ملفات الجلسات (.session) الصالحة"""
         found: Dict[str, Path] = {}
         for d in _get_search_dirs():
             for s in d.glob("*.session"):
@@ -255,7 +255,7 @@ class MultiSessionPoolManager:
                 "primary_name": cached["primary_name"],
                 "records_count": cached["records_count"],
                 "names": cached["names"],
-                "source": "قاعدة البيانات المحلية (سريع ⚡)"
+                "source": "السجل المحفوظ ⚡"
             }
 
         self._ensure_loop()
@@ -286,7 +286,7 @@ class MultiSessionPoolManager:
                 "primary_name": cached["primary_name"],
                 "records_count": cached["records_count"],
                 "names": cached["names"],
-                "source": "قاعدة البيانات المحلية (سريع ⚡)"
+                "source": "السجل المحفوظ ⚡"
             }
 
         # 2. جلب الجلسات المتاحة

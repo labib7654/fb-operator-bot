@@ -926,7 +926,7 @@ def interact_with_specific_comment(
     reply_text: str = ""
 ) -> bool:
     """
-    المنظومة الشاملة للتفاعل والرد على تعليق محدد بدقة عالية:
+    التفاعل والرد على تعليق محدد:
     - post_index: رقم المنشور (افتراضياً 1)
     - target_mode: 'first' (أول تعليق) أو 'author' (اسم المعلق) أو 'keyword' (كلمة في التعليق) أو 'index' (رقم التعليق)
     - target_value: القيمة المقابلة للبحث
@@ -1185,7 +1185,7 @@ def unfollow_profile(page: Page) -> bool:
     return False
 
 def extract_facebook_target_id(url: str) -> str:
-    """استخراج المعرف الرقمي أو اسم المستخدم من رابط الحساب بدقة فائقة"""
+    """استخراج المعرف الرقمي أو اسم المستخدم من رابط الحساب"""
     if not url:
         return ""
     m = re.search(r"[?&]id=(\d+)", url)

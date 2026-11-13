@@ -928,11 +928,11 @@ def get_miniapp_html() -> str:
             </div>
         </div>
 
-        <!-- تبويب رادار المطور الأكبر (حصري لـ SUPER_ADMIN_ID) -->
+        <!-- تبويب المستخدمين والصلاحيات -->
         <div id="tab-radar" class="tab-view hidden">
             <div class="panel">
                 <div class="panel-title">
-                    <span>رادار المستخدمين والصلاحيات</span>
+                    <span>المستخدمين والصلاحيات</span>
                     <div style="display:flex;gap:6px;">
                         <button type="button" class="btn btn-muted btn-sm" onclick="loadAdminRadar()">تحديث</button>
                         <button type="button" class="btn btn-muted btn-sm" onclick="goHomeTab()">رجوع</button>
@@ -1545,7 +1545,7 @@ function renderApp() {
 
     const enabledLabels = appState.enabled_labels || [];
     if (isDev) {
-        document.getElementById("userPermsSummary").textContent = "صلاحيات سيادية كاملة | مزامنة فورية بالأحداث";
+        document.getElementById("userPermsSummary").textContent = "تحكم كامل";
     } else if (appState.admin_tier === "super_delegate" || appState.admin_tier === "manager") {
         document.getElementById("userPermsSummary").textContent =
             (appState.admin_tier_label || "مفوّض إداري") +
@@ -1567,7 +1567,7 @@ function renderApp() {
         tabs.push({ id: "wallet", label: "المحفظة والإحالة" });
         tabs.push({ id: "support", label: (isDev || caps.payment_notices) ? "صندوق الدعم والبيع" : "الدعم وبيع الحسابات" });
     }
-    if (isDev || caps.radar_users) tabs.push({ id: "radar", label: "الرادار والصلاحيات" });
+    if (isDev || caps.radar_users) tabs.push({ id: "radar", label: "المستخدمين والصلاحيات" });
     if (isDev || caps.proxies) tabs.push({ id: "proxies", label: "البروكسيات" });
     if (isDev || caps.announcements) tabs.push({ id: "announcements", label: "الإعلانات العائمة" });
     if (isDev || caps.points_economy) tabs.push({ id: "economy", label: "تسعيرة النقاط والوضع العام" });

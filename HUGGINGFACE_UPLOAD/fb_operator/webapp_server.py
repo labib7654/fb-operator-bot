@@ -674,7 +674,7 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                 uid, tg_user, _ = auth
                 is_dev = hooks["is_super_admin"](uid)
                 if not self._has_cap(uid, "radar_users"):
-                    self._deny_perm(uid, tg_user, "محاولة استعلام رادار المطور من مستخدم غير مصرح")
+                    self._deny_perm(uid, tg_user, "محاولة استعلام قائمة المستخدمين من مستخدم غير مصرح")
                     return
 
                 cap_pool = self._has_cap(uid, "accounts_pool")
@@ -1426,8 +1426,8 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                         return
                     update_menu_button_for_user(bot_inst, target_id, is_allowed=True)
                     t_lbl = adm.ADMIN_TIER_LABELS.get(tier_val, tier_val)
-                    hooks["safe_send"](target_id, f"🎖️ <b>تحديث رتبتك الإدارية:</b> تم تعيينك كـ <b>{html.escape(t_lbl, quote=True)}</b>.")
-                    self._send_json(200, {"ok": True, "tier": tier_val, "message": f"✅ تم تعيين الرتبة: {t_lbl}"})
+                    hooks["safe_send"](target_id, f"🎖️ <b>تحديث مستواك:</b> تم تعيينك كـ <b>{html.escape(t_lbl, quote=True)}</b>.")
+                    self._send_json(200, {"ok": True, "tier": tier_val, "message": f"✅ تم تعيين المستوى: {t_lbl}"})
                     return
 
                 if act == "toggle_restriction":
@@ -1545,7 +1545,7 @@ def make_miniapp_handler(bot_token: str, hooks: dict[str, Any]):
                         f"💸 تسوية كامل الرصيد ({snap['points']} نقطة = {snap['yer_value']:,} ريال)",
                         callback_data=f"tkt_settle_{tkt['id']}"
                     ))
-                mk.add(types.InlineKeyboardButton("🛰️ فتح بطاقة المستخدم بالرادار", callback_data=f"surv_user_{uid}"))
+                mk.add(types.InlineKeyboardButton("👤 عرض بيانات المستخدم", callback_data=f"surv_user_{uid}"))
                 tkt_html = (
                     f"📬 <b>{title}</b>\n"
                     "━━━━━━━━━━━━━━━━━━━━\n"

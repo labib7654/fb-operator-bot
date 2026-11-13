@@ -33,7 +33,7 @@ _sync_state = {
     "last_pull_ts": 0.0,
     "last_pull_iso": "",
     "last_error": "",
-    "last_status": "مرآة SQLite محلية نشطة | لم تُربط قاعدة سحابية خارجية بعد",
+    "last_status": "قاعدة محلية نشطة | لم تُربط قاعدة خارجية بعد",
 }
 
 SUPPORTED_PROVIDERS = ("turso", "supabase", "firebase")
@@ -184,7 +184,7 @@ def clear_cloud_db_config() -> dict:
             except Exception:
                 pass
         _sync_state["last_error"] = ""
-        _sync_state["last_status"] = "مرآة SQLite محلية نشطة | تم فصل القاعدة السحابية"
+        _sync_state["last_status"] = "قاعدة محلية نشطة | تم فصل القاعدة الخارجية"
         return load_cloud_db_config(mask_secrets=True)
 
 

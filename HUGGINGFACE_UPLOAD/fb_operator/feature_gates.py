@@ -1,12 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-محرك إدارة وبوابات الميزات المستقبلية (Feature Gates & Extensibility Engine)
----------------------------------------------------------------------------
-يتيح للمطور الأكبر التحكم بكل ميزة حالية أو مستقبلية:
-1. نطاق الوصول: (public = عامة للجميع | admins = للمطور والأدمن فقط | specific = لأشخاص محددين بالـ ID).
-2. نموذج التسعير: (free = مجانية بدون رصيد | points = خصم نقاط محددة عند كل تشغيل).
-3. حالة الميزة: (active = نشطة | disabled = معطلة مؤقتاً | beta = تجريبية | coming_soon = قيد التطوير).
-4. إضافة ميزات عالمية جديدة ديناميكياً (مثل الإيميلات، الذكاء الاصطناعي، وغيرها).
+إدارة ميزات البوت وصلاحيات الوصول.
 """
 from __future__ import annotations
 
@@ -91,6 +85,17 @@ DEFAULT_FEATURES: dict[str, dict[str, Any]] = {
         "title": "كاشف الأرقام",
         "description": "معرفة اسم المتصل والشبكة لجميع الأرقام اليمنية.",
         "category": "أدوات",
+        "status": "active",
+        "access_scope": "public",
+        "pricing_type": "free",
+        "points_cost": 0,
+        "allowed_user_ids": [],
+    },
+    "virtual_numbers": {
+        "id": "virtual_numbers",
+        "title": "أرقام التفعيل",
+        "description": "أرقام دولية مؤقتة لاستقبال رسائل وأكواد SMS.",
+        "category": "الأرقام",
         "status": "active",
         "access_scope": "public",
         "pricing_type": "free",
@@ -381,7 +386,7 @@ def register_custom_feature(
     status: str = "active",
     **kwargs: Any,
 ) -> ResultDict:
-    """تسجيل ميزة جديدة في المنظومة وإتاحة بوابتها فوراً للإدارة والتسعير."""
+    """تسجيل ميزة جديدة وإتاحتها للإدارة."""
     fid = str(feature_id or "").strip().lower()
     if not fid:
         return ResultDict(ok=False, error="معرّف الميزة مطلوب.")

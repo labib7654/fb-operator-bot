@@ -1,9 +1,5 @@
 """
-بوت تلغرام المتطور للتحكم الكامل بأتمتة حسابات فيسبوك (FB Operator Telegram Bot)
-يدعم بوابة الموافقة الصارمة (Strict Two-Tier Approval Gate)،
-نظام الصلاحيات الدقيق لـ 10 أدوات مستقلة (كل ميزة مغلقة افتراضياً حتى يفتحها المطور)،
-رادار المراقبة الشامل والإشعارات الفورية للمطور عن كل حساب نشط أو فاشل يتم إضافته،
-منع تكرار الحسابات نهائياً، وعزل الخيوط للتنفيذ المتوازي الآمن 24/7.
+بوت تلغرام لإدارة حسابات فيسبوك وكاشف الأرقام والبريد المؤقت.
 """
 
 import sys
@@ -155,6 +151,8 @@ from fb_operator.economy_manager import (
     list_invite_codes_by_owner, revoke_invite_code, looks_like_invite_token,
     redeem_invite_code, build_user_settlement_snapshot, create_support_ticket,
     reply_support_ticket, settle_payout, list_support_tickets, get_ticket_by_id,
+    list_active_wallets, get_all_wallets, get_wallet_by_id, add_custom_wallet,
+    delete_custom_wallet, toggle_wallet, get_sales_recipient, set_sales_recipient,
 )
 from fb_operator.feature_gates import (
     load_feature_gates, get_feature, list_features, is_feature_accessible,
@@ -723,18 +721,18 @@ def notify_new_pending_user(user_id: int, full_name: str, username: str = "") ->
         types.InlineKeyboardButton("🚫 رفض وحظر نهائي", callback_data=f"gate_ban_{user_id}")
     )
     markup.add(
-        types.InlineKeyboardButton("🛰️ فتح بطاقة المستخدم بالرادار", callback_data=f"surv_user_{user_id}")
+        types.InlineKeyboardButton("👤 عرض بيانات المستخدم", callback_data=f"surv_user_{user_id}")
     )
     user_tag = f"@{esc(username)}" if username else "بدون معرف"
     alert_text = (
-        "🚨 <b>رادار الأمان: مستخدم جديد دخل للبوت!</b>\n"
+        "🔔 <b>مستخدم جديد دخل للبوت:</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"👤 <b>الاسم:</b> {esc(full_name)}\n"
         f"🆔 <b>الآيدي:</b> <code>{user_id}</code>\n"
         f"🌐 <b>المعرف:</b> {user_tag}\n"
         f"📅 <b>التوقيت:</b> {datetime.now().strftime('%Y-%m-%d %I:%M %p')}\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "⚠️ <b>الحالة الآن:</b> محجوب بالكامل. عند القبول تبقى كل الميزات مغلقة حتى تحددها بنفسك:"
+        "⚠️ <b>الحالة الآن:</b> محجوب حتى تحدد صلاحياته بنفسك:"
     )
     for rec_uid in get_admin_notification_recipients("new_user_notices"):
         safe_send(rec_uid, alert_text, reply_markup=markup)
@@ -742,10 +740,9 @@ def notify_new_pending_user(user_id: int, full_name: str, username: str = "") ->
 
 def check_user_access_gate(user, chat_id: int, notify_blocked: bool = True) -> bool:
     """
-    بوابة الأمان والتحقق الصارمة:
-    1. المطور الأكبر يمر فوراً بصلاحيات مطلقة لا تمس.
-    2. أي مستخدم جديد يُسجل كـ 'pending' وكافة الأدوات مغلقة (False)، ويُرسل إشعار فوري للمطور والمدراء.
-    3. يمنع أي مستخدم غير معتمد أو محظور من لمس أي زر أو نص.
+    التحقق من حالة وصول المستخدم:
+    1. المطور يمر فوراً.
+    2. أي مستخدم جديد يُسجل كـ 'pending' ويُرسل إشعار للمطور.
     """
     user_id = user.id
     full_name = f"{user.first_name or ''} {user.last_name or ''}".strip() or f"مستخدم_{user_id}"
@@ -761,7 +758,7 @@ def check_user_access_gate(user, chat_id: int, notify_blocked: bool = True) -> b
         if notify_blocked:
             safe_send(
                 chat_id,
-                "⛔ <b>تم حظر وصولك إلى هذا البوت من قبل المطور الرئيسي.</b>"
+                "⛔ <b>تم حظر وصولك إلى هذا البوت.</b>"
             )
         return False
 
@@ -772,8 +769,8 @@ def check_user_access_gate(user, chat_id: int, notify_blocked: bool = True) -> b
             for rec_uid in get_admin_notification_recipients("new_user_notices"):
                 safe_send(
                     rec_uid,
-                    f"🌐 <b>وضع العامة | مستخدم جديد دخل تلقائياً:</b> {esc(full_name)} (<code>{user_id}</code>)\n"
-                    "🔐 الصلاحية الابتدائية: إضافة حسابات فيسبوك فقط (+ نظام النقاط)."
+                    f"🌐 <b>مستخدم جديد انضم للبوت:</b> {esc(full_name)} (<code>{user_id}</code>)\n"
+                    "🔐 الصلاحية الابتدائية: إضافة حسابات فقط (+ نظام النقاط)."
                 )
         return True
 
@@ -787,11 +784,11 @@ def check_user_access_gate(user, chat_id: int, notify_blocked: bool = True) -> b
         if notify_blocked:
             safe_send(
                 chat_id,
-                "🔒 <b>منظومة FB Operator | الوصول مقفل</b>\n"
+                "🔒 <b>البوت مقفل حالياً</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━\n"
-                "⚠️ لا يمكن استخدام النظام إلا بعد موافقة المطور الرئيسي أو إدخال <b>كود دعوة / رابط إحالة</b> من عضو مصرح.\n\n"
-                "📩 <b>تم إرسال طلبك للمطور للمراجعة.</b>\n"
-                "💡 إن كان لديك كود تفعيل (مثل <code>FB-XXXX-XXXX</code>) يمكنك إرساله مباشرة أو الضغط على الزر أدناه:",
+                "⚠️ لا يمكن استخدام البوت إلا بعد الموافقة أو إدخال <b>كود دعوة</b> من عضو مصرح.\n\n"
+                "📩 <b>تم إرسال طلبك للمراجعة.</b>\n"
+                "💡 إن كان لديك كود تفعيل يمكنك إرساله مباشرة أو الضغط أدناه:",
                 reply_markup=inv_markup
             )
         return False
@@ -1146,7 +1143,7 @@ def _render_announcement_detail_view(ann_id: str) -> tuple[str, types.InlineKeyb
     return txt, mk
 
 
-# ----------------- قسم أدوات فيسبوك المجمعة ودليل الأرباح وبوابات الميزات -----------------
+# ----------------- قسم أدوات فيسبوك المجمعة ودليل الأرباح وإدارة الميزات -----------------
 
 def render_fb_tools_text(user_id: int) -> str:
     """واجهة مجمعة لجميع تفاعلات وأدوات فيسبوك لتقليل الزحام والتشويش في القائمة الرئيسية"""
@@ -1343,7 +1340,7 @@ def render_earn_guide_text_and_markup(user_id: int) -> tuple[str, types.InlineKe
 
 
 def render_feature_gates_text(user_id: int) -> str:
-    """عرض لوحة التحكم المركزية ببوابات الميزات للمطور والأدمن"""
+    """عرض لوحة إدارة الميزات"""
     gates = load_feature_gates()
     lines = [
         "🎛️ <b>إدارة الميزات</b>",
@@ -1696,9 +1693,9 @@ def render_tempmail_admin_all_view(user_id: int) -> tuple[str, types.InlineKeybo
     emails = tm_m.list_all_emails_admin(user_id)
 
     txt = (
-        f"🛰️ <b>رادار المطور لبريد المستخدمين الشامل</b>\n"
+        f"📬 <b>بريد المستخدمين</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"إجمالي الإيميلات المسجلة بالنظام: <b>{len(emails)}</b>\n"
+        f"إجمالي الإيميلات: <b>{len(emails)}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
     )
     mk = types.InlineKeyboardMarkup(row_width=1)
@@ -1725,9 +1722,9 @@ def render_tempmail_admin_trash_view(user_id: int) -> tuple[str, types.InlineKey
     trash = tm_m.list_trash_emails_admin(user_id)
 
     txt = (
-        f"♻️ <b>خزنة الاسترجاع وسلة المحذوفات (Recovery Vault)</b>\n"
+        f"🗑️ <b>سلة المحذوفات</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🛡️ <b>حماية كاملة من الضياع:</b> أي إيميل يحذفه المستخدم بالغلط يُحفظ هنا ويمكنك استرجاعه فوراً بضغطة واحدة!\n"
+        f"يمكنك استرجاع أي إيميل محذوف من هنا:\n"
         f"عدد الإيميلات في السلة: <b>{len(trash)}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
     )
@@ -1818,17 +1815,17 @@ def render_caller_sessions_view(user_id: int) -> tuple[str, types.InlineKeyboard
     sessions = pool_mgr.discover_sessions()
 
     txt = (
-        "🔄 <b>حوض جلسات كاشف الأرقام المتعددة (Multi-Session Rotating Pool)</b>\n"
+        "📱 <b>أرقام البحث عن الأسماء</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "💡 يقوم البوت بالتدوير التلقائي والتبديل الفوري بين حسابات التيليجرام المساعدة؛ فإذا طلبت إحدى الجلسات ترقية أو استنفدت باقتها اليومية، يحول فوراً للرقم الاحتياطي التالي!\n"
+        "حسابات تيليجرام المساعدة في البحث عن الأرقام:\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 <b>عدد الجلسات المفعلة في الحوض:</b> <b>{len(sessions)}</b>\n\n"
+        f"📊 <b>عدد الحسابات المضافة:</b> <b>{len(sessions)}</b>\n\n"
     )
 
     mk = types.InlineKeyboardMarkup(row_width=2)
 
     if not sessions:
-        txt += "⚪ <i>لا توجد أي جلسة مربوطة حالياً. اضغط على الزر أدناه لإضافة رقمك المساعد الأول.</i>\n"
+        txt += "⚪ <i>لا توجد أي جلسة مربوطة حالياً. اضغط على الزر أدناه لإضافة رقم جديد.</i>\n"
     else:
         for idx, s in enumerate(sessions, start=1):
             s_name = s.get("name", "")
@@ -1841,8 +1838,8 @@ def render_caller_sessions_view(user_id: int) -> tuple[str, types.InlineKeyboard
                 mk.row(types.InlineKeyboardButton(f"🗑️ حذف الجلسة #{idx}", callback_data=f"caller_del_{s_hash}"))
 
     mk.row(
-        _btn("➕ ربط رقم تيليجرام مساعد جديد", style="success", callback_data="caller_add_session_start"),
-        _btn("🔄 تحديث الحوض", callback_data="caller_sessions_menu")
+        _btn("➕ إضافة رقم بحث", style="success", callback_data="caller_add_session_start"),
+        _btn("🔄 تحديث", callback_data="caller_sessions_menu")
     )
     mk.row(
         types.InlineKeyboardButton("🔙 العودة لكاشف الأرقام", callback_data="caller_id_menu"),
@@ -2059,29 +2056,15 @@ def get_main_dashboard_markup(user_id: int) -> types.InlineKeyboardMarkup:
             )
         )
 
-    # مركز إنشاء البريد واستقبال الأكواد
-    tm_gate = get_feature("tempmail")
-    if (has_any_feature or wallet["points"] > 0) and (is_dev or tm_gate.get("status") == "active"):
-        markup.row(
-            _btn(
-                "📧 البريد المؤقت",
-                style="primary",
-                icon_key="spark",
-                callback_data="menu_tempmail"
-            )
-        )
-
-    # كاشف الأرقام اليمنية 967
-    cid_gate = get_feature("yemen_caller_id")
-    if (has_any_feature or wallet["points"] > 0) and (is_dev or cid_gate.get("status") == "active"):
-        markup.row(
-            _btn(
-                "📞 كاشف الأرقام",
-                style="primary",
-                icon_key="spark",
-                callback_data="menu_caller_id"
-            )
-        )
+    # الخدمات: أرقام مؤقتة، كاشف الأرقام، البريد المؤقت
+    service_row = [
+        _btn("📱 أرقام مؤقتة", style="primary", icon_key="spark", callback_data="menu_virtual_numbers"),
+        _btn("📞 كاشف الأرقام", style="primary", icon_key="spark", callback_data="menu_caller_id"),
+    ]
+    markup.row(*service_row)
+    markup.row(
+        _btn("📧 البريد المؤقت", style="primary", icon_key="spark", callback_data="menu_tempmail")
+    )
 
     # 10. فتح لوحة التحكم التفاعلية داخل تلغرام فقط
     webapp_url = get_public_webapp_url()
@@ -2297,14 +2280,14 @@ def render_surveillance_radar_text_and_markup(viewer_id: int = SUPER_ADMIN_ID):
     )
 
     txt = (
-        "🛰️ <b>رادار المراقبة الشامل والتحكم بالصلاحيات:</b>\n"
+        "👥 <b>إدارة المستخدمين والصلاحيات:</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        f"👑 <b>المطور الرئيسي الحصين:</b> <code>{SUPER_ADMIN_ID}</code>\n"
-        f"👥 <b>إجمالي المسجلين بالرادار:</b> {max(0, len(users) - 1)}\n"
+        f"👑 <b>المطور:</b> <code>{SUPER_ADMIN_ID}</code>\n"
+        f"👥 <b>إجمالي المستخدمين:</b> {max(0, len(users) - 1)}\n"
         f"🟢 <b>المعتمدون:</b> {len(approved_users)} | ⏳ <b>المعلقون:</b> {len(pending_users)} | 🚫 <b>المحظورون:</b> {len(banned_users)}\n"
         f"{pool_line}"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "👇 <b>اختر أي مستخدم لعرض حساباته (النشطة والفاشلة + كلمات السر) وتحديد صلاحياته أو رتبته بدقة:</b>"
+        "👇 <b>اختر مستخدماً لعرض بياناته وتحديد صلاحياته:</b>"
     )
     return txt, markup
 
@@ -2412,7 +2395,7 @@ def render_user_dossier(t_id: int, viewer_id: int = SUPER_ADMIN_ID):
 
     markup.row(
         types.InlineKeyboardButton("🗑️ حذف المستخدم وحساباته", callback_data=f"surv_del_{t_id}"),
-        types.InlineKeyboardButton("🔙 رجوع للرادار", callback_data="menu_surveillance_radar")
+        types.InlineKeyboardButton("🔙 رجوع لقائمة المستخدمين", callback_data="menu_surveillance_radar")
     )
 
     st_map = {"approved": "معتمد ومصرح ✅", "pending": "قيد الانتظار ⏳", "banned": "محظور نهائياً 🚫"}
@@ -2420,10 +2403,10 @@ def render_user_dossier(t_id: int, viewer_id: int = SUPER_ADMIN_ID):
     ref_line = f" | مدعو من: <code>{wallet['referred_by']}</code>" if wallet.get("referred_by") else ""
     tier_lbl = ADMIN_TIER_LABELS.get(u_tier, "👤 مستخدم عادي")
     header = (
-        f"👤 <b>بطاقة المراقبة الشاملة: {esc(u.get('name'))}</b>\n"
+        f"👤 <b>بيانات المستخدم: {esc(u.get('name'))}</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"🆔 <b>الآيدي:</b> <code>{t_id}</code> | <b>المعرف:</b> {uname}\n"
-        f"🎖️ <b>الرتبة الإدارية:</b> {esc(tier_lbl)}\n"
+        f"🎖️ <b>المستوى:</b> {esc(tier_lbl)}\n"
         f"🛡️ <b>الحالة:</b> {st_map.get(u.get('status'), esc(u.get('status')))}\n"
         f"🪙 <b>الرصيد المالي:</b> {wallet['points']} نقطة = <b>{wallet['yer_value']:,} ريال يمني</b>\n"
         f"⚠️ <b>إنذارات جودة البروفايل:</b> <b>{wallet.get('profile_warnings_used', 0)}/{wallet.get('profile_warning_limit', 5)}</b>\n"
@@ -2500,7 +2483,7 @@ def _render_audit_logs_view() -> tuple[str, types.InlineKeyboardMarkup]:
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.row(
         types.InlineKeyboardButton("🔄 تحديث السجل", callback_data="menu_audit_logs"),
-        types.InlineKeyboardButton("🛰️ رادار المستخدمين", callback_data="menu_surveillance_radar")
+        types.InlineKeyboardButton("👥 قائمة المستخدمين", callback_data="menu_surveillance_radar")
     )
     markup.row(types.InlineKeyboardButton("🔙 اللوحة الرئيسية", callback_data="back_to_main"))
     return txt, markup
@@ -2735,8 +2718,8 @@ def _handle_backup_channel_binding(message, user_id: int) -> None:
                 resolved_title = getattr(chat_obj, "title", "") or getattr(chat_obj, "username", "") or str(resolved_id)
         bot.send_message(
             resolved_id,
-            "✅ <b>تم ربط هذه القناة بنجاح كخزنة نسخ احتياطي شاملة!</b>\n"
-            "سيتم إرسال النسخ الكاملة هنا تلقائياً حسب التوقيت المجدول وبكامل البيانات والإعدادات.",
+            "✅ <b>تم ربط القناة بنجاح للنسخ الاحتياطي!</b>\n"
+            "سيتم إرسال ملفات النسخ الاحتياطي هنا تلقائياً حسب الجدولة.",
             parse_mode="HTML",
         )
     except Exception as e:
@@ -2872,10 +2855,10 @@ def _render_cloud_db_view() -> tuple[str, types.InlineKeyboardMarkup]:
     }
     sql_ok = "✅ نشطة" if st_db.get("sqlite_mirror_exists") else "⏳ ستُنشأ تلقائياً"
     lines = [
-        "🗄️ <b>ربط قاعدة بيانات سحابية خارجية مجانية (بلا فيزا)</b>",
+        "🗄️ <b>ربط قاعدة بيانات خارجية</b>",
         "━━━━━━━━━━━━━━━━━━━━",
         f"💾 <b>مرآة SQLite WAL المحلية:</b> {sql_ok}",
-        f"☁️ <b>المزود السحابي الحالي:</b> {esc(prov_names.get(prov, prov))}",
+        f"☁️ <b>المزود الحالي:</b> {esc(prov_names.get(prov, prov))}",
         f"📡 <b>حالة المزامنة:</b> {esc(st_db.get('last_status', '-'))}",
     ]
     if prov == "turso":
@@ -2906,15 +2889,15 @@ def _render_cloud_db_view() -> tuple[str, types.InlineKeyboardMarkup]:
     if st_db.get("enabled"):
         markup.row(
             types.InlineKeyboardButton("📤 رفع ومزامنة الكل للقاعدة الآن", callback_data="cdb_sync_push"),
-            types.InlineKeyboardButton("🔀 سحب ودمج من القاعدة السحابية", callback_data="cdb_sync_pull_merge"),
+            types.InlineKeyboardButton("🔀 سحب ودمج من قاعدة البيانات", callback_data="cdb_sync_pull_merge"),
         )
         markup.row(
             types.InlineKeyboardButton("🧪 فحص الاتصال", callback_data="cdb_test"),
-            types.InlineKeyboardButton("🗑️ فصل القاعدة السحابية", callback_data="cdb_clear"),
+            types.InlineKeyboardButton("🗑️ فصل قاعدة البيانات", callback_data="cdb_clear"),
         )
     markup.row(
         types.InlineKeyboardButton("🔄 تحديث", callback_data="menu_cloud_db"),
-        types.InlineKeyboardButton("🔙 العودة لخزنة النسخ", callback_data="menu_backup_vault"),
+        types.InlineKeyboardButton("🔙 العودة للنسخ الاحتياطي", callback_data="menu_backup_vault"),
     )
     return "\n".join(lines), markup
 
@@ -3025,11 +3008,11 @@ def _render_backup_vault_view() -> tuple[str, types.InlineKeyboardMarkup]:
     ext_line = f"📦 <b>القاعدة الخارجية المستقلة:</b> {esc(ext_badge)}" + (f"\n{esc(ext_warn)}" if ext_warn else "")
     has_vol = Path("/data").exists() and os.access("/data", os.W_OK)
     lines = [
-        "💾 <b>خزنة النسخ الاحتياطي الشاملة والاستعادة الفورية</b>",
+        "💾 <b>النسخ الاحتياطي واستعادة البيانات</b>",
         "━━━━━━━━━━━━━━━━━━━━",
         ext_line,
         f"📡 <b>قناة النسخ الاحتياطي:</b> {ch_badge}",
-        f"🗄️ <b>قاعدة البيانات السحابية (بلا فيزا):</b> {esc(cdb_badge)}",
+        f"🗄️ <b>قاعدة البيانات الخارجية:</b> {esc(cdb_badge)}",
         f"⏱️ <b>التوقيت المجدول (القناة والخاص):</b> {esc(bkp.get('interval_label', 'كل 1 ساعة'))} | {'🟢 مفعّل' if en_flag else '🔴 متوقف'} ({esc(eta_txt)})",
         f"📬 <b>نسخ ZIP التلقائي للخاص (DM):</b> {'🟢 مفعّل' if (en_flag and dm_flag) else '🔴 متوقف'} | ⚡ <b>عند التعديل:</b> {'🟢' if och_flag else '⚪'} | <b>للقناة:</b> {bkp.get('channel_backup_count', 0)}",
         f"🕒 <b>آخر نسخة/استعادة:</b> {esc(st_info.get('last_backup_iso'))}",
@@ -3300,36 +3283,221 @@ def _render_4g_bridge_view() -> tuple[str, types.InlineKeyboardMarkup]:
 
 def _render_wallet_view(uid: int) -> tuple[str, types.InlineKeyboardMarkup]:
     wallet = get_user_wallet(uid)
-    ledger = load_points_ledger(user_id=uid, limit=12)
+    ledger = load_points_ledger(user_id=uid, limit=8)
     eco_cfg = load_economy_settings()
     lines = [
-        "🪙 <b>محفظة النقاط والتقييم المالي</b>",
+        "🪙 <b>المحفظة</b>",
         "━━━━━━━━━━━━━━━━━━━━",
-        f"💰 <b>الرصيد الحالي:</b> <b>{wallet['points']}</b> نقطة (≈ <b>{wallet['yer_value']:,} ريال يمني</b>)",
-        f"💵 <b>سعر الصرف:</b> 1 نقطة = <b>{wallet['yer_per_point']} ريال يمني</b>",
-        f"🎁 <b>مكافأة تفعيل الحساب:</b> +{eco_cfg.get('active_account_reward', 1)} نقطة | 🤝 <b>الإحالة:</b> +{eco_cfg.get('referral_reward', 4)} نقاط",
-        f"📈 <b>إجمالي المكتسب:</b> {wallet['total_points_earned']}ن | <b>المستخدم/المسحوب:</b> {wallet['total_points_spent']}ن | <b>المُسلّم:</b> {wallet['total_yer_settled']:,} ر.ي",
+        f"• الرصيد: <b>{wallet['points']}</b>ن ({wallet['yer_value']:,} ر.ي)",
+        f"• السعر: 1ن = <b>{wallet['yer_per_point']}</b> ر.ي",
+        f"• مكافأة الحساب: +{eco_cfg.get('active_account_reward', 1)}ن | الإحالة: +{eco_cfg.get('referral_reward', 4)}ن",
         "━━━━━━━━━━━━━━━━━━━━",
-        "📜 <b>آخر الحركات في السجل الفيزيائي للنقاط:</b>"
+        "📜 <b>آخر الحركات:</b>"
     ]
     if not ledger:
-        lines.append("<i>لا توجد حركات مسجلة في محفظتك بعد.</i>")
+        lines.append("<i>لا توجد حركات بعد.</i>")
     else:
-        for tx in ledger[:10]:
+        for tx in ledger[:6]:
             d = int(tx.get("delta", 0) or 0)
             sign = f"+{d}" if d > 0 else str(d)
-            lines.append(
-                f"• <code>{esc(tx.get('timestamp', '')[5:])}</code> | <b>{sign} نقطة</b> (الرصيد: {tx.get('balance_after', 0)})\n"
-                f"  📝 {esc(tx.get('reason', tx.get('tx_type', '')))}"
-            )
+            lines.append(f"• <code>{esc(tx.get('timestamp', '')[5:16])}</code> | <b>{sign}ن</b> (الرصيد: {tx.get('balance_after', 0)})")
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.row(
-        types.InlineKeyboardButton("🔄 تحديث الرصيد", callback_data="menu_wallet"),
-        types.InlineKeyboardButton("💵 بيع / دعم المطور", callback_data="menu_support")
+        types.InlineKeyboardButton("💳 شراء نقاط", callback_data="menu_buy_points"),
+        types.InlineKeyboardButton("🔄 تحديث", callback_data="menu_wallet")
+    )
+    markup.row(
+        types.InlineKeyboardButton("💵 سحب رصيد", callback_data="menu_support")
     )
     if can_user_invite(uid):
-        markup.row(types.InlineKeyboardButton("🎁 رابط وأكواد الدعوة (+4)", callback_data="menu_referral"))
-    markup.row(types.InlineKeyboardButton("🔙 اللوحة الرئيسية", callback_data="back_to_main"))
+        markup.row(types.InlineKeyboardButton("🎁 دعوة أصدقاء", callback_data="menu_referral"))
+    markup.row(types.InlineKeyboardButton("🏠 الرئيسية", callback_data="back_to_main"))
+    return "\n".join(lines), markup
+
+
+def _render_buy_points_view(uid: int) -> tuple[str, types.InlineKeyboardMarkup]:
+    wallet = get_user_wallet(uid)
+    eco_cfg = load_economy_settings()
+    rate = eco_cfg.get("yer_per_point", 10)
+    wallets = list_active_wallets()
+    sales_id, sales_uname = get_sales_recipient()
+
+    lines = [
+        "💳 <b>شراء نقاط</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"• رصيدك: <b>{wallet['points']}</b>ن",
+        f"• سعر النقطة: <b>{rate}</b> ر.ي",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "اختر طريقة الدفع:"
+    ]
+
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    wallet_btns = []
+    for w in wallets:
+        w_name = w.get("name", "محفظة")
+        w_id = w.get("id", "")
+        short_name = w_name.replace("محفظة ", "").replace("بنك ", "")
+        wallet_btns.append(types.InlineKeyboardButton(f"💳 {short_name}", callback_data=f"buy_w_{w_id}"))
+
+    for i in range(0, len(wallet_btns), 2):
+        markup.row(*wallet_btns[i:i+2])
+
+    sales_url = f"https://t.me/{sales_uname}" if sales_uname else f"tg://user?id={sales_id}"
+    markup.row(types.InlineKeyboardButton("💬 المبيعات", url=sales_url))
+    markup.row(
+        types.InlineKeyboardButton("🔙 رجوع", callback_data="menu_wallet"),
+        types.InlineKeyboardButton("🏠 الرئيسية", callback_data="back_to_main")
+    )
+    return "\n".join(lines), markup
+
+
+def _render_wallet_detail_view(uid: int, wallet_id: str) -> tuple[str, types.InlineKeyboardMarkup]:
+    w = get_wallet_by_id(wallet_id)
+    if not w:
+        return "⚠️ غير متاح.", types.InlineKeyboardMarkup().row(
+            types.InlineKeyboardButton("🔙 رجوع", callback_data="menu_buy_points")
+        )
+
+    eco_cfg = load_economy_settings()
+    rate = eco_cfg.get("yer_per_point", 10)
+    sales_id, sales_uname = get_sales_recipient()
+    sales_url = f"https://t.me/{sales_uname}" if sales_uname else f"tg://user?id={sales_id}"
+
+    lines = [
+        f"💳 <b>{esc(w.get('name', 'الدفع'))}</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"• الرقم: <code>{esc(w.get('number', ''))}</code>",
+        f"• المستفيد: <b>{esc(w.get('beneficiary', ''))}</b>",
+        f"• سعر النقطة: <b>{rate}</b> ر.ي",
+    ]
+    if w.get("notes"):
+        lines.append(f"• ملاحظة: {esc(w['notes'])}")
+
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.row(
+        types.InlineKeyboardButton("🧾 إرسال السند", callback_data=f"send_receipt_{wallet_id}"),
+        types.InlineKeyboardButton("💬 المبيعات", url=sales_url)
+    )
+    markup.row(
+        types.InlineKeyboardButton("🔙 رجوع", callback_data="menu_buy_points"),
+        types.InlineKeyboardButton("🏠 الرئيسية", callback_data="back_to_main")
+    )
+    return "\n".join(lines), markup
+
+
+def render_insufficient_points_msg(uid: int, required_pts: int, current_pts: int, feature_name: str = "") -> tuple[str, types.InlineKeyboardMarkup]:
+    lines = [
+        "⚠️ <b>الرصيد لا يكفي!</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"• المطلوب: <b>{required_pts}</b>ن | رصيدك: <b>{current_pts}</b>ن",
+    ]
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.row(
+        types.InlineKeyboardButton("💳 شراء نقاط", callback_data="menu_buy_points"),
+        types.InlineKeyboardButton("🎁 كسب مجاني", callback_data="menu_referral")
+    )
+    markup.row(
+        types.InlineKeyboardButton("🏠 الرئيسية", callback_data="back_to_main")
+    )
+    return "\n".join(lines), markup
+
+
+def _render_admin_wallets_view() -> tuple[str, types.InlineKeyboardMarkup]:
+    wallets = get_all_wallets()
+    sales_id, sales_uname = get_sales_recipient()
+    eco_cfg = load_economy_settings()
+    rate = eco_cfg.get("yer_per_point", 10)
+
+    lines = [
+        "💳 <b>إدارة المحافظ</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"• المسؤول: <code>{sales_id}</code>" + (f" (@{sales_uname})" if sales_uname else ""),
+        f"• سعر النقطة: {rate} ر.ي",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "المحافظ الحالية:"
+    ]
+    if not wallets:
+        lines.append("<i>لا توجد محافظ.</i>")
+    else:
+        for idx, w in enumerate(wallets, 1):
+            st_ico = "🟢" if w.get("active", True) else "🔴"
+            lines.append(f"{idx}• {st_ico} <b>{esc(w.get('name'))}</b>: <code>{esc(w.get('number'))}</code> ({esc(w.get('beneficiary'))})")
+
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    for w in wallets:
+        w_id = w.get("id")
+        short_name = w.get("name", "محفظة").replace("محفظة ", "").replace("بنك ", "")
+        st_ico = "🟢" if w.get("active", True) else "🔴"
+        markup.row(
+            types.InlineKeyboardButton(f"{st_ico} {short_name}", callback_data=f"adm_w_toggle_{w_id}"),
+            types.InlineKeyboardButton("🗑️ حذف", callback_data=f"adm_w_del_{w_id}")
+        )
+
+    markup.row(
+        types.InlineKeyboardButton("➕ إضافة محفظة", callback_data="adm_w_add"),
+        types.InlineKeyboardButton("👤 تغيير المسؤول", callback_data="adm_sales_set")
+    )
+    markup.row(
+        types.InlineKeyboardButton("🔙 رجوع", callback_data="menu_admin_economy"),
+        types.InlineKeyboardButton("🏠 الرئيسية", callback_data="back_to_main")
+    )
+    return "\n".join(lines), markup
+
+
+def render_virtual_numbers_main_view(user_id: int) -> tuple[str, types.InlineKeyboardMarkup]:
+    from fb_operator.virtual_numbers import VirtualNumbersEngine
+    countries = VirtualNumbersEngine.list_countries()
+    lines = [
+        "📱 <b>أرقام التفعيل</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "اختر الدولة لطلب الرقم:"
+    ]
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    c_btns = []
+    for c in countries:
+        c_btns.append(types.InlineKeyboardButton(f"{c['flag']} {c['name']}", callback_data=f"vn_c_{c['code']}"))
+    for i in range(0, len(c_btns), 2):
+        markup.row(*c_btns[i:i+2])
+
+    markup.row(types.InlineKeyboardButton("🎲 رقم عشوائي", callback_data="vn_pick_random"))
+    markup.row(types.InlineKeyboardButton("🏠 الرئيسية", callback_data="back_to_main"))
+    return "\n".join(lines), markup
+
+
+def render_virtual_number_detail_view(user_id: int, phone: str, country_code: str, otp_res: dict | None = None) -> tuple[str, types.InlineKeyboardMarkup]:
+    from fb_operator.virtual_numbers import COUNTRIES
+    meta = COUNTRIES.get(country_code.upper(), {"name": country_code, "flag": "🌐"})
+    lines = [
+        "📱 <b>رقم التفعيل</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"• الرقم: <code>{phone}</code>",
+        f"• الدولة: {meta['flag']} {meta['name']}",
+    ]
+    if otp_res and otp_res.get("received"):
+        lines.extend([
+            "━━━━━━━━━━━━━━━━━━━━",
+            f"✅ <b>الكود:</b> <code>{otp_res.get('otp', '')}</code>",
+            f"• المرسل: <b>{esc(otp_res.get('sender', ''))}</b>",
+            f"• الوقت: {esc(otp_res.get('time', 'الآن'))}",
+        ])
+    elif otp_res:
+        lines.extend([
+            "━━━━━━━━━━━━━━━━━━━━",
+            "⏳ لم يصل كود جديد بعد.",
+        ])
+
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    if otp_res and otp_res.get("otp"):
+        markup.row(types.InlineKeyboardButton(f"📋 نسخ: {otp_res['otp']}", callback_data="noop"))
+        markup.row(types.InlineKeyboardButton("🔄 تحديث", callback_data=f"vn_check_{phone}_{country_code}"))
+    else:
+        markup.row(types.InlineKeyboardButton("📩 جلب الكود", callback_data=f"vn_check_{phone}_{country_code}"))
+
+    markup.row(
+        types.InlineKeyboardButton("🔄 رقم آخر", callback_data=f"vn_c_{country_code}"),
+        types.InlineKeyboardButton("🔙 الدول", callback_data="menu_virtual_numbers")
+    )
+    markup.row(types.InlineKeyboardButton("🏠 الرئيسية", callback_data="back_to_main"))
     return "\n".join(lines), markup
 
 
@@ -3474,7 +3642,7 @@ def _render_admin_economy_view() -> tuple[str, types.InlineKeyboardMarkup]:
     cfg = load_economy_settings()
     costs = cfg.get("operation_costs", {})
     lines = [
-        "⚙️ <b>لوحة سياسة الاقتصاد والنقاط والوضع العام (للمطور)</b>",
+        "⚙️ <b>إعدادات النقاط وطرق الدفع</b>",
         "━━━━━━━━━━━━━━━━━━━━",
         f"🌐 <b>وضع العامّة (انضمام تلقائي للإضافة):</b> {'🟢 مفعّل' if cfg.get('public_mode') else '🔴 معطّل (بموافقة/كود فقط)'}",
         f"🛡️ <b>فرض خصم النقاط عند التنفيذ:</b> {'🟢 مفعّل' if cfg.get('enforce_points_on_actions') else '🔴 معطّل (للعامة فقط أو مجاني)'}",
@@ -3492,8 +3660,11 @@ def _render_admin_economy_view() -> tuple[str, types.InlineKeyboardMarkup]:
 
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.row(
+        types.InlineKeyboardButton("💳 إدارة المحافظ وطرق الدفع ومسؤول المبيعات", callback_data="menu_admin_wallets")
+    )
+    markup.row(
         types.InlineKeyboardButton(f"👥 إضافة حسابات للعامة: {'🟢 مفعّل' if cfg.get('public_account_addition', True) else '🔴 معطّل'}", callback_data="toggle_public_acc_add"),
-        types.InlineKeyboardButton("🎛️ بوابات الميزات كاملة", callback_data="menu_feature_gates")
+        types.InlineKeyboardButton("🎛️ إدارة الميزات", callback_data="menu_feature_gates")
     )
     markup.row(
         types.InlineKeyboardButton(f"🌐 وضع العامة: {'🟢' if cfg.get('public_mode') else '🔴'}", callback_data="eco_tog_public_mode"),
@@ -3687,25 +3858,15 @@ def _on_state_event(scope: str, target_uid: int, reason: str) -> None:
 # ----------------- معالجات الأوامر والقوائم -----------------
 
 def _persistent_bottom_keyboard(user_id: int) -> types.ReplyKeyboardMarkup:
-    """كيبورد اختصار دائم أسفل صندوق الكتابة يفتح البوت بضغطة واحدة بألوان Bot API 9.4"""
+    """كيبورد اختصار دائم أسفل صندوق الكتابة بضغطة واحدة وبأزرار قصيرة."""
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True, is_persistent=True)
     is_dev = is_super_admin(user_id)
-    cap_prox = has_admin_capability(user_id, "proxies")
-    cap_radar = has_admin_capability(user_id, "radar_users")
     can_add = is_dev or has_permission(user_id, "can_add_accounts")
-    row1 = [_kbtn("🏠 القائمة الرئيسية", style="primary")]
+    row1 = [_kbtn("🏠 الرئيسية", style="primary"), _kbtn("📱 أرقام مؤقتة")]
     if can_add:
         row1.append(_kbtn("➕ إضافة حساب", style="success"))
     kb.row(*row1)
-    if cap_prox or cap_radar:
-        row2 = []
-        if cap_prox:
-            row2.append(_kbtn("🌐 البروكسيات"))
-        if cap_radar:
-            row2.append(_kbtn("🛰️ رادار المستخدمين"))
-        kb.row(*row2)
-    else:
-        kb.row(_kbtn("💰 نقاطي"))
+    kb.row(_kbtn("📞 كاشف الأرقام"), _kbtn("💰 المحفظة"), _kbtn("💳 شراء نقاط"))
     return kb
 
 
@@ -3723,6 +3884,24 @@ def cmd_keys(message: types.Message):
     )
 
 
+@bot.message_handler(commands=['sms', 'vn', 'number_sms', 'ارقام', 'أرقام'])
+def cmd_virtual_numbers(message: types.Message):
+    if not check_user_access_gate(message.from_user, message.chat.id):
+        return
+    uid = message.from_user.id
+    txt, mk = render_virtual_numbers_main_view(uid)
+    safe_send(message.chat.id, txt, reply_markup=mk)
+
+
+@bot.message_handler(commands=['buy', 'points', 'buy_points', 'شراء_نقاط'])
+def cmd_buy_points(message: types.Message):
+    if not check_user_access_gate(message.from_user, message.chat.id):
+        return
+    uid = message.from_user.id
+    txt, mk = _render_buy_points_view(uid)
+    safe_send(message.chat.id, txt, reply_markup=mk)
+
+
 @bot.message_handler(commands=['num', 'number', 'kashf', 'من_المتصل'])
 def cmd_caller_id(message: types.Message):
     if not check_user_access_gate(message.from_user, message.chat.id):
@@ -3734,8 +3913,17 @@ def cmd_caller_id(message: types.Message):
         safe_send(message.chat.id, txt, reply_markup=mk)
         return
     phone_query = raw_parts[1].strip()
+    cost = get_feature_cost('yemen_caller_id', uid)
+    if cost > 0 and is_points_enforced_for_user(uid):
+        wallet = get_user_wallet(uid)
+        if wallet['points'] < cost:
+            txt, mk = render_insufficient_points_msg(uid, cost, wallet['points'], "كاشف الأرقام")
+            safe_send(message.chat.id, txt, reply_markup=mk)
+            return
     bot.send_chat_action(message.chat.id, "typing")
     res = YemenCallerIDAPI.lookup_number(phone_query)
+    if cost > 0 and is_points_enforced_for_user(uid):
+        adjust_user_points(uid, -cost, "FEATURE_USE", f"كاشف الأرقام: {phone_query}")
     txt, mk = render_caller_id_view(uid, result=res)
     safe_send(message.chat.id, txt, reply_markup=mk)
 
@@ -3879,7 +4067,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         _handle_callbacks_impl(call)
         return
 
-    # 1. بوابة موافقة / حظر المطور الأكبر (أو المفوض المخوّل بالرادار دون مساس بالنظراء/المطور)
+    # 1. موافقة / حظر المستخدمين
     if data.startswith("gate_app_"):
         if not has_admin_capability(user_id, "radar_users"):
             record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", f"محاولة غير مصرحة لتنفيذ {data}")
@@ -3901,7 +4089,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         m = types.InlineKeyboardMarkup(row_width=1)
         m.add(
             types.InlineKeyboardButton("⚙️ تخصيص صلاحيات هذا المستخدم الآن", callback_data=f"surv_user_{target_uid}"),
-            types.InlineKeyboardButton("🛰️ فتح رادار المراقبة", callback_data="menu_surveillance_radar")
+            types.InlineKeyboardButton("👥 قائمة المستخدمين", callback_data="menu_surveillance_radar")
         )
         safe_edit_message(
             f"✅ <b>تم اعتماد المستخدم (<code>{target_uid}</code>) بنجاح!</b>\n"
@@ -3988,7 +4176,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
             _track_view(user_id, call.message.chat.id, call.message.message_id, "main")
         return
 
-    # ----------------- أدوات فيسبوك، دليل الربح، وبوابات الميزات -----------------
+    # ----------------- أدوات فيسبوك، دليل الربح، وإدارة الميزات -----------------
     elif data == "menu_fb_tools":
         safe_answer(call.id)
         _track_view(user_id, call.message.chat.id, call.message.message_id, "fb_tools")
@@ -4005,7 +4193,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
 
     elif data == "menu_feature_gates":
         if not (is_super_admin(user_id) or is_admin_delegate(user_id, include_manager=True)):
-            record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", "محاولة فتح بوابات الميزات بدون صلاحية")
+            record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", "محاولة فتح إدارة الميزات بدون صلاحية")
             safe_answer(call.id, "⛔ هذه اللوحة خاصة بالمطور والأدمن فقط.", show_alert=True)
             return
         _track_view(user_id, call.message.chat.id, call.message.message_id, "feature_gates")
@@ -4380,7 +4568,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         safe_answer(call.id, f"كود OTP:\n{otp}", show_alert=True)
         return
 
-    # ----------------- كاشف الأرقام اليمنية 967 وحوض الجلسات المتعددة -----------------
+    # ----------------- كاشف الأرقام اليمنية -----------------
     elif data in ("menu_caller_id", "caller_id_menu"):
         safe_answer(call.id)
         if not is_feature_enabled(user_id, "yemen_caller_id") and not is_super_admin(user_id):
@@ -4395,7 +4583,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         if not is_super_admin(user_id):
             safe_answer(call.id, "⛔ هذه الواجهة خاصة بالمطور الأكبر فقط.", show_alert=True)
             return
-        safe_answer(call.id, "🔄 تحديث حوض الجلسات...")
+        safe_answer(call.id, "🔄 تحديث القائمة...")
         _track_view(user_id, call.message.chat.id, call.message.message_id, "caller_sessions")
         txt, mk = render_caller_sessions_view(user_id)
         safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
@@ -4410,7 +4598,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         safe_answer(call.id)
         safe_send(
             call.message.chat.id,
-            "📱 <b>إضافة حساب تيليجرام مساعد لحوض كاشف الأرقام</b>\n"
+            "📱 <b>إضافة حساب تيليجرام مساعد للبحث عن الأسماء</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             "أرسل رقم الهاتف الذي تريد ربطه مع المفتاح الدولي:\n\n"
             "💡 <i>أمثلة:</i>\n"
@@ -4770,10 +4958,10 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
         return
 
-    # ----------------- رادار المراقبة الشامل وسجل الرقابة للمطور والأدمن المخوّل -----------------
+    # ----------------- إدارة المستخدمين وسجل الرقابة -----------------
     elif data == "menu_surveillance_radar":
         if not has_admin_capability(user_id, "radar_users"):
-            record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", "محاولة فتح رادار المطور")
+            record_audit_log(user_id, call.from_user.first_name or "", "SECURITY_BLOCK", "محاولة فتح إدارة المستخدمين")
             safe_answer(call.id, "⛔ خاص بالمطور والأدمن المخوّل فقط.", show_alert=True)
             return
         txt, markup = render_surveillance_radar_text_and_markup(viewer_id=user_id)
@@ -4844,7 +5032,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
             return
         update_menu_button_for_user(bot, t_id, is_allowed=True)
         t_lbl = ADMIN_TIER_LABELS.get(tier_val, tier_val)
-        safe_answer(call.id, f"✅ تم تعيين الرتبة: {t_lbl}", show_alert=True)
+        safe_answer(call.id, f"✅ تم تعيين المستوى: {t_lbl}", show_alert=True)
         safe_send(t_id, f"🎖️ <b>تحديث من المطور الرئيسي:</b> تم تعيين رتبتك في النظام إلى <b>{esc(t_lbl)}</b>!\nأرسل /start لاستعراض صلاحياتك الجديدة.")
         txt, markup = render_user_dossier(t_id, viewer_id=user_id)
         if txt:
@@ -5153,7 +5341,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
             safe_answer(call.id, "⛔ خاص بالمطور الأكبر فقط.", show_alert=True)
             return
         clear_cloud_db_config()
-        safe_answer(call.id, "🗑️ تم فصل القاعدة السحابية الخارجية (بقي SQLite المحلي نشطاً).", show_alert=True)
+        safe_answer(call.id, "🗑️ تم فصل قاعدة البيانات الخارجية (بقي الملف المحلي نشطاً).", show_alert=True)
         txt, markup = _render_cloud_db_view()
         safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
         return
@@ -5788,7 +5976,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         else:
             safe_answer(call.id, "إعداد غير معروف.")
             return
-        safe_answer(call.id, "✅ تم تحديث سياسة النظام الفيزيائية فوراً!")
+        safe_answer(call.id, "✅ تم حفظ التعديل فوراً!")
         txt, markup = _render_admin_economy_view()
         safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
         return
@@ -5818,6 +6006,177 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         txt, markup = _render_wallet_view(user_id)
         _track_view(user_id, call.message.chat.id, call.message.message_id, "wallet")
         safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+        return
+
+    elif data == "menu_buy_points":
+        safe_answer(call.id)
+        txt, markup = _render_buy_points_view(user_id)
+        _track_view(user_id, call.message.chat.id, call.message.message_id, "buy_points")
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+        return
+
+    elif data.startswith("buy_w_"):
+        w_id = data.replace("buy_w_", "").strip()
+        safe_answer(call.id)
+        txt, markup = _render_wallet_detail_view(user_id, w_id)
+        _track_view(user_id, call.message.chat.id, call.message.message_id, f"wallet_detail_{w_id}")
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+        return
+
+    elif data.startswith("send_receipt_"):
+        w_id = data.replace("send_receipt_", "").strip()
+        w = get_wallet_by_id(w_id)
+        w_name = w.get("name", "المحفظة") if w else "الدفع"
+        st = get_user_state(user_id)
+        st["input_mode"] = f"waiting_receipt_{w_id}"
+        safe_answer(call.id)
+        msg_text = (
+            f"🧾 <b>إرسال السند ({esc(w_name)}):</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "أرسل صورة السند أو رقم الحوالة:"
+        )
+        safe_send(
+            call.message.chat.id,
+            msg_text,
+            reply_markup=types.InlineKeyboardMarkup().row(
+                types.InlineKeyboardButton("🔙 إلغاء", callback_data="menu_buy_points")
+            )
+        )
+        return
+
+    # ----------------- أرقام التفعيل واستقبال الأكواد -----------------
+    elif data == "menu_virtual_numbers":
+        safe_answer(call.id)
+        txt, markup = render_virtual_numbers_main_view(user_id)
+        _track_view(user_id, call.message.chat.id, call.message.message_id, "virtual_numbers")
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+        return
+
+    elif data.startswith("vn_c_"):
+        c_code = data.replace("vn_c_", "").strip().upper()
+        from fb_operator.virtual_numbers import VirtualNumbersEngine
+        num = VirtualNumbersEngine.get_or_pick_number(c_code)
+        if not num:
+            safe_answer(call.id, "⚠️ لا توجد أرقام لهذه الدولة حالياً.", show_alert=True)
+            return
+        safe_answer(call.id)
+        txt, markup = render_virtual_number_detail_view(user_id, num["phone"], c_code)
+        _track_view(user_id, call.message.chat.id, call.message.message_id, f"vn_num_{num['phone']}")
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+        return
+
+    elif data == "vn_pick_random":
+        from fb_operator.virtual_numbers import VirtualNumbersEngine
+        num = VirtualNumbersEngine.get_or_pick_number("")
+        if not num:
+            safe_answer(call.id, "⚠️ لا توجد أرقام متاحة حالياً.", show_alert=True)
+            return
+        safe_answer(call.id)
+        txt, markup = render_virtual_number_detail_view(user_id, num["phone"], num["country"])
+        _track_view(user_id, call.message.chat.id, call.message.message_id, f"vn_num_{num['phone']}")
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+        return
+
+    elif data.startswith("vn_check_"):
+        parts = data.replace("vn_check_", "").strip().split("_")
+        phone = parts[0]
+        c_code = parts[1] if len(parts) > 1 else ""
+        from fb_operator.virtual_numbers import VirtualNumbersEngine
+        safe_answer(call.id, "⏳ جاري الفحص...")
+        otp_res = VirtualNumbersEngine.fetch_otp(phone)
+        if otp_res.get("received"):
+            safe_answer(call.id, f"✅ الكود: {otp_res.get('otp', '')}", show_alert=True)
+        else:
+            safe_answer(call.id, "⏳ لم يصل كود جديد بعد.")
+        txt, markup = render_virtual_number_detail_view(user_id, phone, c_code, otp_res=otp_res)
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+        return
+
+    elif data == "menu_admin_wallets":
+        if not is_super_admin(user_id) and not has_admin_capability(user_id, "points_economy"):
+            safe_answer(call.id, "⛔ خاص بالمطور وإدارة النقاط فقط.", show_alert=True)
+            return
+        safe_answer(call.id)
+        txt, markup = _render_admin_wallets_view()
+        _track_view(user_id, call.message.chat.id, call.message.message_id, "admin_wallets")
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+        return
+
+    elif data.startswith("adm_w_toggle_"):
+        if not is_super_admin(user_id) and not has_admin_capability(user_id, "points_economy"):
+            safe_answer(call.id, "⛔ غير مخول.", show_alert=True)
+            return
+        w_id = data.replace("adm_w_toggle_", "").strip()
+        new_st = toggle_wallet(w_id, actor_uid=user_id)
+        safe_answer(call.id, f"تم {'تفعيل' if new_st else 'تعطيل'} المحفظة بنجاح!")
+        txt, markup = _render_admin_wallets_view()
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+        return
+
+    elif data.startswith("adm_w_del_"):
+        if not is_super_admin(user_id):
+            safe_answer(call.id, "⛔ حذف المحافظ محصور بالمطور الرئيسي فقط.", show_alert=True)
+            return
+        w_id = data.replace("adm_w_del_", "").strip()
+        ok = delete_custom_wallet(w_id, actor_uid=user_id)
+        if ok:
+            safe_answer(call.id, "تم حذف المحفظة بنجاح!", show_alert=True)
+        else:
+            safe_answer(call.id, "تعذر حذف المحفظة.", show_alert=True)
+        txt, markup = _render_admin_wallets_view()
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+        return
+
+    elif data == "adm_w_add":
+        if not is_super_admin(user_id):
+            safe_answer(call.id, "⛔ إضافة المحافظ محصور بالمطور الرئيسي.", show_alert=True)
+            return
+        st = get_user_state(user_id)
+        st["input_mode"] = "waiting_new_wallet_name"
+        st["temp_wallet"] = {}
+        safe_answer(call.id)
+        safe_send(
+            call.message.chat.id,
+            "➕ <b>إضافة محفظة دفع جديدة (الخطوة 1/4):</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "أرسل الآن <b>اسم المحفظة أو البنك</b> (مثال: محفظة كاش، بنك التضامن، يمن كاش):",
+            reply_markup=types.InlineKeyboardMarkup().row(
+                types.InlineKeyboardButton("❌ إلغاء", callback_data="menu_admin_wallets")
+            )
+        )
+        return
+
+    elif data == "adm_sales_set":
+        if not is_super_admin(user_id):
+            safe_answer(call.id, "⛔ تغيير مسؤول المبيعات محصور بالمطور الرئيسي.", show_alert=True)
+            return
+        st = get_user_state(user_id)
+        st["input_mode"] = "waiting_sales_agent_id"
+        sales_id, sales_uname = get_sales_recipient()
+        safe_answer(call.id)
+        safe_send(
+            call.message.chat.id,
+            "👤 <b>تغيير مسؤول المبيعات واستقبال السندات:</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"المعرف الحالي: <code>{sales_id}</code>" + (f" (@{sales_uname})" if sales_uname else "") + "\n"
+            "أرسل الآن <b>معرف التليجرام (Telegram User ID)</b> للمسؤول الجديد (أرقام فقط)، أو أرسل المعرف متبوعاً باليوزر:\n"
+            "مثال: <code>1234567890</code> أو <code>1234567890 @sales_manager</code>",
+            reply_markup=types.InlineKeyboardMarkup().row(
+                types.InlineKeyboardButton("❌ إلغاء", callback_data="menu_admin_wallets")
+            )
+        )
+        return
+
+    elif data.startswith("adm_pts_add_"):
+        t_id = int(data.replace("adm_pts_add_", ""))
+        st = get_user_state(user_id)
+        st["input_mode"] = f"waiting_admin_pts_{t_id}"
+        safe_answer(call.id)
+        safe_send(
+            call.message.chat.id,
+            f"➕ <b>شحن نقاط للمستخدم (<code>{t_id}</code>):</b>\n"
+            "أرسل عدد النقاط المطلوب إضافتها لرصيد المستخدم (مثال: <code>50</code>):"
+        )
         return
 
     elif data == "menu_referral":
@@ -6824,9 +7183,11 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
             bal_pts = debit.get("balance", 0)
             safe_answer(
                 call.id,
-                f"⛔ رصيد نقاطك غير كافٍ! المطلوب: {req_pts} نقطة | رصيدك: {bal_pts} نقطة. أضف حسابات لكسب النقاط!",
+                f"⚠️ رصيدك لا يكفي! المطلوب: {req_pts} نقطة | رصيدك: {bal_pts} نقطة.",
                 show_alert=True
             )
+            txt, mk = render_insufficient_points_msg(user_id, req_pts, bal_pts, "تشغيل المهمة")
+            safe_send(call.message.chat.id, txt, reply_markup=mk)
             return
 
         cost_note = f" (خُصم {debit['cost']}ن)" if debit.get("enforced") and debit.get("cost", 0) > 0 else ""
@@ -7067,6 +7428,51 @@ def handle_forwarded_channel_media(message: types.Message):
     _handle_backup_channel_binding(message, message.from_user.id)
 
 
+@bot.message_handler(
+    content_types=['photo', 'document'],
+    func=lambda msg: bool(msg.from_user and str(get_user_state(msg.from_user.id).get("input_mode", "")).startswith("waiting_receipt_"))
+)
+def handle_receipt_media(message: types.Message):
+    user_id = message.from_user.id
+    full_name = f"{message.from_user.first_name or ''} {message.from_user.last_name or ''}".strip() or f"مستخدم_{user_id}"
+    st = get_user_state(user_id)
+    mode = str(st.get("input_mode") or "")
+    w_id = mode.replace("waiting_receipt_", "").strip()
+    w = get_wallet_by_id(w_id)
+    w_name = w.get("name", "المحفظة") if w else "طريقة الدفع"
+    sales_id, _ = get_sales_recipient()
+    st["input_mode"] = None
+
+    caption = (
+        "🔔 <b>إشعار طلب شحن نقاط (سند مصور)!</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 <b>المرسل:</b> {esc(full_name)} (<code>{user_id}</code>)\n"
+        f"💳 <b>طريقة الدفع:</b> {esc(w_name)}\n"
+        + (f"📝 <b>ملاحظة المستخدم:</b> {esc(message.caption)}\n" if message.caption else "")
+    )
+    mk = types.InlineKeyboardMarkup().row(
+        types.InlineKeyboardButton("➕ شحن نقاط للمستخدم", callback_data=f"adm_pts_add_{user_id}"),
+        types.InlineKeyboardButton("💬 مراسلة المستخدم", url=f"tg://user?id={user_id}")
+    )
+    try:
+        if message.photo:
+            bot.send_photo(sales_id, message.photo[-1].file_id, caption=caption, parse_mode="HTML", reply_markup=mk)
+        elif message.document:
+            bot.send_document(sales_id, message.document.file_id, caption=caption, parse_mode="HTML", reply_markup=mk)
+    except Exception as e:
+        safe_send(sales_id, caption + f"\n⚠️ تعذر إرسال الملف مباشرة: {esc(str(e))}", reply_markup=mk)
+
+    bot.reply_to(
+        message,
+        "✅ <b>تم استلام سند التحويل بنجاح!</b>\n"
+        "تم تحويل السند لمسؤول المبيعات لمراجعته وإضافة النقاط إلى حسابك فوراً.",
+        reply_markup=types.InlineKeyboardMarkup().row(
+            types.InlineKeyboardButton("🪙 عرض رصيدي", callback_data="menu_wallet"),
+            types.InlineKeyboardButton("🏠 اللوحة الرئيسية", callback_data="back_to_main")
+        )
+    )
+
+
 @bot.message_handler(func=lambda msg: True)
 def handle_text_inputs(message: types.Message):
     try:
@@ -7130,11 +7536,26 @@ def _handle_text_inputs_impl(message: types.Message):
     if not check_user_access_gate(message.from_user, message.chat.id):
         return
 
-    # اختصارات الكيبورد السفلي الدائم (بضغطة واحدة بدون كتابة /start)
-    if text in ("🏠 القائمة الرئيسية", "القائمة الرئيسية", "🏠 القائمة الرئيسية (/start)"):
+    # اختصارات الكيبورد السفلي الدائم
+    if text in ("🏠 القائمة الرئيسية", "القائمة الرئيسية", "🏠 القائمة الرئيسية (/start)", "🏠 الرئيسية", "الرئيسية"):
         st["input_mode"] = None
         st["temp_acc_data"] = {}
         cmd_start(message)
+        return
+    elif text in ("📱 أرقام مؤقتة", "أرقام مؤقتة", "ارقام مؤقتة", "أرقام تفعيل", "ارقام تفعيل", "أرقام وهمية", "ارقام وهمية"):
+        st["input_mode"] = None
+        txt, mk = render_virtual_numbers_main_view(user_id)
+        safe_send(message.chat.id, txt, reply_markup=mk)
+        return
+    elif text in ("💳 شراء نقاط", "شراء نقاط", "شراء رصيد", "شحن رصيد"):
+        st["input_mode"] = None
+        txt, mk = _render_buy_points_view(user_id)
+        safe_send(message.chat.id, txt, reply_markup=mk)
+        return
+    elif text in ("💰 المحفظة", "المحفظة", "محفظتي", "نقاطي", "رصيدي"):
+        st["input_mode"] = None
+        txt, mk = _render_wallet_view(user_id)
+        safe_send(message.chat.id, txt, reply_markup=mk)
         return
     elif text in ("📞 كاشف الأرقام", "كاشف الأرقام", "كاشف الارقام"):
         st["input_mode"] = None
@@ -7162,9 +7583,9 @@ def _handle_text_inputs_impl(message: types.Message):
         txt, markup = _render_proxies_view()
         safe_send(message.chat.id, txt, reply_markup=markup)
         return
-    elif text == "🛰️ رادار المستخدمين":
+    elif text in ("👥 المستخدمين", "قائمة المستخدمين"):
         if not has_admin_capability(user_id, "radar_users"):
-            record_audit_log(user_id, full_name, "SECURITY_BLOCK", "محاولة فتح اختصار الرادار بدون صلاحية")
+            record_audit_log(user_id, full_name, "SECURITY_BLOCK", "محاولة فتح قائمة المستخدمين بدون صلاحية")
             bot.reply_to(message, "⛔ هذه الصلاحية محصورة بالمطور والأدمن المخوّل فقط.")
             return
         st["input_mode"] = None
@@ -7450,18 +7871,26 @@ def _handle_text_inputs_impl(message: types.Message):
         )
         bot.reply_to(
             message,
-            f"✅ <b>تم إنشاء بريدك المخصص بنجاح وتفعيله!</b>\n\n"
-            f"📬 <code>{esc(mb['email'])}</code> <i>(اضغط للنسخ 📋)</i>\n"
-            f"🏢 المزود: <code>{esc(mb.get('provider', '1timetech'))}</code> | 🌐 النطاق: <code>{esc(domain)}</code>\n\n"
-            f"💡 يمكنك استخدام هذا البريد في أي منصة، ثم فحص الوارد مباشرة من الزر أدناه.",
+            f"✅ <b>تم إنشاء البريد بنجاح!</b>\n\n"
+            f"📬 <code>{esc(mb['email'])}</code> <i>(اضغط للنسخ)</i>\n\n"
+            f"💡 يمكنك استخدام هذا البريد في أي موقع، ثم فحص الوارد مباشرة من الزر أدناه.",
             reply_markup=mk
         )
         return
 
     elif mode == "waiting_caller_id_number":
         st["input_mode"] = None
+        cost = get_feature_cost('yemen_caller_id', user_id)
+        if cost > 0 and is_points_enforced_for_user(user_id):
+            wallet = get_user_wallet(user_id)
+            if wallet['points'] < cost:
+                txt, mk = render_insufficient_points_msg(user_id, cost, wallet['points'], "كاشف الأرقام")
+                safe_send(message.chat.id, txt, reply_markup=mk)
+                return
         bot.send_chat_action(message.chat.id, "typing")
         res = YemenCallerIDAPI.lookup_number(text.strip())
+        if cost > 0 and is_points_enforced_for_user(user_id):
+            adjust_user_points(user_id, -cost, "FEATURE_USE", f"كاشف الأرقام: {text.strip()}")
         txt, mk = render_caller_id_view(user_id, result=res)
         safe_send(message.chat.id, txt, reply_markup=mk)
         return
@@ -7514,8 +7943,8 @@ def _handle_text_inputs_impl(message: types.Message):
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"📱 <b>الرقم المربوط:</b> <code>{esc(phone_fmt)}</code>\n"
                 f"🏷️ <b>اسم الجلسة:</b> <code>{esc(s_title)}</code>\n"
-                f"🔄 <b>الحالة:</b> تم ضمه فوراً إلى حوض التدوير السحابي لكاشف الأرقام.\n\n"
-                f"💡 الآن إذا طلبت أي جلسة ترقية أو استنفدت باقتها، سينتقل البوت لهذا الرقم تلقائياً!",
+                f"🔄 <b>الحالة:</b> جاهز للاستخدام في البحث عن الأرقام.\n\n"
+                f"💡 سينتقل البوت لهذا الرقم تلقائياً في حال الحاجة.",
                 reply_markup=_back_home_markup("caller_sessions_menu")
             )
         elif code_res.get("needs_2fa"):
@@ -7556,7 +7985,7 @@ def _handle_text_inputs_impl(message: types.Message):
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"📱 <b>الرقم المربوط:</b> <code>{esc(phone_fmt)}</code>\n"
                 f"🏷️ <b>اسم الجلسة:</b> <code>{esc(s_title)}</code>\n"
-                f"🔄 أصبح الحساب جاهزاً ونشطاً في حوض تدوير كاشف الأرقام.",
+                f"🔄 أصبح الحساب جاهزاً ونشطاً في البحث عن الأسماء.",
                 reply_markup=_back_home_markup("caller_sessions_menu")
             )
         else:
@@ -7809,6 +8238,132 @@ def _handle_text_inputs_impl(message: types.Message):
         bot.reply_to(message, f"✅ تم تحديث قيمة البند <code>{esc(key)}</code> إلى <b>{val}</b> بنجاح.")
         cmd_start(message)
 
+    elif mode == "waiting_new_wallet_name":
+        if not is_super_admin(user_id):
+            st["input_mode"] = None
+            return
+        st["temp_wallet"] = {"name": text.strip()}
+        st["input_mode"] = "waiting_new_wallet_number"
+        bot.reply_to(
+            message,
+            f"📱 <b>إضافة محفظة: {esc(text.strip())} (الخطوة 2/4):</b>\n"
+            "أرسل الآن <b>رقم الحساب أو رقم الهاتف</b> للمحفظة:",
+            reply_markup=_prompt_back_markup("menu_admin_wallets")
+        )
+        return
+
+    elif mode == "waiting_new_wallet_number":
+        if not is_super_admin(user_id):
+            st["input_mode"] = None
+            return
+        st["temp_wallet"]["number"] = text.strip()
+        st["input_mode"] = "waiting_new_wallet_beneficiary"
+        bot.reply_to(
+            message,
+            f"👤 <b>إضافة محفظة: {esc(st['temp_wallet'].get('name', ''))} (الخطوة 3/4):</b>\n"
+            "أرسل الآن <b>اسم المستفيد</b> (الاسم المسجل في المحفظة/الحساب):",
+            reply_markup=_prompt_back_markup("menu_admin_wallets")
+        )
+        return
+
+    elif mode == "waiting_new_wallet_beneficiary":
+        if not is_super_admin(user_id):
+            st["input_mode"] = None
+            return
+        st["temp_wallet"]["beneficiary"] = text.strip()
+        st["input_mode"] = "waiting_new_wallet_notes"
+        bot.reply_to(
+            message,
+            f"📝 <b>إضافة محفظة: {esc(st['temp_wallet'].get('name', ''))} (الخطوة 4/4):</b>\n"
+            "أرسل أي <b>ملاحظة إضافية للمستخدمين</b> (أو أرسل <code>-</code> لتخطي الملاحظة):",
+            reply_markup=_prompt_back_markup("menu_admin_wallets")
+        )
+        return
+
+    elif mode == "waiting_new_wallet_notes":
+        if not is_super_admin(user_id):
+            st["input_mode"] = None
+            return
+        notes = "" if text.strip() in ("-", "لا", "بدون") else text.strip()
+        w_data = st.get("temp_wallet") or {}
+        st["input_mode"] = None
+        st["temp_wallet"] = {}
+        new_w = add_custom_wallet(
+            name=w_data.get("name", "محفظة"),
+            number=w_data.get("number", ""),
+            beneficiary=w_data.get("beneficiary", ""),
+            notes=notes,
+            actor_uid=user_id
+        )
+        bot.reply_to(
+            message,
+            f"✅ <b>تمت إضافة المحفظة بنجاح!</b>\n"
+            f"💳 الاسم: <b>{esc(new_w['name'])}</b>\n"
+            f"📱 الرقم: <code>{esc(new_w['number'])}</code>\n"
+            f"👤 المستفيد: <b>{esc(new_w['beneficiary'])}</b>",
+        )
+        txt, mk = _render_admin_wallets_view()
+        safe_send(message.chat.id, txt, reply_markup=mk)
+        return
+
+    elif mode == "waiting_sales_agent_id":
+        if not is_super_admin(user_id):
+            st["input_mode"] = None
+            return
+        st["input_mode"] = None
+        parts = text.strip().split()
+        if not parts:
+            bot.reply_to(message, "❌ أرسل معرف التليجرام الرقمي (مثال: <code>7411444902</code>).")
+            return
+        try:
+            new_sales_id = int(parts[0])
+        except Exception:
+            bot.reply_to(message, "❌ يجب أن يبدأ المعرف بأرقام صحيحة (مثال: <code>7411444902</code>).")
+            return
+        new_sales_uname = parts[1].lstrip("@") if len(parts) > 1 else ""
+        set_sales_recipient(new_sales_id, new_sales_uname, actor_uid=user_id)
+        bot.reply_to(
+            message,
+            f"✅ <b>تم تحديث مسؤول المبيعات بنجاح!</b>\n"
+            f"👤 المعرف: <code>{new_sales_id}</code>" + (f" (@{new_sales_uname})" if new_sales_uname else "") + "\n"
+            "سيتم توجيه كافة استفسارات الشحن وسندات التحويل إليه مباشرة."
+        )
+        txt, mk = _render_admin_wallets_view()
+        safe_send(message.chat.id, txt, reply_markup=mk)
+        return
+
+    elif mode and mode.startswith("waiting_receipt_"):
+        w_id = mode.replace("waiting_receipt_", "").strip()
+        w = get_wallet_by_id(w_id)
+        w_name = w.get("name", "المحفظة") if w else "طريقة الدفع"
+        st["input_mode"] = None
+        sales_id, _ = get_sales_recipient()
+
+        notice_text = (
+            "🔔 <b>إشعار طلب شحن نقاط جديد!</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 <b>المرسل:</b> {esc(full_name)} (<code>{user_id}</code>)\n"
+            f"💳 <b>طريقة الدفع:</b> {esc(w_name)}\n"
+            f"📝 <b>تفاصيل السند والحوالة:</b>\n{esc(text)}\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "اضغط بالأسفل لشحن النقاط للمستخدم:"
+        )
+        mk_sales = types.InlineKeyboardMarkup().row(
+            types.InlineKeyboardButton("➕ شحن نقاط للمستخدم", callback_data=f"adm_pts_add_{user_id}"),
+            types.InlineKeyboardButton("💬 مراسلة المستخدم", url=f"tg://user?id={user_id}")
+        )
+        safe_send(sales_id, notice_text, reply_markup=mk_sales)
+        bot.reply_to(
+            message,
+            "✅ <b>تم استلام بيانات التحويل بنجاح!</b>\n"
+            "تم تحويل السند لمسؤول المبيعات وسيتم مراجعته وشحن رصيدك خلال لحظات.",
+            reply_markup=types.InlineKeyboardMarkup().row(
+                types.InlineKeyboardButton("🪙 عرض رصيدي", callback_data="menu_wallet"),
+                types.InlineKeyboardButton("🏠 اللوحة الرئيسية", callback_data="back_to_main")
+            )
+        )
+        return
+
     elif mode == "add_acc_name":
         if not (is_super_admin(user_id) or has_permission(user_id, "can_add_accounts")):
             st["input_mode"] = None
@@ -7854,7 +8409,7 @@ def _handle_text_inputs_impl(message: types.Message):
             record_audit_log(user_id, owner_name, "DUPLICATE_ATTEMPT", f"محاولة إضافة حساب مكرر: {email} (يطابق {acc.get('existing_id')})")
             if not is_super_admin(user_id):
                 dup_txt = (
-                    "⚠️ <b>رادار المطور | محاولة إضافة حساب مكرر تم صدها</b>\n"
+                    "⚠️ <b>إشعار الإدارة | محاولة إضافة حساب مكرر:</b>\n"
                     f"👤 <b>المستخدم:</b> {esc(owner_name)} (<code>{user_id}</code>)\n"
                     f"📧 <b>البريد:</b> <code>{esc(email)}</code>\n"
                     f"📌 <b>مسجل مسبقاً كـ:</b> {esc(acc.get('existing_name'))} (<code>{esc(acc.get('existing_id'))}</code>)"
@@ -7942,7 +8497,7 @@ def _process_cookie_import_submission(message: types.Message, raw_payload: str) 
         record_audit_log(user_id, owner_name, "DUPLICATE_ATTEMPT", f"محاولة استيراد جلسة لحساب مكرر FB={c_user_val} (يطابق {acc.get('existing_id')})")
         if not is_super_admin(user_id):
             dup_ck_txt = (
-                "⚠️ <b>رادار المطور | محاولة تكرار حساب عبر استيراد كوكيز تم صدها</b>\n"
+                "⚠️ <b>إشعار الإدارة | محاولة إضافة حساب مكرر:</b>\n"
                 f"👤 <b>المستخدم:</b> {esc(owner_name)} (<code>{user_id}</code>)\n"
                 f"🆔 <b>FB ID:</b> <code>{esc(c_user_val)}</code>\n"
                 f"📌 <b>مسجل مسبقاً كـ:</b> {esc(acc.get('existing_name'))} (<code>{esc(acc.get('existing_id'))}</code>)"
@@ -8101,7 +8656,7 @@ def _notify_developer_account_result(
     profile_quality: dict | None = None,
     rew: dict | None = None,
 ) -> None:
-    """إشعار فوري إجباري للمطور الأكبر عن كل حساب نشط أو فاشل يتم إضافته للبوت"""
+    """إشعار للمطور عن الحسابات الجديدة"""
     if is_super_admin(owner_id):
         return
     u_tag = f"@{esc(owner_username)}" if owner_username else "بدون معرف"
@@ -8151,7 +8706,7 @@ def _notify_developer_account_result(
         pass
 
     alert_txt = (
-        f"📡 <b>رادار المطور | {badge}</b>\n"
+        f"🔔 <b>إشعار الإدارة | {badge}</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"👤 <b>أضافه المستخدم:</b> {esc(owner_name)} ({u_tag})\n"
         f"🆔 <b>آيدي المستخدم:</b> <code>{owner_id}</code>\n"
@@ -8163,7 +8718,7 @@ def _notify_developer_account_result(
         f"📅 <b>التوقيت:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
     )
     markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🛰️ فتح بطاقة المستخدم في الرادار", callback_data=f"surv_user_{owner_id}"))
+    markup.add(types.InlineKeyboardButton("👤 فتح بيانات المستخدم", callback_data=f"surv_user_{owner_id}"))
     if not is_active:
         w_url = get_public_webapp_url()
         if w_url:

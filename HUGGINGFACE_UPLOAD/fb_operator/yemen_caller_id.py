@@ -1,12 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-محرك كاشف الأرقام اليمنية المستخرج والمدعوم ذاتياً (Yemen Caller ID Engine)
--------------------------------------------------------------------------
-1. تنقية وتوحيد كافة صيغ الأرقام اليمنية (+967, 00967, 07..., 7...) بدقة متناهية.
-2. كشف شركة الاتصالات (يمن موبايل 4G/CDMA، يو YOU، سبأفون، واي، والهواتف الثابتة بكل المحافظات).
-3. فحص سحابي فائق السرعة عبر خيوط معالجة متوازية (Parallel ThreadPool Executor) بمهلة 2 ثانية كحد أقصى.
-4. ميزة التخزين المحلي الدائم (Local Caching Vault) لحفظ نتائج البحث فورياً ومنع تكرار الانتظار.
-5. لا يظهر أبداً رسالة 'الرقم غير صالح' إذا كان الرقم يمنياً صحيحاً.
+كاشف الأرقام والشبكات اليمنية.
 """
 from __future__ import annotations
 
@@ -73,7 +67,7 @@ class YemenCallerIDAPI:
         },
         "78": {
             "name": "يمن موبايل 4G (Yemen Mobile VoLTE)",
-            "type": "جوال فائق السرعة (4G LTE)",
+            "type": "جوال (4G LTE)",
             "region": "عموم الجمهورية اليمنية",
             "code": "YE-YM4G"
         },
@@ -259,7 +253,7 @@ class YemenCallerIDAPI:
                 "names": []
             }
 
-        # 1. الاستعلام عبر حوض الجلسات المتعددة المتناوبة مع الكاش الفوري (Multi-Session Rotating Pool)
+        # 1. الاستعلام عبر حسابات البحث المتوفرة
         try:
             from fb_operator.multi_session_pool import MultiSessionPoolManager
             pool_mgr = MultiSessionPoolManager.get_instance()
@@ -275,7 +269,7 @@ class YemenCallerIDAPI:
                     "primary_name": cached_entry.get("primary_name") or (cached_entry.get("names") or [""])[0],
                     "records_count": cached_entry.get("records_count") or len(cached_entry.get("names", [])),
                     "names": cached_entry["names"],
-                    "source": "قاعدة البيانات المحلية (سريع ⚡)"
+                    "source": "السجل المحفوظ ⚡"
                 }
 
             active_sessions = pool_mgr.discover_sessions()
@@ -360,10 +354,10 @@ class YemenCallerIDAPI:
                 "carrier_type": carrier_info["type"],
                 "region": carrier_info["region"],
                 "names": found_names,
-                "source": "الدليل السحابي المباشر 🌐"
+                "source": "كاشف الأرقام 🌐"
             }
 
-        # الرقم صالح 100% ولكن قاعدة الأسماء السحابية تحت المزامنة أو لا يوجد اسم مسجل
+        # الرقم صالح 100% ولكن لا يوجد اسم مسجل له
         return {
             "success": True,
             "is_valid": True,
@@ -372,7 +366,7 @@ class YemenCallerIDAPI:
             "carrier_type": carrier_info["type"],
             "region": carrier_info["region"],
             "names": [],
-            "note": f"الرقم صالح ويتبع شبكة {carrier_info['name']} ({carrier_info['region']}). لا يوجد اسم معلن له حالياً في السجلات السحابية."
+            "note": f"الرقم صالح ويتبع شبكة {carrier_info['name']}. لا يوجد اسم معلن له حالياً في السجلات."
         }
 
     @staticmethod
