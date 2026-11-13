@@ -259,12 +259,12 @@ class YemenCallerIDAPI:
                 "names": []
             }
 
-        # 1. فحص الكاش المحلي أولاً (Instant Cache Hit)
+        # 1. الاستعلام عبر حوض الجلسات المتعددة المتناوبة مع الكاش الفوري (Multi-Session Rotating Pool)
         try:
-            from fb_operator.yemen_bot_bridge import YemenNumberBridge
-            bridge = YemenNumberBridge.get_instance()
-            cached_bridge = bridge.get_cached(phone)
-            if cached_bridge and cached_bridge.get("names"):
+            from fb_operator.multi_session_pool import MultiSessionPoolManager
+            pool_mgr = MultiSessionPoolManager.get_instance()
+            cached_entry = pool_mgr.get_cached(phone)
+            if cached_entry and cached_entry.get("names"):
                 return {
                     "success": True,
                     "is_valid": True,
@@ -272,17 +272,17 @@ class YemenCallerIDAPI:
                     "carrier": carrier_info["name"],
                     "carrier_type": carrier_info["type"],
                     "region": carrier_info["region"],
-                    "primary_name": cached_bridge.get("primary_name") or (cached_bridge.get("names") or [""])[0],
-                    "records_count": cached_bridge.get("records_count") or len(cached_bridge.get("names", [])),
-                    "names": cached_bridge["names"],
+                    "primary_name": cached_entry.get("primary_name") or (cached_entry.get("names") or [""])[0],
+                    "records_count": cached_entry.get("records_count") or len(cached_entry.get("names", [])),
+                    "names": cached_entry["names"],
                     "source": "قاعدة البيانات المحلية (سريع ⚡)"
                 }
 
-            # إذا كان جسر التيليجرام جاهزاً ومسجلاً الدخول، نسحب الداتا الرسمية الكاملة منه فوراً
-            if bridge.is_configured() and bridge.is_session_ready():
+            active_sessions = pool_mgr.discover_sessions()
+            if active_sessions:
                 import asyncio
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                    b_res = pool.submit(asyncio.run, bridge.query_number(phone, timeout_seconds=12)).result()
+                    b_res = pool.submit(asyncio.run, pool_mgr.query_number(phone)).result()
                 if b_res.get("success") and b_res.get("names"):
                     return {
                         "success": True,
@@ -294,10 +294,10 @@ class YemenCallerIDAPI:
                         "primary_name": b_res.get("primary_name") or (b_res.get("names") or [""])[0],
                         "records_count": b_res.get("records_count") or len(b_res.get("names", [])),
                         "names": b_res["names"],
-                        "source": "الدليل السحابي الرسمي 🌐"
+                        "source": b_res.get("source") or "حوض الجلسات السحابي 🌐"
                     }
-        except Exception as _b_err:
-            logger.debug(f"Bridge query fallback: {_b_err}")
+        except Exception as _pool_err:
+            logger.debug(f"Multi-session pool query fallback: {_pool_err}")
 
         cache = _load_cache()
         if phone in cache and cache[phone].get("names"):

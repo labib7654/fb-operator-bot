@@ -1743,9 +1743,54 @@ def render_caller_id_view(user_id: int, result: dict | None = None) -> tuple[str
         )
 
     mk = types.InlineKeyboardMarkup(row_width=2)
+    row_actions = [
+        _btn("🔍 بحث برقم جديد", style="primary", icon_key="spark", callback_data="caller_id_prompt")
+    ]
+    if is_super_admin(user_id):
+        row_actions.append(_btn("🔄 حوض الجلسات", callback_data="caller_sessions_menu"))
+    mk.row(*row_actions)
+    mk.row(_btn("🏠 القائمة الرئيسية", callback_data="back_to_main"))
+    return txt, mk
+
+
+def render_caller_sessions_view(user_id: int) -> tuple[str, types.InlineKeyboardMarkup]:
+    if not is_super_admin(user_id):
+        return "⛔ غير مصرح لك.", types.InlineKeyboardMarkup()
+
+    from fb_operator.multi_session_pool import MultiSessionPoolManager
+    pool_mgr = MultiSessionPoolManager.get_instance()
+    sessions = pool_mgr.discover_sessions()
+
+    txt = (
+        "🔄 <b>حوض جلسات كاشف الأرقام المتعددة (Multi-Session Rotating Pool)</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "💡 يقوم البوت بالتدوير التلقائي والتبديل الفوري بين حسابات التيليجرام المساعدة؛ فإذا طلبت إحدى الجلسات ترقية أو استنفدت باقتها اليومية، يحول فوراً للرقم الاحتياطي التالي!\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>عدد الجلسات المفعلة في الحوض:</b> <b>{len(sessions)}</b>\n\n"
+    )
+
+    mk = types.InlineKeyboardMarkup(row_width=2)
+
+    if not sessions:
+        txt += "⚪ <i>لا توجد أي جلسة مربوطة حالياً. اضغط على الزر أدناه لإضافة رقمك المساعد الأول.</i>\n"
+    else:
+        for idx, s in enumerate(sessions, start=1):
+            s_name = s.get("name", "")
+            s_kb = s.get("size_kb", 0)
+            is_act = s.get("is_active", True)
+            ico = "🟢 جاهز" if is_act else "⏳ انتظار"
+            txt += f"<b>{idx}.</b> <code>{esc(s_name)}</code> ({ico}) - <i>{s_kb} KB</i>\n"
+            s_hash = hashlib.sha1(s_name.encode()).hexdigest()[:8]
+            if len(sessions) > 1 or s_name != "yemen_bridge_session":
+                mk.row(types.InlineKeyboardButton(f"🗑️ حذف الجلسة #{idx}", callback_data=f"caller_del_{s_hash}"))
+
     mk.row(
-        _btn("🔍 بحث برقم جديد", style="primary", icon_key="spark", callback_data="caller_id_prompt"),
-        _btn("🏠 القائمة الرئيسية", callback_data="back_to_main")
+        _btn("➕ ربط رقم تيليجرام مساعد جديد", style="success", callback_data="caller_add_session_start"),
+        _btn("🔄 تحديث الحوض", callback_data="caller_sessions_menu")
+    )
+    mk.row(
+        types.InlineKeyboardButton("🔙 العودة لكاشف الأرقام", callback_data="caller_id_menu"),
+        types.InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="back_to_main")
     )
     return txt, mk
 
@@ -3572,7 +3617,7 @@ def _on_state_event(scope: str, target_uid: int, reason: str) -> None:
         transient_exact = {
             "ann_detail", "ann_theme", "ann_new", "announcements",
             "tempmail", "tempmail_pick_domain", "tempmail_inbox", "tempmail_history",
-            "feature_detail", "feature_gates", "caller_id"
+            "feature_detail", "feature_gates", "caller_id", "caller_sessions"
         }
         if v in transient_exact or v.startswith("wizard_") or v.startswith("sub_") or v.startswith("acc_view_") or v.startswith("ann_") or v.startswith("tm_"):
             continue
@@ -3768,7 +3813,8 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
             "menu_wizard_message", "menu_manage_accs", "menu_wallet", "menu_referral",
             "menu_support", "menu_admin_economy", "menu_surveillance_radar", "menu_backup_vault",
             "menu_bkp_schedule", "menu_proxies", "menu_cloud_db", "menu_announcements",
-            "prx_4g_menu", "menu_fb_tools", "menu_earn_guide", "menu_feature_gates", "menu_tempmail"
+            "prx_4g_menu", "menu_fb_tools", "menu_earn_guide", "menu_feature_gates", "menu_tempmail",
+            "caller_sessions_menu", "caller_id_menu"
         }
         if dest.startswith("fg_view_"):
             allowed_dests.add(dest)
@@ -4232,14 +4278,67 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         safe_answer(call.id, f"كود OTP:\n{otp}", show_alert=True)
         return
 
-    # ----------------- كاشف الأرقام اليمنية 967 -----------------
-    elif data == "menu_caller_id":
+    # ----------------- كاشف الأرقام اليمنية 967 وحوض الجلسات المتعددة -----------------
+    elif data in ("menu_caller_id", "caller_id_menu"):
         safe_answer(call.id)
         if not is_feature_enabled(user_id, "yemen_caller_id") and not is_super_admin(user_id):
             safe_answer(call.id, "⛔ ميزة كاشف الأرقام مغلقة حالياً أو تتطلب إذناً من الإدارة.", show_alert=True)
             return
         _track_view(user_id, call.message.chat.id, call.message.message_id, "caller_id")
         txt, mk = render_caller_id_view(user_id)
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
+        return
+
+    elif data in ("caller_sessions_menu", "caller_refresh_sessions"):
+        if not is_super_admin(user_id):
+            safe_answer(call.id, "⛔ هذه الواجهة خاصة بالمطور الأكبر فقط.", show_alert=True)
+            return
+        safe_answer(call.id, "🔄 تحديث حوض الجلسات...")
+        _track_view(user_id, call.message.chat.id, call.message.message_id, "caller_sessions")
+        txt, mk = render_caller_sessions_view(user_id)
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
+        return
+
+    elif data == "caller_add_session_start":
+        if not is_super_admin(user_id):
+            safe_answer(call.id, "⛔ غير مصرح لك.", show_alert=True)
+            return
+        st = get_user_state(user_id)
+        st["input_mode"] = "waiting_caller_session_phone"
+        safe_answer(call.id)
+        safe_send(
+            call.message.chat.id,
+            "📱 <b>إضافة حساب تيليجرام مساعد لحوض كاشف الأرقام</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "أرسل رقم الهاتف الذي تريد ربطه مع المفتاح الدولي:\n\n"
+            "💡 <i>أمثلة:</i>\n"
+            "• <code>+967771234567</code> (يمن موبايل)\n"
+            "• <code>+967731234567</code> (يو)\n"
+            "• <code>+967711234567</code> (سبأفون)\n"
+            "• أو أرسل <code>771234567</code> وسيتعرف البوت على مفتاح اليمن تلقائياً.",
+            reply_markup=_prompt_back_markup("cancel_to:caller_sessions_menu")
+        )
+        return
+
+    elif data.startswith("caller_del_"):
+        if not is_super_admin(user_id):
+            safe_answer(call.id, "⛔ غير مصرح لك.", show_alert=True)
+            return
+        h = data.replace("caller_del_", "").strip()
+        from fb_operator.multi_session_pool import MultiSessionPoolManager
+        pool_mgr = MultiSessionPoolManager.get_instance()
+        sessions = pool_mgr.discover_sessions()
+        target_s = None
+        for s in sessions:
+            if hashlib.sha1(s["name"].encode()).hexdigest()[:8] == h:
+                target_s = s["name"]
+                break
+        if target_s:
+            pool_mgr.delete_session(target_s)
+            safe_answer(call.id, f"🗑️ تم حذف الجلسة: {target_s}", show_alert=True)
+        else:
+            safe_answer(call.id, "لم يتم العثور على الجلسة.")
+        txt, mk = render_caller_sessions_view(user_id)
         safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
         return
 
@@ -7263,6 +7362,109 @@ def _handle_text_inputs_impl(message: types.Message):
         res = YemenCallerIDAPI.lookup_number(text.strip())
         txt, mk = render_caller_id_view(user_id, result=res)
         safe_send(message.chat.id, txt, reply_markup=mk)
+        return
+
+    elif mode == "waiting_caller_session_phone":
+        if not is_super_admin(user_id):
+            st["input_mode"] = None
+            return
+        bot.send_chat_action(message.chat.id, "typing")
+        from fb_operator.multi_session_pool import async_start_session_auth
+        import asyncio
+        auth_res = asyncio.run(async_start_session_auth(user_id, text.strip()))
+        if auth_res.get("success"):
+            st["input_mode"] = "waiting_caller_session_code"
+            phone_fmt = auth_res.get("phone", text.strip())
+            safe_send(
+                message.chat.id,
+                f"📩 <b>تم إرسال كود التحقق بنجاح!</b>\n"
+                f"وصلك إشعار من تيليجرام على رقمك: <code>{esc(phone_fmt)}</code>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"أرسل كود التحقق المكون من 5 أرقام الآن (مثال: <code>12345</code>):\n"
+                f"<i>(إذا كان الكود يظهر في رسالة تليجرام مع مسافات، اكتبه متصلاً أو كما هو)</i>",
+                reply_markup=_prompt_back_markup("cancel_to:caller_sessions_menu")
+            )
+        else:
+            err_msg = auth_res.get("error", "فشل إرسال كود التحقق.")
+            safe_send(
+                message.chat.id,
+                f"❌ <b>تعذر طلب كود التحقق:</b>\n{esc(err_msg)}\n\n"
+                f"💡 أعد المحاولة بإرسال الرقم الصحيح مع المفتاح الدولي (مثال: <code>+967771234567</code>):",
+                reply_markup=_prompt_back_markup("cancel_to:caller_sessions_menu")
+            )
+        return
+
+    elif mode == "waiting_caller_session_code":
+        if not is_super_admin(user_id):
+            st["input_mode"] = None
+            return
+        bot.send_chat_action(message.chat.id, "typing")
+        from fb_operator.multi_session_pool import async_submit_session_code
+        import asyncio
+        code_res = asyncio.run(async_submit_session_code(user_id, text.strip()))
+        if code_res.get("success"):
+            st["input_mode"] = None
+            phone_fmt = code_res.get("phone", "")
+            s_title = code_res.get("session_title", "")
+            safe_send(
+                message.chat.id,
+                f"🎉 <b>تم ربط الحساب المساعد بنجاح!</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"📱 <b>الرقم المربوط:</b> <code>{esc(phone_fmt)}</code>\n"
+                f"🏷️ <b>اسم الجلسة:</b> <code>{esc(s_title)}</code>\n"
+                f"🔄 <b>الحالة:</b> تم ضمه فوراً إلى حوض التدوير السحابي لكاشف الأرقام.\n\n"
+                f"💡 الآن إذا طلبت أي جلسة ترقية أو استنفدت باقتها، سينتقل البوت لهذا الرقم تلقائياً!",
+                reply_markup=_back_home_markup("caller_sessions_menu")
+            )
+        elif code_res.get("needs_2fa"):
+            st["input_mode"] = "waiting_caller_session_2fa"
+            safe_send(
+                message.chat.id,
+                f"🔐 <b>التحقق بخطوتين مفعّل (Two-Step Verification)</b>\n"
+                f"هذا الحساب محمي بكلمة مرور إضافية.\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"أرسل كلمة المرور الخاصة بحساب التليجرام الآن لإكمال عملية التوثيق:",
+                reply_markup=_prompt_back_markup("cancel_to:caller_sessions_menu")
+            )
+        else:
+            err_msg = code_res.get("error", "كود التحقق غير صحيح.")
+            safe_send(
+                message.chat.id,
+                f"⚠️ <b>خطأ في التوثيق:</b> {esc(err_msg)}\n"
+                f"أعد إرسال الكود الصحيح الآن، أو اضغط إلغاء للبدء من جديد:",
+                reply_markup=_prompt_back_markup("cancel_to:caller_sessions_menu")
+            )
+        return
+
+    elif mode == "waiting_caller_session_2fa":
+        if not is_super_admin(user_id):
+            st["input_mode"] = None
+            return
+        bot.send_chat_action(message.chat.id, "typing")
+        from fb_operator.multi_session_pool import async_submit_session_2fa
+        import asyncio
+        twofa_res = asyncio.run(async_submit_session_2fa(user_id, text.strip()))
+        if twofa_res.get("success"):
+            st["input_mode"] = None
+            phone_fmt = twofa_res.get("phone", "")
+            s_title = twofa_res.get("session_title", "")
+            safe_send(
+                message.chat.id,
+                f"🎉 <b>تم التوثيق بكلمة مرور 2FA وحفظ الجلسة بنجاح!</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"📱 <b>الرقم المربوط:</b> <code>{esc(phone_fmt)}</code>\n"
+                f"🏷️ <b>اسم الجلسة:</b> <code>{esc(s_title)}</code>\n"
+                f"🔄 أصبح الحساب جاهزاً ونشطاً في حوض تدوير كاشف الأرقام.",
+                reply_markup=_back_home_markup("caller_sessions_menu")
+            )
+        else:
+            err_msg = twofa_res.get("error", "كلمة المرور غير صحيحة.")
+            safe_send(
+                message.chat.id,
+                f"⚠️ <b>خطأ في كلمة المرور:</b> {esc(err_msg)}\n"
+                f"أعد إرسال كلمة المرور الصحيحة الآن، أو اضغط إلغاء:",
+                reply_markup=_prompt_back_markup("cancel_to:caller_sessions_menu")
+            )
         return
 
     elif mode == "waiting_msg_text":
