@@ -68,9 +68,10 @@ def _get_data() -> dict[str, Any]:
     data = _safe_load_json(TEMP_EMAILS_FILE, {})
     if not isinstance(data, dict):
         data = {}
-    data.setdefault("users", {})          # {str(user_id): {...active_mailbox...}}
-    data.setdefault("history", [])        # list of {id, user_id, email, provider, token, domain, username, created_at}
-    data.setdefault("seen_messages", {})  # {str(user_id): [msg_id, ...]}
+    data.setdefault("users", {})             # {str(user_id): {...active_mailbox...}}
+    data.setdefault("history", [])           # list of {id, user_id, email, provider, token, domain, username, created_at}
+    data.setdefault("seen_messages", {})     # {str(user_id): [msg_id, ...]}
+    data.setdefault("mailbox_messages", {})  # {email_lower: [msg1, msg2, ...]} خزنة الرسائل الدائمة لكل إيميل
     return data
 
 
@@ -227,9 +228,10 @@ def set_user_active_mailbox(user_id: int, email: str) -> dict[str, Any] | None:
 
 
 def get_user_history(user_id: int, limit: int = 15) -> list[dict[str, Any]]:
-    """جلب سجل الإيميلات السابقة للمستخدم مع إزالة التكرارات بالبريد"""
+    """جلب سجل الإيميلات السابقة للمستخدم مع إزالة التكرارات بالبريد وتضمين عدد الرسائل المؤرشفة"""
     with _tm_lock:
         data = _get_data()
+        mb_map = data.get("mailbox_messages", {})
         seen = set()
         result = []
         for item in data.get("history", []):
@@ -237,10 +239,30 @@ def get_user_history(user_id: int, limit: int = 15) -> list[dict[str, Any]]:
                 em = item.get("email", "").lower()
                 if em and em not in seen:
                     seen.add(em)
-                    result.append(item)
+                    item_copy = dict(item)
+                    item_copy["msg_count"] = len(mb_map.get(em, []))
+                    result.append(item_copy)
                     if len(result) >= limit:
                         break
         return result
+
+
+def get_mailbox_messages(email: str) -> list[dict[str, Any]]:
+    """جلب كافة الرسائل المحفوظة والمؤرشفة لصندوق بريد محدد"""
+    if not email:
+        return []
+    with _tm_lock:
+        data = _get_data()
+        return list(data.get("mailbox_messages", {}).get(email.lower().strip(), []))
+
+
+def get_mailbox_message_count(email: str) -> int:
+    """جلب عدد الرسائل المستلمة لصندوق بريد محدد"""
+    if not email:
+        return 0
+    with _tm_lock:
+        data = _get_data()
+        return len(data.get("mailbox_messages", {}).get(email.lower().strip(), []))
 
 
 def delete_user_email(user_id: int, email: str, deleted_by: int = 0) -> bool:
@@ -384,6 +406,8 @@ def check_inbox(user_id: int, email: str | None = None) -> list[dict[str, Any]]:
         data = _get_data()
         uid_str = str(user_id)
         seen_list = set(data["seen_messages"].get(uid_str, []))
+        em_key = target_email.lower().strip()
+        mb_history = data.setdefault("mailbox_messages", {}).setdefault(em_key, [])
 
         for msg in raw_messages:
             msg_id = str(msg.get("id", ""))
@@ -399,7 +423,7 @@ def check_inbox(user_id: int, email: str | None = None) -> list[dict[str, Any]]:
             if msg_id:
                 seen_list.add(msg_id)
 
-            parsed_messages.append({
+            p_item = {
                 "id": msg_id,
                 "sender": msg.get("sender", "Unknown"),
                 "subject": subject,
@@ -409,9 +433,20 @@ def check_inbox(user_id: int, email: str | None = None) -> list[dict[str, Any]]:
                 "links": links,
                 "is_new": is_new,
                 "email": target_email
-            })
+            }
+            parsed_messages.append(p_item)
+
+            # دمج الرسائل في الأرشيف الدائم لصندوق هذا البريد بالتحديد لمنع فقدان الأكواد نهائياً
+            existing_ids = {str(m.get("id", "")) for m in mb_history if m.get("id")}
+            if not msg_id or msg_id not in existing_ids:
+                mb_history.insert(0, p_item)
 
         data["seen_messages"][uid_str] = list(seen_list)[-300:]
+
+        # إذا كانت الاستجابة المباشرة فارغة، نعيد الرسائل المحفوظة في الصندوق الدائم لهذا البريد
+        if not parsed_messages and mb_history:
+            parsed_messages = list(mb_history)
+
         _atomic_write_json(TEMP_EMAILS_FILE, data)
 
     return parsed_messages

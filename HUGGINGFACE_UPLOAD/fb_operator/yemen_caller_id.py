@@ -272,6 +272,8 @@ class YemenCallerIDAPI:
                     "carrier": carrier_info["name"],
                     "carrier_type": carrier_info["type"],
                     "region": carrier_info["region"],
+                    "primary_name": cached_bridge.get("primary_name") or (cached_bridge.get("names") or [""])[0],
+                    "records_count": cached_bridge.get("records_count") or len(cached_bridge.get("names", [])),
                     "names": cached_bridge["names"],
                     "source": "قاعدة البيانات المحلية (سريع ⚡)"
                 }
@@ -282,7 +284,6 @@ class YemenCallerIDAPI:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                     b_res = pool.submit(asyncio.run, bridge.query_number(phone, timeout_seconds=12)).result()
                 if b_res.get("success") and b_res.get("names"):
-                    bridge.save_cache(phone, b_res["names"], carrier_info["name"])
                     return {
                         "success": True,
                         "is_valid": True,
@@ -290,6 +291,8 @@ class YemenCallerIDAPI:
                         "carrier": carrier_info["name"],
                         "carrier_type": carrier_info["type"],
                         "region": carrier_info["region"],
+                        "primary_name": b_res.get("primary_name") or (b_res.get("names") or [""])[0],
+                        "records_count": b_res.get("records_count") or len(b_res.get("names", [])),
                         "names": b_res["names"],
                         "source": "الدليل السحابي الرسمي 🌐"
                     }

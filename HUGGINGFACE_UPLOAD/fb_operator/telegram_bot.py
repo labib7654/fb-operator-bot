@@ -375,12 +375,23 @@ def _strip_tg_emoji_tags(html_text: str) -> str:
 
 
 def _safe_bot_send(fn, *args, **kwargs):
-    """مُرسل مرن يحافظ على ألوان الأزرار ويتجاوز تلقائياً فقط الميزات التي يرفضها السيرفر"""
+    """مُرسل مرن يحافظ على ألوان الأزرار ويتجاوز تلقائياً فقط الميزات التي يرفضها السيرفر مع حماية 429"""
     global _BOT_CAP_CUSTOM_EMOJI_OK, _BOT_CAP_STYLE_OK
     try:
         return fn(*args, **kwargs)
     except Exception as exc:
         err_s = str(exc).lower()
+        if "429" in err_s or "too many requests" in err_s or "retry after" in err_s:
+            m = re.search(r"retry after (\d+)", err_s)
+            wait_s = int(m.group(1)) if m else 2
+            if wait_s <= 3:
+                time.sleep(wait_s)
+                try:
+                    return fn(*args, **kwargs)
+                except Exception:
+                    return None
+            return None
+
         retry_kw = dict(kwargs)
         changed = False
         if "effect" in err_s and "message_effect_id" in retry_kw:
@@ -418,6 +429,8 @@ def safe_edit_message(text: str, chat_id: int, message_id: int | None, reply_mar
     except Exception as e:
         err_l = str(e).lower()
         if "message is not modified" in err_l:
+            return
+        if "429" in err_l or "too many requests" in err_l or "retry after" in err_l:
             return
         if "style" in err_l or "emoji" in err_l or "icon" in err_l:
             try:
@@ -1510,25 +1523,31 @@ def render_tempmail_inbox_view(user_id: int, email: str | None = None) -> tuple[
         return render_tempmail_main_view(user_id)
 
     messages = tm_m.check_inbox(user_id, target_email)
+    em_hash = hashlib.sha1(target_email.encode()).hexdigest()[:8]
+    is_active_box = active and (active.get("email", "").lower() == target_email.lower())
 
     mk = types.InlineKeyboardMarkup(row_width=1)
+
+    status_tag = "🟢 <b>(البريد النشط حالياً)</b>" if is_active_box else "⚪ <b>(بريد مؤرشف)</b>"
 
     if not messages:
         txt = (
             f"📭 <b>صندوق الوارد:</b> <code>{esc(target_email)}</code>\n"
+            f"{status_tag}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"⚪ لا توجد رسائل واردة حالياً.\n"
             f"بانتظار وصول رسائل التحقق والتفعيل...\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"💡 اضغط <b>تحديث وفحص الآن</b> بعد طلب الكود من فيسبوك أو المنصة المستهدفة."
+            f"💡 اضغط <b>تحديث وفحص الآن</b> بعد طلب الكود من فيسبوك أو أي منصة."
         )
     else:
         txt = (
             f"📬 <b>صندوق الوارد:</b> <code>{esc(target_email)}</code>\n"
-            f"عدد الرسائل المستلمة: <b>{len(messages)}</b>\n"
+            f"{status_tag}\n"
+            f"عدد الرسائل المؤرشفة: <b>{len(messages)}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
         )
-        for idx, m in enumerate(messages[:8], start=1):
+        for idx, m in enumerate(messages[:10], start=1):
             sender = esc(m.get("sender") or "مجهول")
             subj = esc(m.get("subject") or "بدون عنوان")
             otp = m.get("otp_code")
@@ -1550,37 +1569,47 @@ def render_tempmail_inbox_view(user_id: int, email: str | None = None) -> tuple[
             if links:
                 mk.row(types.InlineKeyboardButton("🌐 فتح رابط التفعيل", url=links[0]))
 
+    action_row = [
+        _btn("🔄 تحديث وفحص الآن", style="primary", icon_key="spark", callback_data=f"tm_inbox_{em_hash}")
+    ]
+    if not is_active_box:
+        action_row.append(_btn("🟢 جعله البريد النشط", callback_data=f"tm_switch_{em_hash}"))
+    mk.row(*action_row)
     mk.row(
-        _btn("🔄 تحديث وفحص الآن", style="primary", icon_key="spark", callback_data="tm_inbox"),
-        _btn("📧 إدارة البريد", callback_data="menu_tempmail")
+        types.InlineKeyboardButton("📜 أرشيف كافة الإيميلات", callback_data="menu_tm_history"),
+        types.InlineKeyboardButton("🔙 إدارة البريد", callback_data="menu_tempmail")
     )
     return txt, mk
 
 
 def render_tempmail_history_view(user_id: int) -> tuple[str, types.InlineKeyboardMarkup]:
-    history = tm_m.get_user_history(user_id, limit=12)
+    history = tm_m.get_user_history(user_id, limit=15)
     active = tm_m.get_user_active_mailbox(user_id)
     active_email = (active.get("email") or "").lower() if active else ""
 
     txt = (
-        f"📜 <b>أرشيف وسجل إيميلاتي المحفوظة</b>\n"
+        f"📜 <b>أرشيف وسجل كافة إيميلاتي المحفوظة</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"💡 يمكنك التبديل بين إيميلاتك السابقة في أي وقت لإعادة استخدامها أو فحص رسائلها القديمة والجديدة:\n"
+        f"💡 لكل إيميل صندوق بريد دائم ومستقل لحفظ رسائل التحقق وأكواد OTP إلى الأبد:\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
     )
 
-    mk = types.InlineKeyboardMarkup(row_width=2)
+    mk = types.InlineKeyboardMarkup(row_width=3)
     if not history:
         txt += "⚪ لا يوجد أي بريد محفوظ في أرشيفك حتى الآن."
     else:
         for idx, item in enumerate(history, start=1):
             em = item.get("email", "")
+            msg_cnt = item.get("msg_count", 0)
             is_cur = em.lower() == active_email
             ico = "🟢 نشط" if is_cur else "⚪ سابق"
-            txt += f"{idx}. <code>{esc(em)}</code> ({ico})\n"
+            cnt_str = f" | 📩 <b>{msg_cnt} رسائل</b>" if msg_cnt > 0 else " | 📭 فارغ"
+            txt += f"{idx}. <code>{esc(em)}</code> ({ico}){cnt_str}\n"
             em_hash = hashlib.sha1(em.encode()).hexdigest()[:8]
 
-            row_btns = []
+            row_btns = [
+                types.InlineKeyboardButton(f"📬 صندوق #{idx}" + (f" ({msg_cnt})" if msg_cnt else ""), callback_data=f"tm_viewbox_{em_hash}")
+            ]
             if not is_cur:
                 row_btns.append(types.InlineKeyboardButton(f" تفعيل #{idx}", callback_data=f"tm_switch_{em_hash}"))
             row_btns.append(types.InlineKeyboardButton(f"🗑️ حذف #{idx}", callback_data=f"tm_del_{em_hash}"))
@@ -1666,13 +1695,27 @@ def render_caller_id_view(user_id: int, result: dict | None = None) -> tuple[str
         source = result.get("source", "الدليل السحابي 🌐")
 
         if is_valid:
+            primary_name = result.get("primary_name")
+            records_count = result.get("records_count") or len(names)
             txt += (
                 f"📱 <b>الرقم المستعلم عنه:</b> <code>{esc(phone)}</code>\n"
                 f"🌐 <b>الشركة والشبكة:</b> <b>{esc(carrier)}</b> ({esc(carrier_type)})\n"
                 f"📍 <b>النطاق الجغرافي:</b> <b>{esc(region)}</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
             )
-            if names:
+            if primary_name and primary_name not in ("غير مسجل", "لم يتم العثور على اسم مسجل لهذا الرقم في قاعدة البيانات."):
+                txt += f"👑 <b>الاسم الأكثر شهرة:</b> <b>{esc(primary_name)}</b>\n"
+                if records_count > 0:
+                    txt += f"📊 <b>عدد السجلات المكتشفة:</b> {records_count} اسماً مسجلاً\n"
+                txt += "━━━━━━━━━━━━━━━━━━━━\n"
+                txt += "📋 <b>أبرز الأسماء المسجلة لهذا الرقم:</b>\n"
+                shown_count = 0
+                for n in names:
+                    if n and n != primary_name and shown_count < 12:
+                        txt += f"• <code>{esc(n)}</code>\n"
+                        shown_count += 1
+                txt += f"\n⚡ <i>المصدر: {esc(source)}</i>\n"
+            elif names and names[0] not in ("لم يتم العثور على اسم مسجل لهذا الرقم في قاعدة البيانات.", ""):
                 txt += (
                     f"👤 <b>الأسماء المسجلة بالدليل ({len(names)}):</b>\n"
                 )
@@ -3476,9 +3519,23 @@ def _refresh_tracked_inline_view(uid: int) -> None:
     else:
         return
 
+    # منع تكرار طلب تعديل الرسالة إذا لم يتغير المحتوى لتجنب اختناق واستهلاك حصة تيليجرام
+    _cache = getattr(_refresh_tracked_inline_view, "_cache", None)
+    if _cache is None:
+        _cache = {}
+        _refresh_tracked_inline_view._cache = _cache
+    ck = f"{uid}_{view}_{chat_id}_{msg_id}"
+    cur_hash = hashlib.md5((txt or "").encode("utf-8", errors="ignore")).hexdigest()
+    if _cache.get(ck) == cur_hash:
+        return
+    _cache[ck] = cur_hash
+
     try:
         bot.edit_message_text(txt, chat_id, msg_id, reply_markup=markup)
-    except Exception:
+    except Exception as exc:
+        err_l = str(exc).lower()
+        if "message is not modified" in err_l:
+            return
         pass
 
 
@@ -3489,7 +3546,7 @@ def _live_inline_sync_worker() -> None:
                 _live_sync_cond.wait(timeout=30.0)
             uids = list(_live_sync_pending_uids)
             _live_sync_pending_uids.clear()
-        time.sleep(0.5)  # دمج التحديثات المتتالية السريعة لمنع الضغط والارتداد
+        time.sleep(1.2)  # دمج وتجميع التحديثات المتتالية لمنع إغراق تليجرام وحظر الخادم
         for uid in uids:
             try:
                 _refresh_tracked_inline_view(uid)
@@ -4027,12 +4084,43 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         return
 
     elif data == "tm_inbox":
-        safe_answer(call.id)
+        safe_answer(call.id, "🔄 جاري فحص الوارد...")
         txt, mk = render_tempmail_inbox_view(user_id)
         safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
         return
 
-    elif data == "tm_history":
+    elif data.startswith("tm_inbox_"):
+        h = data.replace("tm_inbox_", "").strip()
+        hist = tm_m.get_user_history(user_id, limit=50)
+        target_em = None
+        for item in hist:
+            em = item.get("email", "")
+            if hashlib.sha1(em.encode()).hexdigest()[:8] == h:
+                target_em = em
+                break
+        safe_answer(call.id, "🔄 جاري فحص وتحديث الصندوق...")
+        txt, mk = render_tempmail_inbox_view(user_id, email=target_em)
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
+        return
+
+    elif data.startswith("tm_viewbox_"):
+        h = data.replace("tm_viewbox_", "").strip()
+        hist = tm_m.get_user_history(user_id, limit=50)
+        target_em = None
+        for item in hist:
+            em = item.get("email", "")
+            if hashlib.sha1(em.encode()).hexdigest()[:8] == h:
+                target_em = em
+                break
+        if target_em:
+            safe_answer(call.id, f"📬 فتح صندوق البريد")
+            txt, mk = render_tempmail_inbox_view(user_id, email=target_em)
+            safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
+        else:
+            safe_answer(call.id, "لم يتم العثور على هذا البريد في الأرشيف.")
+        return
+
+    elif data in ("tm_history", "menu_tm_history"):
         safe_answer(call.id)
         txt, mk = render_tempmail_history_view(user_id)
         safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
