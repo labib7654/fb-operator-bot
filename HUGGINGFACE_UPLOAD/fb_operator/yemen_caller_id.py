@@ -208,12 +208,12 @@ class YemenCallerIDAPI:
 
     @classmethod
     def _query_single_server(cls, base: str, phone: str) -> list[str]:
-        """استعلام سيرفر محدد بمهلة صارمة"""
+        """استعلام سيرفر محدد بمهلة سريعة جداً لمنع تعليق خيوط المعالجة"""
         url = f"{base}/api/arkamalyemenphone/2025/getname/{phone}"
         # 1. تجربة GET
         try:
             req = urllib.request.Request(url, headers=cls.HEADERS)
-            with urllib.request.urlopen(req, timeout=1.8) as resp:
+            with urllib.request.urlopen(req, timeout=0.7) as resp:
                 if resp.status == 200:
                     content = resp.read().decode("utf-8", errors="ignore")
                     extracted = cls._extract_names_from_json(json.loads(content))
@@ -227,7 +227,7 @@ class YemenCallerIDAPI:
             if phone.isdigit():
                 payload = json.dumps({"phone": int(phone)}).encode("utf-8")
                 req = urllib.request.Request(url, data=payload, headers=cls.HEADERS, method="POST")
-                with urllib.request.urlopen(req, timeout=1.8) as resp:
+                with urllib.request.urlopen(req, timeout=0.7) as resp:
                     if resp.status == 200:
                         content = resp.read().decode("utf-8", errors="ignore")
                         extracted = cls._extract_names_from_json(json.loads(content))
@@ -280,22 +280,37 @@ class YemenCallerIDAPI:
 
             active_sessions = pool_mgr.discover_sessions()
             if active_sessions:
-                import asyncio
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                    b_res = pool.submit(asyncio.run, pool_mgr.query_number(phone)).result()
-                if b_res.get("success") and b_res.get("names"):
-                    return {
-                        "success": True,
-                        "is_valid": True,
-                        "phone": phone,
-                        "carrier": carrier_info["name"],
-                        "carrier_type": carrier_info["type"],
-                        "region": carrier_info["region"],
-                        "primary_name": b_res.get("primary_name") or (b_res.get("names") or [""])[0],
-                        "records_count": b_res.get("records_count") or len(b_res.get("names", [])),
-                        "names": b_res["names"],
-                        "source": b_res.get("source") or "حوض الجلسات السحابي 🌐"
-                    }
+                b_res = pool_mgr.query_number_sync(phone, timeout=12.0)
+                if b_res.get("success"):
+                    names = b_res.get("names", [])
+                    p_name = b_res.get("primary_name")
+                    rec_count = b_res.get("records_count", len(names))
+                    if names and names[0] not in ("غير مسجل", "لم يتم العثور على اسم مسجل لهذا الرقم في قاعدة البيانات."):
+                        return {
+                            "success": True,
+                            "is_valid": True,
+                            "phone": phone,
+                            "carrier": carrier_info["name"],
+                            "carrier_type": carrier_info["type"],
+                            "region": carrier_info["region"],
+                            "primary_name": p_name or names[0],
+                            "records_count": rec_count,
+                            "names": names,
+                            "source": b_res.get("source") or "كاشف الأرقام 🌐"
+                        }
+                    else:
+                        return {
+                            "success": True,
+                            "is_valid": True,
+                            "phone": phone,
+                            "carrier": carrier_info["name"],
+                            "carrier_type": carrier_info["type"],
+                            "region": carrier_info["region"],
+                            "primary_name": "غير مسجل",
+                            "records_count": 0,
+                            "names": [],
+                            "note": f"الرقم صالح ويتبع شبكة {carrier_info['name']}. لا يوجد اسم معلن له حالياً في السجلات."
+                        }
         except Exception as _pool_err:
             logger.debug(f"Multi-session pool query fallback: {_pool_err}")
 

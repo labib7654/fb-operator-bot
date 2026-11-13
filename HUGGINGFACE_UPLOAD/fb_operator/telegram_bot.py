@@ -1768,22 +1768,27 @@ def render_caller_id_view(user_id: int, result: dict | None = None) -> tuple[str
                 f"━━━━━━━━━━━━━━━━━━━━\n"
             )
             if primary_name and primary_name not in ("غير مسجل", "لم يتم العثور على اسم مسجل لهذا الرقم في قاعدة البيانات."):
-                txt += f"👤 <b>الاسم:</b> <b>{esc(primary_name)}</b>\n"
+                txt += f"👤 <b>الاسم الأشهر:</b> <b>{esc(primary_name)}</b>\n"
                 if records_count > 0:
-                    txt += f"📊 <b>عدد السجلات:</b> {records_count}\n"
+                    txt += f"📊 <b>إجمالي السجلات المكتشفة:</b> {records_count}\n"
                 txt += "━━━━━━━━━━━━━━━━━━━━\n"
-                txt += "📋 <b>الأسماء المسجلة:</b>\n"
-                shown_count = 0
-                for n in names:
-                    if n and n != primary_name and shown_count < 12:
-                        txt += f"• {esc(n)}\n"
-                        shown_count += 1
-            elif names and names[0] not in ("لم يتم العثور على اسم مسجل لهذا الرقم في قاعدة البيانات.", ""):
-                txt += f"👤 <b>الأسماء المسجلة ({len(names)}):</b>\n"
-                for n in names[:12]:
-                    txt += f"• {esc(n)}\n"
+                txt += f"📋 <b>كافة الأسماء المسجلة ({len(names)}):</b>\n"
+                for idx_n, n in enumerate(names[:50], start=1):
+                    line = f"{idx_n}• {esc(n)}\n"
+                    if len(txt) + len(line) > 3850:
+                        txt += f"... وهناك {len(names) - idx_n + 1} أسماء أخرى مسجلة.\n"
+                        break
+                    txt += line
+            elif names and names[0] not in ("لم يتم العثور على اسم مسجل لهذا الرقم في قاعدة البيانات.", "", "غير مسجل"):
+                txt += f"👤 <b>كافة الأسماء المسجلة ({len(names)}):</b>\n"
+                for idx_n, n in enumerate(names[:50], start=1):
+                    line = f"{idx_n}• {esc(n)}\n"
+                    if len(txt) + len(line) > 3850:
+                        txt += f"... وهناك {len(names) - idx_n + 1} أسماء أخرى مسجلة.\n"
+                        break
+                    txt += line
             else:
-                txt += "ℹ️ <b>النتيجة:</b> الرقم صالح ولا يوجد اسم مسجل له حالياً.\n"
+                txt += "ℹ️ <b>النتيجة:</b> الرقم صالح ولا يوجد اسم مسجل له حالياً في السجلات.\n"
             txt += "\n💡 <i>أرسل أي رقم آخر للبحث عنه مباشرة.</i>"
         else:
             txt += f"❌ {esc(result.get('error', 'صيغة الرقم غير صحيحة'))}\n"

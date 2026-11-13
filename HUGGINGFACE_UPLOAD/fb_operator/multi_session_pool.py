@@ -14,6 +14,7 @@ import re
 import glob
 import time
 import asyncio
+import threading
 import sqlite3
 import logging
 from pathlib import Path
@@ -86,12 +87,26 @@ def format_international_phone(raw: str) -> str:
 
 class MultiSessionPoolManager:
     _instance: Optional[MultiSessionPoolManager] = None
+    _loop: Optional[asyncio.AbstractEventLoop] = None
+    _loop_thread: Optional[threading.Thread] = None
+    _loop_lock = threading.Lock()
 
     def __init__(self):
         self.db_path = _resolve_db_path()
         self.clients: Dict[str, TelegramClient] = {}
         self.exhausted_sessions = set()
         self._init_db()
+        self._ensure_loop()
+
+    def _ensure_loop(self):
+        with self._loop_lock:
+            if self._loop is None or not self._loop.is_running():
+                self._loop = asyncio.new_event_loop()
+                def _runner():
+                    asyncio.set_event_loop(self._loop)
+                    self._loop.run_forever()
+                self._loop_thread = threading.Thread(target=_runner, daemon=True, name="MultiSessionPoolLoop")
+                self._loop_thread.start()
 
     @classmethod
     def get_instance(cls) -> MultiSessionPoolManager:
@@ -228,10 +243,33 @@ class MultiSessionPoolManager:
             "names": all_names
         }
 
+    def query_number_sync(self, phone: str, timeout: float = 12.0) -> Dict[str, Any]:
+        """استدعاء متزامن آمن ومستمر عبر حلقة الأحداث الخلفية الدائمة دون إغلاق أو تعليق الجلسة"""
+        # 1. فحص الكاش أولاً
+        cached = self.get_cached(phone)
+        if cached:
+            return {
+                "success": True,
+                "phone": phone,
+                "carrier": cached["carrier"],
+                "primary_name": cached["primary_name"],
+                "records_count": cached["records_count"],
+                "names": cached["names"],
+                "source": "قاعدة البيانات المحلية (سريع ⚡)"
+            }
+
+        self._ensure_loop()
+        future = asyncio.run_coroutine_threadsafe(self.query_number(phone), self._loop)
+        try:
+            return future.result(timeout=timeout)
+        except Exception as e:
+            logger.error(f"Error in query_number_sync: {e}")
+            return {"success": False, "error": str(e)}
+
     async def get_client(self, session_path: str) -> TelegramClient:
         stem = Path(session_path).stem
         if stem not in self.clients or not self.clients[stem].is_connected():
-            client = TelegramClient(session_path, OFFICIAL_API_ID, OFFICIAL_API_HASH)
+            client = TelegramClient(session_path, OFFICIAL_API_ID, OFFICIAL_API_HASH, loop=self._loop)
             await client.connect()
             self.clients[stem] = client
         return self.clients[stem]
@@ -262,6 +300,10 @@ class MultiSessionPoolManager:
             self.exhausted_sessions.clear()
             available = all_sessions
 
+        prefix = phone[:2] if len(phone) >= 2 else ""
+        carriers = {"77": "يمن موبايل (Yemen Mobile)", "78": "يمن موبايل 4G", "73": "يو (YOU)", "71": "سبأفون", "70": "واي"}
+        carrier = carriers.get(prefix, "شبكة يمنية")
+
         # 3. تدوير الجلسات مع التبديل التلقائي
         for sess_info in available:
             s_name = sess_info["name"]
@@ -273,12 +315,18 @@ class MultiSessionPoolManager:
                     continue
 
                 sent_msg = await client.send_message(TARGET_BOT, phone)
-                await asyncio.sleep(2.5)
-
                 received_texts = []
-                async for msg in client.iter_messages(TARGET_BOT, min_id=sent_msg.id):
-                    if msg.text and "جاري البحث" not in msg.text:
-                        received_texts.append(msg.text)
+                # انتظار الرد حتى 4.5 ثوانٍ مع خروج فوري عند وصول ملخص البحث أو عدم وجود نتائج
+                for _ in range(9):
+                    await asyncio.sleep(0.5)
+                    msgs = []
+                    async for msg in client.iter_messages(TARGET_BOT, min_id=sent_msg.id):
+                        if msg.text and "جاري البحث" not in msg.text:
+                            msgs.append(msg.text)
+                    if msgs:
+                        received_texts = msgs
+                        if any("ملخص البحث" in t for t in msgs) or any("لم نجد نتائج" in t for t in msgs) or any("لا توجد نتائج" in t for t in msgs):
+                            break
 
                 combined_text = " ".join(received_texts)
                 if self.is_upgrade_or_exhausted(combined_text) and not any("الاسم الأشهر" in t or "الأسماء المرتبطة" in t for t in received_texts):
@@ -286,15 +334,21 @@ class MultiSessionPoolManager:
                     self.exhausted_sessions.add(s_name)
                     continue
 
+                # إذا أجاب البوت بأنه لا توجد نتائج لهذا الرقم
+                if any("لم نجد نتائج" in t or "لا توجد نتائج" in t for t in received_texts):
+                    return {
+                        "success": True,
+                        "phone": phone,
+                        "carrier": carrier,
+                        "primary_name": "غير مسجل",
+                        "records_count": 0,
+                        "names": [],
+                        "source": f"كاشف الأرقام (عبر {s_name})"
+                    }
+
                 parsed = self.parse_full_results(received_texts)
-                if not parsed["names"]:
-                    parsed["names"] = ["لم يتم العثور على اسم مسجل لهذا الرقم في قاعدة البيانات."]
-
-                prefix = phone[:2] if len(phone) >= 2 else ""
-                carriers = {"77": "يمن موبايل 3G/4G", "78": "يمن موبايل 4G", "73": "يو (YOU)", "71": "سبأفون", "70": "واي"}
-                carrier = carriers.get(prefix, "شبكة يمنية أخرى")
-
-                self.save_cache(phone, parsed["primary_name"], parsed["records_count"], parsed["names"], carrier)
+                if parsed["names"]:
+                    self.save_cache(phone, parsed["primary_name"], parsed["records_count"], parsed["names"], carrier)
 
                 return {
                     "success": True,
