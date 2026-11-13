@@ -1346,15 +1346,14 @@ def render_feature_gates_text(user_id: int) -> str:
     """عرض لوحة التحكم المركزية ببوابات الميزات للمطور والأدمن"""
     gates = load_feature_gates()
     lines = [
-        "🎛️ <b>إدارة وبوابات الميزات (Feature Gates)</b>",
+        "🎛️ <b>إدارة الميزات</b>",
         "━━━━━━━━━━━━━━━━━━━━",
-        "تحكم سيادي كامل بظهور وتسعير وصلاحية كل ميزة حالية أو مستقبلية:",
-        "• 🌍 <b>عامة:</b> متاحة ومفتوحة لجميع المستخدمين.",
-        "• 👑 <b>إدارة:</b> مقتصرة على المطور الرئيسي ونوابه فقط.",
-        "• 👥 <b>محددين:</b> مقيدة بأرقام معرفات (User IDs) تختارها بنفسك.",
-        "• 💰 <b>التسعير:</b> مجانية أو تخصم نقاطاً بالريال اليمني عند الاستخدام.",
+        "تحديد الصلاحيات والأسعار لكل ميزة:",
+        "• <b>عامة:</b> لجميع المستخدمين.",
+        "• <b>إدارة:</b> للمسؤولين فقط.",
+        "• <b>محددين:</b> لمستخدمين بأرقام معرفات.",
         "━━━━━━━━━━━━━━━━━━━━",
-        f"📦 <b>عدد الميزات المسجلة:</b> {len(gates)} ميزة"
+        f"📦 <b>الميزات:</b> {len(gates)} ميزة"
     ]
     return "\n".join(lines)
 
@@ -1362,16 +1361,27 @@ def render_feature_gates_text(user_id: int) -> str:
 def render_feature_gates_markup(user_id: int) -> types.InlineKeyboardMarkup:
     markup = types.InlineKeyboardMarkup(row_width=1)
     gates = load_feature_gates()
-    scope_labels = {"public": "🌍 عامة", "admins": "👑 إدارة", "specific": "👥 محددين"}
+    scope_labels = {"public": "عامة", "admins": "إدارة", "specific": "محددين"}
+    short_names = {
+        "tempmail": "البريد المؤقت",
+        "fb_tools": "تفاعل فيسبوك",
+        "public_account_addition": "إضافة حسابات",
+        "proxy_tunnel": "البروكسيات",
+        "live_hitl": "الشاشة الحية",
+        "yemen_caller_id": "كاشف الأرقام",
+        "email_campaigns": "حملات البريد",
+        "auto_account_creator": "صانع الحسابات"
+    }
     for fid, f in gates.items():
-        sc = scope_labels.get(f.get("access_scope"), "👑 إدارة")
-        pr = f"💰 {f.get('points_cost', 0)}ن" if f.get("pricing_type") == "points" else "🆓 مجاني"
+        sc = scope_labels.get(f.get("access_scope"), "إدارة")
+        pr = f"{f.get('points_cost', 0)}ن" if f.get("pricing_type") == "points" else "مجاني"
         st_ico = "🟢" if f.get("status") == "active" else ("⏳" if f.get("status") == "coming_soon" else "🔴")
-        lbl = f"{st_ico} {f.get('title', fid)[:26]} [{sc} | {pr}]"
+        display_title = short_names.get(fid, f.get("title", fid)[:18])
+        lbl = f"{st_ico} {display_title} ({sc} | {pr})"
         markup.add(types.InlineKeyboardButton(lbl, callback_data=f"fg_view_{fid}"))
 
-    markup.add(types.InlineKeyboardButton("➕ تسجيل ميزة جديدة للمستقبل", callback_data="fg_new_custom"))
-    markup.add(types.InlineKeyboardButton("🔙 العودة للوحة الرئيسية", callback_data="back_to_main"))
+    markup.add(types.InlineKeyboardButton("➕ ميزة جديدة", callback_data="fg_new_custom"))
+    markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main"))
     return markup
 
 
@@ -1428,52 +1438,48 @@ def render_tempmail_main_view(user_id: int) -> tuple[str, types.InlineKeyboardMa
 
     if active and active.get("email"):
         em = active["email"]
-        prov = active.get("provider", "1timetech")
-        dom = active.get("domain", em.split("@")[-1] if "@" in em else "")
         created = str(active.get("created_at", ""))[:19].replace("T", " ")
         txt = (
-            f"📧 <b>مركز البريد السحابي واستخراج أكواد التحقق</b>\n"
+            f"📧 <b>البريد المؤقت</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📬 <b>البريد النشط الحالي:</b>\n"
-            f"<code>{esc(em)}</code> <i>(اضغط عليه للنسخ 📋)</i>\n\n"
-            f"🏢 <b>المزود:</b> <code>{esc(prov)}</code> | 🌐 <b>النطاق:</b> <code>{esc(dom)}</code>\n"
-            f"⏱️ <b>تاريخ الإنشاء:</b> {created}\n"
-            f"🔔 <b>المراقبة واستخراج OTP:</b> 🟢 مفعّل ومؤتمت\n"
+            f"📬 <b>البريد الحالي:</b>\n"
+            f"<code>{esc(em)}</code> <i>(اضغط للنسخ 📋)</i>\n\n"
+            f"⏱️ <b>الإنشاء:</b> {created}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"💡 انسخ هذا البريد لتسجيل حسابات فيسبوك أو المنصات الأخرى، ثم اضغط <b>فحص الوارد</b> لجلب كود الـ OTP ورابط التفعيل فوراً."
+            f"💡 انسخ البريد للتسجيل، ثم اضغط <b>فحص الوارد</b> لجلب كود التحقق."
         )
     else:
         txt = (
-            f"📧 <b>مركز البريد السحابي واستخراج أكواد التحقق</b>\n"
+            f"📧 <b>البريد المؤقت</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"⚪ <b>لا يوجد بريد نشط حالياً.</b>\n\n"
-            f"اختر <b>إنشاء بريد عشوائي</b> أو <b>إنشاء بريد مخصص</b> من الأزرار أدناه لتوليد بريدك فوراً واستلام الأكواد عليه."
+            f"اختر <b>بريد عشوائي</b> أو <b>بريد مخصص</b> من الأزرار أدناه للبدء."
         )
 
     mk = types.InlineKeyboardMarkup(row_width=2)
     mk.row(
-        _btn("🎲 إنشاء بريد عشوائي", style="primary", icon_key="spark", callback_data="tm_new_rand"),
-        _btn("✏️ إنشاء بريد مخصص", style="primary", icon_key="spark", callback_data="tm_pick_dom")
+        _btn("🎲 بريد عشوائي", style="primary", icon_key="spark", callback_data="tm_new_rand"),
+        _btn("✏️ بريد مخصص", style="primary", icon_key="spark", callback_data="tm_pick_dom")
     )
     if active and active.get("email"):
         mk.row(
-            _btn("🔄 فحص الوارد الآن", style="success", icon_key="spark", callback_data="tm_inbox"),
-            _btn(f"📜 أرشيفي المحفوظ ({len(history)})", callback_data="tm_history")
+            _btn("🔄 فحص الوارد", style="success", icon_key="spark", callback_data="tm_inbox"),
+            _btn(f"📜 الأرشيف ({len(history)})", callback_data="tm_history")
         )
         mk.row(
-            _btn("🗑️ حذف البريد الحالي (للسلة)", callback_data="tm_del_active")
+            _btn("🗑️ حذف البريد", callback_data="tm_del_active")
         )
     else:
         if history:
-            mk.row(_btn(f"📜 أرشيفي المحفوظ ({len(history)})", callback_data="tm_history"))
+            mk.row(_btn(f"📜 الأرشيف ({len(history)})", callback_data="tm_history"))
 
     if is_dev:
         mk.row(
-            _btn("🛰️ رادار بريد المستخدمين (للمطور)", callback_data="tm_admin_all"),
-            _btn(f"♻️ سلة المحذوفات والاسترجاع ({len(trash)})", callback_data="tm_admin_trash")
+            _btn("👥 بريد المستخدمين", callback_data="tm_admin_all"),
+            _btn(f"🗑️ المحذوفات ({len(trash)})", callback_data="tm_admin_trash")
         )
 
-    mk.row(types.InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="back_to_main"))
+    mk.row(types.InlineKeyboardButton("🏠 الرئيسية", callback_data="back_to_main"))
     return txt, mk
 
 
@@ -1744,77 +1750,57 @@ def render_tempmail_admin_trash_view(user_id: int) -> tuple[str, types.InlineKey
 
 def render_caller_id_view(user_id: int, result: dict | None = None) -> tuple[str, types.InlineKeyboardMarkup]:
     txt = (
-        "📞 <b>كاشف الأرقام اليمنية 967 (معرفة هوية المتصل والشبكة)</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "🔍 ابحث عن أي رقم يمني (يمن موبايل، يو، سبأفون، واي، الهاتف الثابت) لمعرفة اسم صاحبه والشبكة فوراً.\n"
-        "⚡ يعتمد على تدوير متوازٍ بين سيرفرات سحابية فائقة السرعة مع تخزين محلي دائم.\n"
+        "📞 <b>كاشف الأرقام</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
     )
     if result:
         phone = result.get("phone", "")
-        carrier = result.get("carrier", "شبكة اتصالات يمنية")
-        carrier_type = result.get("carrier_type", "اتصالات محلية")
-        region = result.get("region", "عموم الجمهورية اليمنية")
+        carrier = result.get("carrier", "يمني")
         names = result.get("names", [])
         is_valid = result.get("is_valid", True)
-        source = result.get("source", "الدليل السحابي 🌐")
 
         if is_valid:
             primary_name = result.get("primary_name")
             records_count = result.get("records_count") or len(names)
             txt += (
-                f"📱 <b>الرقم المستعلم عنه:</b> <code>{esc(phone)}</code>\n"
-                f"🌐 <b>الشركة والشبكة:</b> <b>{esc(carrier)}</b> ({esc(carrier_type)})\n"
-                f"📍 <b>النطاق الجغرافي:</b> <b>{esc(region)}</b>\n"
+                f"📱 <b>الرقم:</b> <code>{esc(phone)}</code>\n"
+                f"🌐 <b>الشبكة:</b> {esc(carrier)}\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
             )
             if primary_name and primary_name not in ("غير مسجل", "لم يتم العثور على اسم مسجل لهذا الرقم في قاعدة البيانات."):
-                txt += f"👑 <b>الاسم الأكثر شهرة:</b> <b>{esc(primary_name)}</b>\n"
+                txt += f"👤 <b>الاسم:</b> <b>{esc(primary_name)}</b>\n"
                 if records_count > 0:
-                    txt += f"📊 <b>عدد السجلات المكتشفة:</b> {records_count} اسماً مسجلاً\n"
+                    txt += f"📊 <b>عدد السجلات:</b> {records_count}\n"
                 txt += "━━━━━━━━━━━━━━━━━━━━\n"
-                txt += "📋 <b>أبرز الأسماء المسجلة لهذا الرقم:</b>\n"
+                txt += "📋 <b>الأسماء المسجلة:</b>\n"
                 shown_count = 0
                 for n in names:
                     if n and n != primary_name and shown_count < 12:
-                        txt += f"• <code>{esc(n)}</code>\n"
+                        txt += f"• {esc(n)}\n"
                         shown_count += 1
-                txt += f"\n⚡ <i>المصدر: {esc(source)}</i>\n"
             elif names and names[0] not in ("لم يتم العثور على اسم مسجل لهذا الرقم في قاعدة البيانات.", ""):
-                txt += (
-                    f"👤 <b>الأسماء المسجلة بالدليل ({len(names)}):</b>\n"
-                )
+                txt += f"👤 <b>الأسماء المسجلة ({len(names)}):</b>\n"
                 for n in names[:12]:
-                    txt += f"• <code>{esc(n)}</code>\n"
-                txt += f"\n⚡ <i>المصدر: {esc(source)}</i>\n"
+                    txt += f"• {esc(n)}\n"
             else:
-                note = result.get("note") or f"الرقم صالح ويتبع شبكة {carrier}. لم يُعلن اسم مسجل له في السجلات السحابية العامة حتى الآن."
-                txt += (
-                    f"ℹ️ <b>حالة السجل:</b> <b>رقم يمني موثق وصالح 100%</b>\n"
-                    f"<i>{esc(note)}</i>\n"
-                )
-            txt += "\n💡 <i>أرسل رقماً آخر للبحث عنه مباشرة، أو اضغط بحث جديد.</i>"
+                txt += "ℹ️ <b>النتيجة:</b> الرقم صالح ولا يوجد اسم مسجل له حالياً.\n"
+            txt += "\n💡 <i>أرسل أي رقم آخر للبحث عنه مباشرة.</i>"
         else:
-            txt += (
-                f"❌ <b>تنبيه في صيغة الإدخال:</b> {esc(result.get('error', 'صيغة الرقم غير معتمدة'))}\n\n"
-                f"💡 <i>أمثلة صحيحة:</i> <code>777123456</code> (يمن موبايل) أو <code>733123456</code> (يو) أو <code>01234567</code> (ثابت صنعاء)."
-            )
+            txt += f"❌ {esc(result.get('error', 'صيغة الرقم غير صحيحة'))}\n"
     else:
         txt += (
-            "👇 <b>طريقة الاستخدام:</b>\n"
-            "اضغط على زر <b>🔍 بحث برقم جديد</b> أو اكتب الأمر مباشرة في الشات:\n"
-            "<code>/num 777123456</code>\n"
-            "أو أرسل الرقم اليمني فقط في الرسالة وسيتم الكشف عنه فوراً."
+            "🔍 <b>ابحث عن أي رقم يمني لمعرفة اسم صاحبه:</b>\n\n"
+            "أرسل الرقم في الشات مباشرة أو اضغط <b>بحث جديد</b>."
         )
 
     mk = types.InlineKeyboardMarkup(row_width=2)
     row_actions = [
-        _btn("🔍 بحث برقم جديد", style="primary", icon_key="spark", callback_data="caller_id_prompt")
+        _btn("🔍 بحث جديد", style="primary", icon_key="spark", callback_data="caller_id_prompt")
     ]
     if is_super_admin(user_id):
-        row_actions.append(_btn("🔄 حوض الجلسات", callback_data="caller_sessions_menu"))
+        row_actions.append(_btn("📱 أرقام البحث", callback_data="caller_sessions_menu"))
     mk.row(*row_actions)
-    mk.row(_btn("🏠 القائمة الرئيسية", callback_data="back_to_main"))
+    mk.row(_btn("🏠 الرئيسية", callback_data="back_to_main"))
     return txt, mk
 
 
@@ -1988,15 +1974,15 @@ def get_main_dashboard_markup(user_id: int) -> types.InlineKeyboardMarkup:
                 types.InlineKeyboardButton("🔄 فحص جلساتي", callback_data="act_check_sessions")
             )
         else:
-            row_acc = [types.InlineKeyboardButton(f"👥 إدارة الحسابات ({len(manageable_accs)})", callback_data="menu_manage_accs")]
+            row_acc = [types.InlineKeyboardButton(f"👥 الحسابات ({len(manageable_accs)})", callback_data="menu_manage_accs")]
             if p_add:
                 row_acc.append(types.InlineKeyboardButton("➕ إضافة حساب", callback_data="act_add_acc"))
             markup.row(*row_acc)
             sub_acc_row = []
             if p_add:
-                sub_acc_row.append(types.InlineKeyboardButton("🍪 استيراد جلسة/كوكيز", callback_data="act_import_cookies"))
+                sub_acc_row.append(types.InlineKeyboardButton("🍪 استيراد كوكيز", callback_data="act_import_cookies"))
             if is_dev or cap_pool or len(manageable_accs) > 0:
-                sub_acc_row.append(types.InlineKeyboardButton("🔄 فحص الجلسات", callback_data="act_check_sessions"))
+                sub_acc_row.append(types.InlineKeyboardButton("🔄 فحص الحسابات", callback_data="act_check_sessions"))
             if sub_acc_row:
                 markup.row(*sub_acc_row)
 
@@ -2006,54 +1992,54 @@ def get_main_dashboard_markup(user_id: int) -> types.InlineKeyboardMarkup:
         if cap_radar:
             all_users = load_users()
             user_count = sum(1 for u in all_users.values() if can_manage_target_user(user_id, u.get("id", 0)))
-            row_a.append(types.InlineKeyboardButton(f"🛰️ رادار المستخدمين ({user_count})", callback_data="menu_surveillance_radar"))
+            row_a.append(types.InlineKeyboardButton(f"👥 المستخدمين ({user_count})", callback_data="menu_surveillance_radar"))
         if cap_eco:
-            row_a.append(types.InlineKeyboardButton("⚙️ إعدادات النقاط والعامة", callback_data="menu_admin_economy"))
+            row_a.append(types.InlineKeyboardButton("⚙️ الإعدادات", callback_data="menu_admin_economy"))
         if row_a:
             markup.row(*row_a)
 
         row_b = []
         if cap_audit:
-            row_b.append(types.InlineKeyboardButton("📜 سجل الرقابة والأحداث", callback_data="menu_audit_logs"))
+            row_b.append(types.InlineKeyboardButton("📋 سجل الأحداث", callback_data="menu_audit_logs"))
         if cap_pay:
-            row_b.append(types.InlineKeyboardButton("📩 تذاكر البيع والدعم", callback_data="menu_support"))
+            row_b.append(types.InlineKeyboardButton("🎫 الدعم والمبيعات", callback_data="menu_support"))
         else:
-            row_b.append(types.InlineKeyboardButton("💵 طلب بيع الحسابات / مراسلة المطور", callback_data="menu_support"))
+            row_b.append(types.InlineKeyboardButton("💵 بيع الحسابات", callback_data="menu_support"))
         if row_b:
             markup.row(*row_b)
 
-        row_c = [types.InlineKeyboardButton("💰 محفظتي وسجلي", callback_data="menu_wallet")]
+        row_c = [types.InlineKeyboardButton("💰 المحفظة", callback_data="menu_wallet")]
         if p_inv:
-            row_c.append(types.InlineKeyboardButton("🔗 روابط وأكواد الدعوة", callback_data="menu_referral"))
+            row_c.append(types.InlineKeyboardButton("🔗 كود الدعوة", callback_data="menu_referral"))
         markup.row(*row_c)
 
         row_d = []
         if cap_prox:
-            row_d.append(_btn("🌐 البروكسيات ونفق 4G", style="primary", icon_key="proxy", callback_data="menu_proxies"))
+            row_d.append(_btn("🌐 البروكسيات", style="primary", icon_key="proxy", callback_data="menu_proxies"))
         if cap_bkp:
-            row_d.append(_btn("💾 الحفظ والنسخ الاحتياطي", callback_data="menu_backup_vault"))
+            row_d.append(_btn("💾 نسخ احتياطي", callback_data="menu_backup_vault"))
         if row_d:
             markup.row(*row_d)
 
         if cap_ann:
             markup.row(
                 _btn(
-                    f"📢 الإعلانات العائمة ({len(active_anns)} نشط)",
+                    f"📢 الإعلانات ({len(active_anns)})",
                     style="primary" if active_anns else None,
                     icon_key="rocket",
                     callback_data="menu_announcements"
                 )
             )
         markup.row(
-            _btn("🎛️ إدارة وبوابات الميزات", style="primary", icon_key="shield", callback_data="menu_feature_gates")
+            _btn("🎛️ إدارة الميزات", style="primary", icon_key="shield", callback_data="menu_feature_gates")
         )
     elif has_any_feature or wallet["points"] > 0:
-        eco_row = [_btn(f"🪙 نقاطي ({wallet['points']} = {wallet['yer_value']:,} ر.ي)", style="primary", callback_data="menu_wallet")]
+        eco_row = [_btn(f"🪙 رصيدي ({wallet['points']} ن)", style="primary", callback_data="menu_wallet")]
         if p_inv:
             eco_row.append(_btn("🎁 دعوة صديق (+4)", style="success", callback_data="menu_referral"))
         markup.row(*eco_row)
         markup.row(
-            _btn("💵 طلب بيع الحسابات / مراسلة المطور", callback_data="menu_support")
+            _btn("💵 بيع الحسابات / الدعم", callback_data="menu_support")
         )
 
     # دليل إنشاء الحسابات والربح للعامة والموردين
@@ -2061,7 +2047,7 @@ def get_main_dashboard_markup(user_id: int) -> types.InlineKeyboardMarkup:
     if (has_any_feature or wallet["points"] > 0) and (is_dev or pub_gate.get("status") == "active"):
         markup.row(
             _btn(
-                "💡 دليل إنشاء الحسابات والربح (10 ر.ي / حساب)",
+                "💡 دليل الربح من الحسابات",
                 style="success" if not has_any_action else None,
                 icon_key="spark",
                 callback_data="menu_earn_guide"
@@ -2073,7 +2059,7 @@ def get_main_dashboard_markup(user_id: int) -> types.InlineKeyboardMarkup:
     if (has_any_feature or wallet["points"] > 0) and (is_dev or tm_gate.get("status") == "active"):
         markup.row(
             _btn(
-                "📧 إنشاء واستقبال الإيميلات (المؤقت والدائم)",
+                "📧 البريد المؤقت",
                 style="primary",
                 icon_key="spark",
                 callback_data="menu_tempmail"
@@ -2085,25 +2071,25 @@ def get_main_dashboard_markup(user_id: int) -> types.InlineKeyboardMarkup:
     if (has_any_feature or wallet["points"] > 0) and (is_dev or cid_gate.get("status") == "active"):
         markup.row(
             _btn(
-                "📞 كاشف الأرقام اليمنية 967 (معرفة اسم المتصل)",
+                "📞 كاشف الأرقام",
                 style="primary",
                 icon_key="spark",
                 callback_data="menu_caller_id"
             )
         )
 
-    # 10. فتح لوحة التحكم التفاعلية داخل تلغرام فقط (WebApp داخل التطبيق بدون متصفح خارجي)
+    # 10. فتح لوحة التحكم التفاعلية داخل تلغرام فقط
     webapp_url = get_public_webapp_url()
     if webapp_url and has_any_feature:
         markup.row(
-            _btn("📱 فتح لوحة التحكم داخل تلغرام", style="primary", icon_key="shield", web_app=types.WebAppInfo(url=webapp_url))
+            _btn("📱 لوحة التحكم", style="primary", icon_key="shield", web_app=types.WebAppInfo(url=webapp_url))
         )
 
     # 11. زر الإطلاق الميداني وميزة انتظار التحقق البشري (HITL)
     if p_exec and has_any_action and (p_use or len(usable_accs) > 0):
         wait_ico = "✅" if st.get("wait_for_hitl", True) else "❌"
         markup.row(
-            _btn("🚀 بدء تنفيذ المهام الآن", style="success", icon_key="rocket", callback_data="action_launch"),
+            _btn("🚀 بدء التنفيذ", style="success", icon_key="rocket", callback_data="action_launch"),
             _btn(f"⏳ انتظار التحقق [{wait_ico}]", style="primary" if st.get("wait_for_hitl", True) else None, callback_data="toggle_wait_hitl"),
         )
 
@@ -2142,51 +2128,46 @@ def get_dashboard_text(user_id: int) -> str:
         all_accs = load_accounts()
         active_count = sum(1 for a in all_accs if "نشط" in a.get("status", ""))
         inactive_count = len(all_accs) - active_count
-        role_title = "👑 المطور الرئيسي (Super Admin)" if is_dev else ADMIN_TIER_LABELS.get(tier, "👑 نائب المطور")
-        mode_tag = "🌐 مفتوح للعامة" if eco_cfg.get("public_mode") else "🔒 بموافقة / دعوة"
+        role_title = "المطور" if is_dev else ADMIN_TIER_LABELS.get(tier, "إدارة")
+        mode_tag = "مفتوح للعامة" if eco_cfg.get("public_mode") else "بموافقة / دعوة"
         acc_summary = (
-            f"📊 <b>إجمالي حسابات النظام:</b> {len(all_accs)} ({active_count} نشط | {inactive_count} غير نشط)\n"
-            f"⚙️ <b>وضع البوت:</b> {mode_tag} | <b>القيمة:</b> 1 نقطة = {wallet['yer_per_point']} ر.ي"
+            f"📊 <b>الحسابات:</b> {len(all_accs)} ({active_count} نشط | {inactive_count} متوقف)\n"
+            f"⚙️ <b>الوضع:</b> {mode_tag} | 1 نقطة = {wallet['yer_per_point']} ر.ي"
         )
     else:
-        role_title = ADMIN_TIER_LABELS.get(tier, "🛡️ حساب معتمد بصلاحيات مخصصة") if tier in ("manager", "super_delegate") else "🛡️ حساب معتمد بصلاحيات مخصصة"
+        role_title = ADMIN_TIER_LABELS.get(tier, "مستخدم") if tier in ("manager", "super_delegate") else "مستخدم"
         parts = []
         if p_use:
             pool_accs = load_accounts()
             active_pool = sum(1 for a in pool_accs if "نشط" in a.get("status", ""))
-            parts.append(f"• <b>حسابات البوت المتاحة للتنفيذ:</b> {active_pool} حساب نشط")
+            parts.append(f"• <b>الحسابات المتاحة:</b> {active_pool} نشط")
         if p_add or p_del:
             bd = get_accounts_breakdown_by_owner(user_id)
             parts.append(
-                f"• <b>حساباتك المضافة للبوت:</b> {len(bd['all'])} "
-                f"(🟢 {len(bd['active'])} نشط | 🔴 {len(bd['inactive'])} غير نشط)"
+                f"• <b>حساباتك:</b> {len(bd['all'])} "
+                f"({len(bd['active'])} نشط | {len(bd['inactive'])} متوقف)"
             )
         if has_any_feature or wallet["points"] > 0:
             parts.append(
-                f"• 🪙 <b>رصيد نقاطك:</b> {wallet['points']} نقطة "
-                f"(≈ <b>{wallet['yer_value']:,} ريال يمني</b> | تم تسليم {wallet['total_yer_settled']:,} ر.ي)"
+                f"• 🪙 <b>الرصيد:</b> {wallet['points']} نقطة "
+                f"(≈ <b>{wallet['yer_value']:,} ريال يمني</b>)"
             )
         acc_summary = "\n".join(parts)
 
     if is_dev:
-        perms_line = "🔐 <b>صلاحياتك الحالية:</b> تحكم سيادي كامل 100%"
+        perms_line = "🔐 <b>الصلاحية:</b> تحكم كامل"
     elif tier == "super_delegate":
-        restr = get_admin_restrictions(user_id)
-        blocked_cnt = sum(1 for v in restr.values() if v)
-        perms_line = (
-            "🔐 <b>صلاحياتك الحالية:</b> تفويض كامل على النظام"
-            + (f" (مقيد عن {blocked_cnt} بنود)" if blocked_cnt else " (بلا قيود)")
-        )
+        perms_line = "🔐 <b>الصلاحية:</b> تفويض كامل"
     elif tier == "manager":
-        perms_line = "🔐 <b>صلاحياتك الحالية:</b> إدارة المستخدمين والطلبات + صلاحياتك الممنوحة"
+        perms_line = "🔐 <b>الصلاحية:</b> إدارة المستخدمين"
     else:
         granted_list = [label for key, label in PERMISSION_LABELS.items() if has_permission(user_id, key)]
-        perms_line = f"🔐 <b>صلاحياتك الحالية:</b> {', '.join(granted_list)}" if granted_list else "🔒 <b>صلاحياتك الحالية:</b> لا توجد ميزات مفعلة بعد"
+        perms_line = f"🔐 <b>الصلاحيات:</b> {', '.join(granted_list)}" if granted_list else "🔒 <b>الصلاحية:</b> مستخدم"
 
     lines = [
-        "⚡ <b>منظومة FB Operator | لوحة التحكم السحابية</b>",
+        "⚡ <b>لوحة التحكم</b>",
         "━━━━━━━━━━━━━━━━━━━━",
-        f"👤 <b>الرتبة:</b> {role_title}",
+        f"👤 <b>الحساب:</b> {role_title}",
         perms_line
     ]
     active_anns = list_announcements(only_active=True)

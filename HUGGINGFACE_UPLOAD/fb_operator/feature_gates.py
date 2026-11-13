@@ -33,9 +33,9 @@ class ResultDict(dict):
 DEFAULT_FEATURES: dict[str, dict[str, Any]] = {
     "tempmail": {
         "id": "tempmail",
-        "title": "إنشاء واستقبال الإيميلات (المؤقت والدائم)",
-        "description": "توليد إيميلات عشوائية ومخصصة من 4 محركات سحابية، استخراج أكواد OTP، وأرشيف دائم مع سلة استرجاع للمطور.",
-        "category": "البريد الإلكتروني",
+        "title": "البريد المؤقت",
+        "description": "إنشاء إيميلات مؤقتة واستقبال أكواد التفعيل والرسائل.",
+        "category": "البريد",
         "status": "active",
         "access_scope": "public",
         "pricing_type": "free",
@@ -44,8 +44,8 @@ DEFAULT_FEATURES: dict[str, dict[str, Any]] = {
     },
     "fb_tools": {
         "id": "fb_tools",
-        "title": "أدوات ومهام تفاعل فيسبوك",
-        "description": "التفاعل والتعليق والمتابعة والرسائل والبلاغات على منشورات وحسابات فيسبوك.",
+        "title": "تفاعل فيسبوك",
+        "description": "التفاعل والتعليق والمتابعة على منشورات وحسابات فيسبوك.",
         "category": "فيسبوك",
         "status": "active",
         "access_scope": "admins",
@@ -55,8 +55,8 @@ DEFAULT_FEATURES: dict[str, dict[str, Any]] = {
     },
     "public_account_addition": {
         "id": "public_account_addition",
-        "title": "إضافة وتوريد حسابات فيسبوك للعامة",
-        "description": "إتاحة إضافة وتوريد الحسابات لأي مستخدم مع دليل الربح بالريال اليمني.",
+        "title": "إضافة حسابات",
+        "description": "إضافة وتوريد الحسابات مع دليل احتساب النقاط.",
         "category": "الحسابات",
         "status": "active",
         "access_scope": "public",
@@ -66,8 +66,8 @@ DEFAULT_FEATURES: dict[str, dict[str, Any]] = {
     },
     "proxy_tunnel": {
         "id": "proxy_tunnel",
-        "title": "نفق البروكسيات المتعدد وشبكة 4G",
-        "description": "ربط وتوجيه حركة الحسابات عبر بروكسيات سكنية وجسور 4G ديناميكية.",
+        "title": "البروكسيات",
+        "description": "إدارة وتوزيع البروكسيات للحسابات.",
         "category": "الشبكات",
         "status": "active",
         "access_scope": "admins",
@@ -77,8 +77,8 @@ DEFAULT_FEATURES: dict[str, dict[str, Any]] = {
     },
     "live_hitl": {
         "id": "live_hitl",
-        "title": "الشاشة الحية للتحقق البشري التفاعلي",
-        "description": "بث مباشر لشاشة المتصفح لحل كابتشا وألغاز فيسبوك يدوياً من الجوال.",
+        "title": "الشاشة الحية",
+        "description": "عرض شاشة المتصفح لحل كابتشا فيسبوك يدوياً.",
         "category": "الأمان",
         "status": "active",
         "access_scope": "admins",
@@ -88,9 +88,9 @@ DEFAULT_FEATURES: dict[str, dict[str, Any]] = {
     },
     "yemen_caller_id": {
         "id": "yemen_caller_id",
-        "title": "كاشف الأرقام اليمنية 967 (معرفة اسم المتصل والشبكة)",
-        "description": "استعلام فوري عن هوية صاحب الرقم والشبكة (يمن موبايل/يو/سبأفون/واي/الثابت) عبر سيرفرات سحابية متعددة وتلقائية.",
-        "category": "أدوات وخدمات",
+        "title": "كاشف الأرقام",
+        "description": "معرفة اسم المتصل والشبكة لجميع الأرقام اليمنية.",
+        "category": "أدوات",
         "status": "active",
         "access_scope": "public",
         "pricing_type": "free",
@@ -99,9 +99,9 @@ DEFAULT_FEATURES: dict[str, dict[str, Any]] = {
     },
     "email_campaigns": {
         "id": "email_campaigns",
-        "title": "حملات البريد الإلكتروني العالمية",
-        "description": "إرسال رسائل بريدية مكثفة وتأكيدات الحسابات وحملات تسويقية تلقائية.",
-        "category": "ميزات مستقبلية",
+        "title": "حملات البريد",
+        "description": "إرسال رسائل بريدية جماعية.",
+        "category": "تسويق",
         "status": "coming_soon",
         "access_scope": "admins",
         "pricing_type": "points",
@@ -110,15 +110,15 @@ DEFAULT_FEATURES: dict[str, dict[str, Any]] = {
     },
     "auto_account_creator": {
         "id": "auto_account_creator",
-        "title": "صانع الحسابات الذاتي بالذكاء الاصطناعي",
-        "description": "توليد وإنشاء حسابات فيسبوك تلقائياً عبر الذكاء الاصطناعي والأرقام المؤقتة.",
-        "category": "ميزات مستقبلية",
+        "title": "صانع الحسابات",
+        "description": "إنشاء حسابات فيسبوك تلقائياً.",
+        "category": "أتمتة",
         "status": "coming_soon",
         "access_scope": "admins",
         "pricing_type": "points",
         "points_cost": 10,
         "allowed_user_ids": [],
-    },
+    }
 }
 
 
