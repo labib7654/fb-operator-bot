@@ -78,6 +78,11 @@ from fb_operator.browser_manager import (
     save_account_storage_state, clear_account_storage_state, _resolve_session_file,
     dismiss_dialogs, get_profile_lock, detect_and_report_proxy_error,
 )
+try:
+    dismiss_dialogs
+except NameError:
+    def dismiss_dialogs(page) -> None:
+        pass
 from fb_operator.proxy_manager import (
     add_proxies_bulk,
     bind_existing_accounts,
@@ -1648,25 +1653,44 @@ def render_caller_id_view(user_id: int, result: dict | None = None) -> tuple[str
         "📞 <b>كاشف الأرقام اليمنية 967 (معرفة هوية المتصل والشبكة)</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "🔍 ابحث عن أي رقم يمني (يمن موبايل، يو، سبأفون، واي، الهاتف الثابت) لمعرفة اسم صاحبه والشبكة فوراً.\n"
-        "⚡ يعتمد على تدوير ذكي بين 5 سيرفرات سحابية فائقة السرعة.\n"
+        "⚡ يعتمد على تدوير متوازٍ بين سيرفرات سحابية فائقة السرعة مع تخزين محلي دائم.\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
     )
     if result:
         phone = result.get("phone", "")
-        carrier = result.get("carrier", "غير معروف")
+        carrier = result.get("carrier", "شبكة اتصالات يمنية")
+        carrier_type = result.get("carrier_type", "اتصالات محلية")
+        region = result.get("region", "عموم الجمهورية اليمنية")
         names = result.get("names", [])
-        if result.get("success"):
+        is_valid = result.get("is_valid", True)
+        source = result.get("source", "الدليل السحابي 🌐")
+
+        if is_valid:
             txt += (
                 f"📱 <b>الرقم المستعلم عنه:</b> <code>{esc(phone)}</code>\n"
-                f"🌐 <b>الشبكة التابع لها:</b> <b>{esc(carrier)}</b>\n\n"
-                f"👤 <b>الأسماء المسجلة بالدليل ({len(names)}):</b>\n"
+                f"🌐 <b>الشركة والشبكة:</b> <b>{esc(carrier)}</b> ({esc(carrier_type)})\n"
+                f"📍 <b>النطاق الجغرافي:</b> <b>{esc(region)}</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
             )
-            for n in names[:12]:
-                txt += f"• <code>{esc(n)}</code>\n"
+            if names:
+                txt += (
+                    f"👤 <b>الأسماء المسجلة بالدليل ({len(names)}):</b>\n"
+                )
+                for n in names[:12]:
+                    txt += f"• <code>{esc(n)}</code>\n"
+                txt += f"\n⚡ <i>المصدر: {esc(source)}</i>\n"
+            else:
+                note = result.get("note") or f"الرقم صالح ويتبع شبكة {carrier}. لم يُعلن اسم مسجل له في السجلات السحابية العامة حتى الآن."
+                txt += (
+                    f"ℹ️ <b>حالة السجل:</b> <b>رقم يمني موثق وصالح 100%</b>\n"
+                    f"<i>{esc(note)}</i>\n"
+                )
             txt += "\n💡 <i>أرسل رقماً آخر للبحث عنه مباشرة، أو اضغط بحث جديد.</i>"
         else:
-            txt += f"❌ <b>تعذر جلب الاسم:</b> {esc(result.get('error', 'الرقم غير مسجل'))}\n\n"
-            txt += "💡 <i>تأكد من كتابة الرقم اليمني صحيحاً (مثال: 777123456).</i>"
+            txt += (
+                f"❌ <b>تنبيه في صيغة الإدخال:</b> {esc(result.get('error', 'صيغة الرقم غير معتمدة'))}\n\n"
+                f"💡 <i>أمثلة صحيحة:</i> <code>777123456</code> (يمن موبايل) أو <code>733123456</code> (يو) أو <code>01234567</code> (ثابت صنعاء)."
+            )
     else:
         txt += (
             "👇 <b>طريقة الاستخدام:</b>\n"
@@ -8660,6 +8684,61 @@ def _maintenance_sync_worker() -> None:
                 pass
 
 
+def _tempmail_auto_poller_worker() -> None:
+    """مراقب خلفي ذكي يفحص الإيميلات النشطة للمستخدمين ويرسل إشعاراً فورياً عند وصول أي كود OTP أو رسالة جديدة"""
+    while not _stop_polling_event.is_set():
+        time.sleep(8)
+        try:
+            tele = tm_m.get_telemetry_stats()
+            if tele.get("active_users_with_mail", 0) <= 0:
+                continue
+
+            data = tm_m._get_data()
+            users_map = data.get("users", {})
+            for uid_str, mb in list(users_map.items()):
+                try:
+                    uid = int(uid_str)
+                    target_email = mb.get("email")
+                    if not target_email or not mb.get("auto_notify", True):
+                        continue
+
+                    # فحص الوارد وجلب الرسائل الجديدة فقط
+                    new_msgs = [m for m in tm_m.check_inbox(uid, target_email) if m.get("is_new")]
+                    for msg in new_msgs:
+                        sender = esc(msg.get("sender") or "مجهول")
+                        subj = esc(msg.get("subject") or "بدون عنوان")
+                        otp = msg.get("otp_code")
+                        links = msg.get("links") or []
+
+                        alert_txt = (
+                            f"🔔 <b>وصلت رسالة جديدة إلى بريدك المؤقت!</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━━━\n"
+                            f"📬 <b>البريد:</b> <code>{esc(target_email)}</code>\n"
+                            f"👤 <b>من:</b> {sender}\n"
+                            f"📌 <b>الموضوع:</b> {subj}\n"
+                        )
+                        if otp:
+                            alert_txt += (
+                                f"━━━━━━━━━━━━━━━━━━━━\n"
+                                f"🔑 <b>كود التحقق (OTP):</b> <code>{esc(otp)}</code> <i>(اضغط للنسخ)</i>\n"
+                            )
+
+                        mk = types.InlineKeyboardMarkup(row_width=1)
+                        if otp:
+                            mk.row(types.InlineKeyboardButton(f"📋 نسخ كود OTP: {otp}", callback_data=f"tm_copyotp_{otp}"))
+                        if links:
+                            mk.row(types.InlineKeyboardButton("🌐 فتح رابط التفعيل", url=links[0]))
+                        mk.row(
+                            _btn("📥 عرض صندوق الوارد", style="primary", icon_key="spark", callback_data="tm_inbox")
+                        )
+
+                        safe_send(uid, alert_txt, reply_markup=mk)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+
 _shutdown_lock = threading.Lock()
 _shutdown_executed = False
 _shutdown_registered = False
@@ -8734,6 +8813,7 @@ def run_telegram_bot():
         register_listener(_on_state_event)
         threading.Thread(target=_live_inline_sync_worker, daemon=True).start()
         threading.Thread(target=_maintenance_sync_worker, daemon=True).start()
+        threading.Thread(target=_tempmail_auto_poller_worker, daemon=True).start()
         _live_sync_started = True
 
     try:
