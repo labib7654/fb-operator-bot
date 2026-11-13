@@ -86,6 +86,17 @@ DEFAULT_FEATURES: dict[str, dict[str, Any]] = {
         "points_cost": 0,
         "allowed_user_ids": [],
     },
+    "yemen_caller_id": {
+        "id": "yemen_caller_id",
+        "title": "كاشف الأرقام اليمنية 967 (معرفة اسم المتصل والشبكة)",
+        "description": "استعلام فوري عن هوية صاحب الرقم والشبكة (يمن موبايل/يو/سبأفون/واي/الثابت) عبر سيرفرات سحابية متعددة وتلقائية.",
+        "category": "أدوات وخدمات",
+        "status": "active",
+        "access_scope": "public",
+        "pricing_type": "free",
+        "points_cost": 0,
+        "allowed_user_ids": [],
+    },
     "email_campaigns": {
         "id": "email_campaigns",
         "title": "حملات البريد الإلكتروني العالمية",

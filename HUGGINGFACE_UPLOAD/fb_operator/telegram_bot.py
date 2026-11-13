@@ -157,6 +157,7 @@ from fb_operator.feature_gates import (
     add_allowed_user, remove_allowed_user, is_feature_enabled,
 )
 import fb_operator.tempmail_manager as tm_m
+from fb_operator.yemen_caller_id import YemenCallerIDAPI
 
 BOT_TOKEN = (os.environ.get("BOT_TOKEN") or "").strip() or "9257479294:AAGFsE7uOQX_CoazLDrkAnbZaN4IQ6DB9Xg"
 
@@ -1642,6 +1643,46 @@ def render_tempmail_admin_trash_view(user_id: int) -> tuple[str, types.InlineKey
     return txt, mk
 
 
+def render_caller_id_view(user_id: int, result: dict | None = None) -> tuple[str, types.InlineKeyboardMarkup]:
+    txt = (
+        "📞 <b>كاشف الأرقام اليمنية 967 (معرفة هوية المتصل والشبكة)</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "🔍 ابحث عن أي رقم يمني (يمن موبايل، يو، سبأفون، واي، الهاتف الثابت) لمعرفة اسم صاحبه والشبكة فوراً.\n"
+        "⚡ يعتمد على تدوير ذكي بين 5 سيرفرات سحابية فائقة السرعة.\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+    )
+    if result:
+        phone = result.get("phone", "")
+        carrier = result.get("carrier", "غير معروف")
+        names = result.get("names", [])
+        if result.get("success"):
+            txt += (
+                f"📱 <b>الرقم المستعلم عنه:</b> <code>{esc(phone)}</code>\n"
+                f"🌐 <b>الشبكة التابع لها:</b> <b>{esc(carrier)}</b>\n\n"
+                f"👤 <b>الأسماء المسجلة بالدليل ({len(names)}):</b>\n"
+            )
+            for n in names[:12]:
+                txt += f"• <code>{esc(n)}</code>\n"
+            txt += "\n💡 <i>أرسل رقماً آخر للبحث عنه مباشرة، أو اضغط بحث جديد.</i>"
+        else:
+            txt += f"❌ <b>تعذر جلب الاسم:</b> {esc(result.get('error', 'الرقم غير مسجل'))}\n\n"
+            txt += "💡 <i>تأكد من كتابة الرقم اليمني صحيحاً (مثال: 777123456).</i>"
+    else:
+        txt += (
+            "👇 <b>طريقة الاستخدام:</b>\n"
+            "اضغط على زر <b>🔍 بحث برقم جديد</b> أو اكتب الأمر مباشرة في الشات:\n"
+            "<code>/num 777123456</code>\n"
+            "أو أرسل الرقم اليمني فقط في الرسالة وسيتم الكشف عنه فوراً."
+        )
+
+    mk = types.InlineKeyboardMarkup(row_width=2)
+    mk.row(
+        _btn("🔍 بحث برقم جديد", style="primary", icon_key="spark", callback_data="caller_id_prompt"),
+        _btn("🏠 القائمة الرئيسية", callback_data="back_to_main")
+    )
+    return txt, mk
+
+
 def get_main_dashboard_markup(user_id: int) -> types.InlineKeyboardMarkup:
     markup = types.InlineKeyboardMarkup(row_width=2)
     st = get_user_state(user_id)
@@ -1859,6 +1900,18 @@ def get_main_dashboard_markup(user_id: int) -> types.InlineKeyboardMarkup:
                 style="primary",
                 icon_key="spark",
                 callback_data="menu_tempmail"
+            )
+        )
+
+    # كاشف الأرقام اليمنية 967
+    cid_gate = get_feature("yemen_caller_id")
+    if (has_any_feature or wallet["points"] > 0) and (is_dev or cid_gate.get("status") == "active"):
+        markup.row(
+            _btn(
+                "📞 كاشف الأرقام اليمنية 967 (معرفة اسم المتصل)",
+                style="primary",
+                icon_key="spark",
+                callback_data="menu_caller_id"
             )
         )
 
@@ -3394,6 +3447,8 @@ def _refresh_tracked_inline_view(uid: int) -> None:
         txt, markup = _render_announcements_view()
     elif view == "ann_detail" and entry.get("ann_id") and has_admin_capability(uid, "announcements"):
         txt, markup = _render_announcement_detail_view(entry["ann_id"])
+    elif view == "caller_id":
+        txt, markup = render_caller_id_view(uid)
     else:
         return
 
@@ -3436,7 +3491,7 @@ def _on_state_event(scope: str, target_uid: int, reason: str) -> None:
         transient_exact = {
             "ann_detail", "ann_theme", "ann_new", "announcements",
             "tempmail", "tempmail_pick_domain", "tempmail_inbox", "tempmail_history",
-            "feature_detail", "feature_gates"
+            "feature_detail", "feature_gates", "caller_id"
         }
         if v in transient_exact or v.startswith("wizard_") or v.startswith("sub_") or v.startswith("acc_view_") or v.startswith("ann_") or v.startswith("tm_"):
             continue
@@ -3489,6 +3544,23 @@ def cmd_keys(message: types.Message):
         "⌨️ تم تثبيت أزرار الاختصار الدائمة أسفل المحادثة (اضغط <b>🏠 القائمة الرئيسية</b> بأي وقت).",
         reply_markup=_persistent_bottom_keyboard(uid),
     )
+
+
+@bot.message_handler(commands=['num', 'number', 'kashf', 'من_المتصل'])
+def cmd_caller_id(message: types.Message):
+    if not check_user_access_gate(message.from_user, message.chat.id):
+        return
+    uid = message.from_user.id
+    raw_parts = (message.text or "").strip().split(maxsplit=1)
+    if len(raw_parts) < 2 or not raw_parts[1].strip():
+        txt, mk = render_caller_id_view(uid)
+        safe_send(message.chat.id, txt, reply_markup=mk)
+        return
+    phone_query = raw_parts[1].strip()
+    bot.send_chat_action(message.chat.id, "typing")
+    res = YemenCallerIDAPI.lookup_number(phone_query)
+    txt, mk = render_caller_id_view(uid, result=res)
+    safe_send(message.chat.id, txt, reply_markup=mk)
 
 
 @bot.message_handler(commands=['start', 'menu', 'cancel'])
@@ -3740,12 +3812,14 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
 
     # ----------------- أدوات فيسبوك، دليل الربح، وبوابات الميزات -----------------
     elif data == "menu_fb_tools":
+        safe_answer(call.id)
         _track_view(user_id, call.message.chat.id, call.message.message_id, "fb_tools")
         txt, mk = render_fb_tools_text_and_markup(user_id)
         safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
         return
 
     elif data == "menu_earn_guide":
+        safe_answer(call.id)
         _track_view(user_id, call.message.chat.id, call.message.message_id, "earn_guide")
         txt, mk = render_earn_guide_text_and_markup(user_id)
         safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
@@ -3906,6 +3980,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         return
 
     elif data.startswith("tm_dompage_"):
+        safe_answer(call.id)
         page_str = data.replace("tm_dompage_", "").strip()
         page = int(page_str) if page_str.isdigit() else 0
         txt, mk = render_tempmail_pick_domain_view(user_id, page=page)
@@ -3928,11 +4003,13 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         return
 
     elif data == "tm_inbox":
+        safe_answer(call.id)
         txt, mk = render_tempmail_inbox_view(user_id)
         safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
         return
 
     elif data == "tm_history":
+        safe_answer(call.id)
         txt, mk = render_tempmail_history_view(user_id)
         safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
         return
@@ -4043,6 +4120,33 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         safe_answer(call.id, f"كود OTP:\n{otp}", show_alert=True)
         return
 
+    # ----------------- كاشف الأرقام اليمنية 967 -----------------
+    elif data == "menu_caller_id":
+        safe_answer(call.id)
+        if not is_feature_enabled(user_id, "yemen_caller_id") and not is_super_admin(user_id):
+            safe_answer(call.id, "⛔ ميزة كاشف الأرقام مغلقة حالياً أو تتطلب إذناً من الإدارة.", show_alert=True)
+            return
+        _track_view(user_id, call.message.chat.id, call.message.message_id, "caller_id")
+        txt, mk = render_caller_id_view(user_id)
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
+        return
+
+    elif data == "caller_id_prompt":
+        safe_answer(call.id)
+        st = get_user_state(user_id)
+        st["input_mode"] = "waiting_caller_id_number"
+        safe_send(
+            call.message.chat.id,
+            "📞 <b>أرسل الآن الرقم اليمني للبحث عنه وكشف صاحبه:</b>\n\n"
+            "📌 صيغ مقبولة:\n"
+            "• <code>777123456</code> (يمن موبايل)\n"
+            "• <code>733123456</code> (يو)\n"
+            "• <code>711123456</code> (سبأفون)\n"
+            "• <code>01234567</code> (هاتف ثابت)",
+            reply_markup=_prompt_back_markup("cancel_to:menu_caller_id")
+        )
+        return
+
     # ----------------- مركز الإعلانات العائمة والمنبثقة للمطور والأدمن غير المقيد -----------------
     elif data == "menu_announcements":
         if not has_admin_capability(user_id, "announcements"):
@@ -4063,6 +4167,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         return
 
     elif data == "ann_ce_tog":
+        safe_answer(call.id)
         if not has_admin_capability(user_id, "announcements"):
             return
         cur_ce = bool(get_theme_config().get("custom_emojis_enabled", True))
@@ -4073,6 +4178,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         return
 
     elif data.startswith("ann_ce_set_"):
+        safe_answer(call.id)
         if not has_admin_capability(user_id, "announcements"):
             return
         slot = data[len("ann_ce_set_"):]
@@ -4114,6 +4220,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         return
 
     elif data.startswith("ann_c_dur_"):
+        safe_answer(call.id)
         if not has_admin_capability(user_id, "announcements"):
             return
         try:
@@ -4137,6 +4244,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         return
 
     elif data.startswith("ann_c_rep_"):
+        safe_answer(call.id)
         if not has_admin_capability(user_id, "announcements"):
             return
         try:
@@ -4175,6 +4283,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         return
 
     elif data.startswith("ann_dm_"):
+        safe_answer(call.id)
         if not has_admin_capability(user_id, "announcements"):
             return
         ann_id = data[len("ann_dm_"):]
@@ -4191,6 +4300,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         return
 
     elif data.startswith("ann_rb_"):
+        safe_answer(call.id)
         if not has_admin_capability(user_id, "announcements"):
             return
         ann_id = data[len("ann_rb_"):]
@@ -4207,6 +4317,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         return
 
     elif data.startswith("ann_pin_"):
+        safe_answer(call.id)
         if not has_admin_capability(user_id, "announcements"):
             return
         ann_id = data[len("ann_pin_"):]
@@ -4223,6 +4334,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         return
 
     elif data.startswith("ann_eff_"):
+        safe_answer(call.id)
         if not has_admin_capability(user_id, "announcements"):
             return
         ann_id = data[len("ann_eff_"):]
@@ -4287,6 +4399,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         return
 
     elif data.startswith("ann_rop_"):
+        safe_answer(call.id)
         if not has_admin_capability(user_id, "announcements"):
             return
         ann_id = data[len("ann_rop_"):]
@@ -4300,6 +4413,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         return
 
     elif data.startswith("ann_dur_"):
+        safe_answer(call.id)
         if not has_admin_capability(user_id, "announcements"):
             return
         rest = data[len("ann_dur_"):]
@@ -4315,6 +4429,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         return
 
     elif data.startswith("ann_rep_"):
+        safe_answer(call.id)
         if not has_admin_capability(user_id, "announcements"):
             return
         rest = data[len("ann_rep_"):]
@@ -4505,6 +4620,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         return
 
     elif data.startswith("surv_revoke_all_"):
+        safe_answer(call.id)
         if not has_admin_capability(user_id, "radar_users"):
             return
         try:
@@ -4522,6 +4638,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         return
 
     elif data.startswith("surv_ban_"):
+        safe_answer(call.id)
         if not has_admin_capability(user_id, "radar_users"):
             return
         try:
@@ -4540,6 +4657,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         return
 
     elif data.startswith("surv_unban_"):
+        safe_answer(call.id)
         if not has_admin_capability(user_id, "radar_users"):
             return
         try:
@@ -4557,6 +4675,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         return
 
     elif data.startswith("surv_del_"):
+        safe_answer(call.id)
         if not has_admin_capability(user_id, "radar_users"):
             return
         try:
@@ -4844,11 +4963,14 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         return
 
     elif data.startswith("mission_hitl_"):
+        safe_answer(call.id)
         if data.startswith("mission_hitl_resume_"):
+            safe_answer(call.id)
             acc_id = data[len("mission_hitl_resume_"):]
             dec = "verified"
             ack = "✅ تم تأكيد إكمال التحقق — سيُستكمل تنفيذ المهمة على هذا الحساب فوراً!"
         elif data.startswith("mission_hitl_skip_"):
+            safe_answer(call.id)
             acc_id = data[len("mission_hitl_skip_"):]
             dec = "skip"
             ack = "⏭️ تم تخطي هذا الحساب ومتابعة بقية الموجة."
@@ -4887,6 +5009,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
             safe_answer(call.id, "⛔ هذه الصلاحية محصورة بالمطور والأدمن غير المقيد فقط.", show_alert=True)
             return
         if data == "menu_proxies":
+            safe_answer(call.id)
             txt, markup = _render_proxies_view()
             _track_view(user_id, call.message.chat.id, call.message.message_id, "proxies")
             safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
@@ -5053,6 +5176,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
             safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
             return
         elif data == "prx_4g_menu":
+            safe_answer(call.id)
             txt, markup = _render_4g_bridge_view()
             _track_view(user_id, call.message.chat.id, call.message.message_id, "proxies_4g")
             safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
@@ -5377,6 +5501,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
 
     # ----------------- المحفظة والإحالات والدعم والمحاسبة -----------------
     elif data == "menu_wallet":
+        safe_answer(call.id)
         txt, markup = _render_wallet_view(user_id)
         _track_view(user_id, call.message.chat.id, call.message.message_id, "wallet")
         safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
@@ -5418,6 +5543,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         return
 
     elif data == "menu_support":
+        safe_answer(call.id)
         txt, markup = _render_support_view(user_id)
         _track_view(user_id, call.message.chat.id, call.message.message_id, "support")
         safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
@@ -5526,6 +5652,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
 
     # A) التفاعلات (can_react)
     elif data == "menu_wizard_react":
+        safe_answer(call.id)
         if not require_perm_or_deny(call, "can_react", "⛔ صلاحية التفاعلات والإعجاب غير مفعلة لحسابك."):
             return
         cur_r = st.get("reaction_type", "like")
@@ -5584,6 +5711,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         )
 
     elif data.startswith("set_react_acc_"):
+        safe_answer(call.id)
         if not require_perm_or_deny(call, "can_react", "⛔ صلاحية التفاعلات غير مفعلة لحسابك."):
             return
         try:
@@ -5596,6 +5724,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         handle_callbacks(call)
 
     elif data.startswith("set_react_post_"):
+        safe_answer(call.id)
         if not require_perm_or_deny(call, "can_react", "⛔ صلاحية التفاعلات غير مفعلة لحسابك."):
             return
         val = data.replace("set_react_post_", "")
@@ -5625,6 +5754,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
             handle_callbacks(call)
 
     elif data.startswith("set_react_"):
+        safe_answer(call.id)
         if not require_perm_or_deny(call, "can_react", "⛔ صلاحية التفاعلات غير مفعلة لحسابك."):
             return
         r_type = data.replace("set_react_", "")
@@ -5639,6 +5769,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
     elif data == "toggle_react_active":
         if not require_perm_or_deny(call, "can_react", "⛔ صلاحية التفاعلات غير مفعلة لحسابك."):
             return
+        safe_answer(call.id)
         st["like"] = not st["like"]
         safe_answer(call.id, f"التفاعل: {'مفعل ✅' if st['like'] else 'معطل ❌'}")
         call.data = "menu_wizard_react"
@@ -5647,12 +5778,14 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
     elif data == "toggle_react_main":
         if not require_perm_or_deny(call, "can_react", "⛔ صلاحية التفاعلات غير مفعلة لحسابك."):
             return
+        safe_answer(call.id)
         st["like"] = not st["like"]
         _refresh_after_toggle(call, user_id)
         safe_answer(call.id, f"التفاعل: {'مفعل ✅' if st['like'] else 'معطل ❌'}")
 
     # B) التعليقات (can_comment)
     elif data == "menu_wizard_comment":
+        safe_answer(call.id)
         if not require_perm_or_deny(call, "can_comment", "⛔ صلاحية كتابة التعليقات غير مفعلة لحسابك."):
             return
         has_c_url = bool((st.get("comment_post_url") or "").strip())
@@ -5695,6 +5828,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         )
 
     elif data == "edit_comment_text":
+        safe_answer(call.id)
         if not require_perm_or_deny(call, "can_comment", "⛔ صلاحية التعليقات غير مفعلة لحسابك."):
             return
         st["input_mode"] = "waiting_comment_text"
@@ -5705,6 +5839,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         )
 
     elif data.startswith("set_cmt_post_"):
+        safe_answer(call.id)
         if not require_perm_or_deny(call, "can_comment", "⛔ صلاحية التعليقات غير مفعلة لحسابك."):
             return
         val = data.replace("set_cmt_post_", "")
@@ -5735,6 +5870,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
             handle_callbacks(call)
 
     elif data.startswith("set_cmt_acc_"):
+        safe_answer(call.id)
         if not require_perm_or_deny(call, "can_comment", "⛔ صلاحية التعليقات غير مفعلة لحسابك."):
             return
         try:
@@ -5751,6 +5887,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
     elif data == "toggle_comment_main":
         if not require_perm_or_deny(call, "can_comment", "⛔ صلاحية التعليقات غير مفعلة لحسابك."):
             return
+        safe_answer(call.id)
         if not st["comment"] and not (st.get("comment_text") or "").strip():
             st["input_mode"] = "waiting_comment_text"
             safe_answer(call.id, "أرسل نص التعليق أولاً لتفعيله")
@@ -5767,6 +5904,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
     elif data == "toggle_comment_active":
         if not require_perm_or_deny(call, "can_comment", "⛔ صلاحية التعليقات غير مفعلة لحسابك."):
             return
+        safe_answer(call.id)
         if not st["comment"] and not (st.get("comment_text") or "").strip():
             st["input_mode"] = "waiting_comment_text"
             safe_answer(call.id, "أرسل نص التعليق أولاً لتفعيله")
@@ -5783,6 +5921,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
 
     # C) الصداقة والمتابعة (can_friend_follow)
     elif data == "toggle_friend":
+        safe_answer(call.id)
         if not require_perm_or_deny(call, "can_friend_follow", "⛔ صلاحية الصداقة والمتابعة غير مفعلة لحسابك."):
             return
         st["friend"] = not st["friend"]
@@ -5792,6 +5931,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         safe_answer(call.id, f"طلب الصداقة: {'مفعل ✅' if st['friend'] else 'معطل ❌'}")
 
     elif data == "toggle_cancel_friend":
+        safe_answer(call.id)
         if not require_perm_or_deny(call, "can_friend_follow", "⛔ صلاحية الصداقة والمتابعة غير مفعلة لحسابك."):
             return
         st["cancel_friend"] = not st["cancel_friend"]
@@ -5801,6 +5941,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         safe_answer(call.id, f"إلغاء طلب الصداقة: {'مفعل ✅' if st['cancel_friend'] else 'معطل ❌'}")
 
     elif data == "toggle_follow":
+        safe_answer(call.id)
         if not require_perm_or_deny(call, "can_friend_follow", "⛔ صلاحية الصداقة والمتابعة غير مفعلة لحسابك."):
             return
         st["follow"] = not st["follow"]
@@ -5810,6 +5951,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         safe_answer(call.id, f"المتابعة: {'مفعل ✅' if st['follow'] else 'معطل ❌'}")
 
     elif data == "toggle_unfollow":
+        safe_answer(call.id)
         if not require_perm_or_deny(call, "can_friend_follow", "⛔ صلاحية الصداقة والمتابعة غير مفعلة لحسابك."):
             return
         st["unfollow"] = not st["unfollow"]
@@ -5820,6 +5962,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
 
     # D) الرسائل الخاصة (can_message)
     elif data == "menu_wizard_message":
+        safe_answer(call.id)
         if not require_perm_or_deny(call, "can_message", "⛔ صلاحية الرسائل الخاصة غير مفعلة لحسابك."):
             return
         markup = types.InlineKeyboardMarkup(row_width=1)
@@ -5838,6 +5981,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
     elif data == "toggle_message":
         if not require_perm_or_deny(call, "can_message", "⛔ صلاحية الرسائل الخاصة غير مفعلة لحسابك."):
             return
+        safe_answer(call.id)
         if not st["message"] and not (st.get("message_text") or "").strip():
             st["input_mode"] = "waiting_msg_text"
             safe_answer(call.id, "أرسل نص الرسالة الخاصة أولاً لتفعيلها")
@@ -5855,6 +5999,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
     elif data == "toggle_msg_main":
         if not require_perm_or_deny(call, "can_message", "⛔ صلاحية الرسائل الخاصة غير مفعلة لحسابك."):
             return
+        safe_answer(call.id)
         if not st["message"] and not (st.get("message_text") or "").strip():
             st["input_mode"] = "waiting_msg_text"
             safe_answer(call.id, "أرسل نص الرسالة الخاصة أولاً لتفعيلها")
@@ -5882,6 +6027,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
 
     # E) البلاغات والحظر (can_report)
     elif data == "toggle_rep_post":
+        safe_answer(call.id)
         if not require_perm_or_deny(call, "can_report", "⛔ صلاحية البلاغات غير مفعلة لحسابك."):
             return
         st["report_post"] = not st["report_post"]
@@ -5891,6 +6037,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         safe_answer(call.id, f"بلاغ المنشور: {'مفعل ✅' if st['report_post'] else 'معطل ❌'}")
 
     elif data == "toggle_rep_profile":
+        safe_answer(call.id)
         if not require_perm_or_deny(call, "can_report", "⛔ صلاحية البلاغات غير مفعلة لحسابك."):
             return
         st["report_profile"] = not st["report_profile"]
@@ -5902,11 +6049,13 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
     elif data == "toggle_block":
         if not require_perm_or_deny(call, "can_report", "⛔ صلاحية الحظر غير مفعلة لحسابك."):
             return
+        safe_answer(call.id)
         st["block"] = not st["block"]
         _refresh_after_toggle(call, user_id)
         safe_answer(call.id, f"حظر الحساب: {'مفعل ✅' if st['block'] else 'معطل ❌'}")
 
     elif data == "menu_rep_config":
+        safe_answer(call.id)
         if not require_perm_or_deny(call, "can_report", "⛔ صلاحية البلاغات غير مفعلة لحسابك."):
             return
         markup = types.InlineKeyboardMarkup(row_width=2)
@@ -5928,6 +6077,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         )
 
     elif data.startswith("set_rep_reason_"):
+        safe_answer(call.id)
         if not require_perm_or_deny(call, "can_report", "⛔ صلاحية البلاغات غير مفعلة لحسابك."):
             return
         rk = data.replace("set_rep_reason_", "")
@@ -5938,6 +6088,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         handle_callbacks(call)
 
     elif data.startswith("set_rep_victim_"):
+        safe_answer(call.id)
         if not require_perm_or_deny(call, "can_report", "⛔ صلاحية البلاغات غير مفعلة لحسابك."):
             return
         vk = data.replace("set_rep_victim_", "")
@@ -5949,6 +6100,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
 
     # F) التفاعل والرد على تعليق محدد (can_interact_comments)
     elif data == "menu_cmt_interact":
+        safe_answer(call.id)
         if not require_perm_or_deny(call, "can_interact_comments", "⛔ صلاحية الرد والتفاعل مع التعليقات غير مفعلة لحسابك."):
             return
         markup = types.InlineKeyboardMarkup(row_width=2)
@@ -5979,6 +6131,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
     elif data == "toggle_cmt_int_active":
         if not require_perm_or_deny(call, "can_interact_comments", "⛔ صلاحية التفاعل مع التعليقات غير مفعلة."):
             return
+        safe_answer(call.id)
         st["interact_cmt"] = not st["interact_cmt"]
         safe_answer(call.id, f"الميزة: {'مفعلة ✅' if st['interact_cmt'] else 'معطلة ❌'}")
         call.data = "menu_cmt_interact"
@@ -5987,11 +6140,13 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
     elif data == "toggle_cmt_int_main":
         if not require_perm_or_deny(call, "can_interact_comments", "⛔ صلاحية التفاعل مع التعليقات غير مفعلة."):
             return
+        safe_answer(call.id)
         st["interact_cmt"] = not st["interact_cmt"]
         _refresh_after_toggle(call, user_id)
         safe_answer(call.id, f"الرد على التعليق: {'مفعل ✅' if st['interact_cmt'] else 'معطل ❌'}")
 
     elif data == "cycle_cmt_mode":
+        safe_answer(call.id)
         if not require_perm_or_deny(call, "can_interact_comments", "⛔ صلاحية التفاعل مع التعليقات غير مفعلة."):
             return
         modes = ["first", "author", "keyword", "index"]
@@ -6002,6 +6157,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         handle_callbacks(call)
 
     elif data == "cycle_cmt_reaction":
+        safe_answer(call.id)
         if not require_perm_or_deny(call, "can_interact_comments", "⛔ صلاحية التفاعل مع التعليقات غير مفعلة."):
             return
         reactions = ["like", "love", "care", "haha", "wow", "sad", "angry", "none"]
@@ -6012,6 +6168,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         handle_callbacks(call)
 
     elif data == "edit_cmt_target_val":
+        safe_answer(call.id)
         if not require_perm_or_deny(call, "can_interact_comments", "⛔ صلاحية التفاعل مع التعليقات غير مفعلة."):
             return
         st["input_mode"] = "waiting_cmt_val"
@@ -6022,6 +6179,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         )
 
     elif data == "edit_cmt_reply_text":
+        safe_answer(call.id)
         if not require_perm_or_deny(call, "can_interact_comments", "⛔ صلاحية التفاعل مع التعليقات غير مفعلة."):
             return
         st["input_mode"] = "waiting_cmt_reply"
@@ -6282,6 +6440,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         handle_callbacks(call)
 
     elif data == "act_add_acc":
+        safe_answer(call.id)
         if not require_perm_or_deny(call, "can_add_accounts", "⛔ ليس لديك صلاحية إضافة حسابات للبوت. اطلب الإذن من المطور الرئيسي."):
             return
         st["input_mode"] = "add_acc_name"
@@ -6293,6 +6452,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         )
 
     elif data == "act_import_cookies":
+        safe_answer(call.id)
         if not require_perm_or_deny(call, "can_add_accounts", "⛔ ليس لديك صلاحية إضافة حسابات للبوت."):
             return
         st["input_mode"] = "import_ck_name"
@@ -6314,6 +6474,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         threading.Thread(target=check_all_sessions_worker, args=(call.message.chat.id, user_id), daemon=True).start()
 
     elif data == "back_to_main":
+        safe_answer(call.id)
         st["input_mode"] = None
         st["temp_acc_data"] = {}
         safe_edit_message(
@@ -6327,6 +6488,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
     elif data == "action_launch":
         if not require_perm_or_deny(call, "can_execute", "⛔ ليس لديك صلاحية تشغيل التنفيذ الميداني."):
             return
+        safe_answer(call.id)
         if not user_has_any_action_perm(user_id):
             safe_answer(call.id, "⛔ لم يفعّل المطور لك أي أداة تنفيذ (تفاعل/تعليق/بلاغ/صداقة) بعد!", show_alert=True)
             return
@@ -6661,6 +6823,11 @@ def _handle_text_inputs_impl(message: types.Message):
         st["temp_acc_data"] = {}
         cmd_start(message)
         return
+    elif text in ("📞 كاشف الأرقام", "كاشف الأرقام", "كاشف الارقام"):
+        st["input_mode"] = None
+        txt, mk = render_caller_id_view(user_id)
+        safe_send(message.chat.id, txt, reply_markup=mk)
+        return
     elif text == "➕ إضافة حساب":
         if not (is_super_admin(user_id) or has_permission(user_id, "can_add_accounts")):
             bot.reply_to(message, "⛔ ليس لديك صلاحية إضافة حسابات للبوت.")
@@ -6976,6 +7143,14 @@ def _handle_text_inputs_impl(message: types.Message):
             f"💡 يمكنك استخدام هذا البريد في أي منصة، ثم فحص الوارد مباشرة من الزر أدناه.",
             reply_markup=mk
         )
+        return
+
+    elif mode == "waiting_caller_id_number":
+        st["input_mode"] = None
+        bot.send_chat_action(message.chat.id, "typing")
+        res = YemenCallerIDAPI.lookup_number(text.strip())
+        txt, mk = render_caller_id_view(user_id, result=res)
+        safe_send(message.chat.id, txt, reply_markup=mk)
         return
 
     elif mode == "waiting_msg_text":
@@ -7304,6 +7479,18 @@ def _handle_text_inputs_impl(message: types.Message):
 
     elif mode == "waiting_acc_cookies":
         _process_cookie_import_submission(message, text)
+
+    else:
+        # إذا لم يكن هناك وضع إدخال معلق، وكان النص عبارة عن رقم يمني صريح، نكشف عنه مباشرة كخدمة ذكية
+        clean_num = YemenCallerIDAPI.sanitize_number(text)
+        if clean_num and len(clean_num) in (7, 8, 9) and (clean_num.startswith("7") or clean_num.startswith("0") or clean_num.startswith("1")):
+            cid_gate = get_feature("yemen_caller_id")
+            if is_super_admin(user_id) or (cid_gate and cid_gate.get("status") == "active"):
+                bot.send_chat_action(message.chat.id, "typing")
+                res = YemenCallerIDAPI.lookup_number(clean_num)
+                txt, mk = render_caller_id_view(user_id, result=res)
+                safe_send(message.chat.id, txt, reply_markup=mk)
+                return
 
 
 def _process_cookie_import_submission(message: types.Message, raw_payload: str) -> None:
