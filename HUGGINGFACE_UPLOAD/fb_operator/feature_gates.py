@@ -261,6 +261,10 @@ def is_feature_accessible(arg1: Any, arg2: Any) -> bool:
     return acc
 
 
+# اسم بديل متطابق للتوافق الشامل
+is_feature_enabled = is_feature_accessible
+
+
 def get_feature_cost(feature_id: str, user_id: int = 0) -> int:
     f = get_feature(feature_id)
     if not f:

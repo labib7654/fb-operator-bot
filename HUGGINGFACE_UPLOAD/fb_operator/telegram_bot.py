@@ -154,7 +154,7 @@ from fb_operator.economy_manager import (
 from fb_operator.feature_gates import (
     load_feature_gates, get_feature, list_features, is_feature_accessible,
     get_feature_cost, update_feature_gate, register_custom_feature,
-    add_allowed_user, remove_allowed_user,
+    add_allowed_user, remove_allowed_user, is_feature_enabled,
 )
 import fb_operator.tempmail_manager as tm_m
 
@@ -1061,10 +1061,11 @@ def _render_announcements_view() -> tuple[str, types.InlineKeyboardMarkup]:
             )
             markup.row(
                 _btn(
-                    f"{st_ico} {str(a.get('title') or '')[:26]}",
+                    f"{st_ico} {str(a.get('title') or '')[:20]}",
                     style="success" if a.get("is_effectively_active") else None,
                     callback_data=f"ann_view_{a['id']}",
-                )
+                ),
+                _btn("🗑️ حذف", style="danger", callback_data=f"ann_del_{a['id']}"),
             )
     markup.row(
         _btn("🔄 تحديث", style="primary", callback_data="menu_announcements"),
@@ -3391,6 +3392,8 @@ def _refresh_tracked_inline_view(uid: int) -> None:
         txt, markup = _render_4g_bridge_view()
     elif view == "announcements" and has_admin_capability(uid, "announcements"):
         txt, markup = _render_announcements_view()
+    elif view == "ann_detail" and entry.get("ann_id") and has_admin_capability(uid, "announcements"):
+        txt, markup = _render_announcement_detail_view(entry["ann_id"])
     else:
         return
 
@@ -3429,8 +3432,13 @@ def _on_state_event(scope: str, target_uid: int, reason: str) -> None:
             continue
         with _active_views_lock:
             v = (_active_views.get(uid) or {}).get("view", "")
-        # إذا كانت الواجهة معالج تفاعلي أو نافذة فرعية، لا نزعجه بتحديث خاطف
-        if v.startswith("wizard_") or v.startswith("sub_") or v.startswith("acc_view_"):
+        # إذا كانت الواجهة معالج تفاعلي، نافذة فرعية، تفاصيل إعلان، أو إدارة بريد، لا نزعجه بتحديث خاطف يغلق الشاشة
+        transient_exact = {
+            "ann_detail", "ann_theme", "ann_new", "announcements",
+            "tempmail", "tempmail_pick_domain", "tempmail_inbox", "tempmail_history",
+            "feature_detail", "feature_gates"
+        }
+        if v in transient_exact or v.startswith("wizard_") or v.startswith("sub_") or v.startswith("acc_view_") or v.startswith("ann_") or v.startswith("tm_"):
             continue
 
         if is_super_admin(uid) or is_admin_delegate(uid, include_manager=True):
@@ -3870,6 +3878,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
 
     # ----------------- مركز البريد المؤقت والدائم وسلة الاسترجاع -----------------
     elif data == "menu_tempmail":
+        safe_answer(call.id)
         if not is_feature_enabled(user_id, "tempmail") and not is_super_admin(user_id):
             safe_answer(call.id, "⛔ ميزة البريد مغلقة حالياً أو تتطلب إذناً من الإدارة.", show_alert=True)
             return
@@ -4234,6 +4243,11 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
             safe_answer(call.id, "⛔ غير مصرح لك.", show_alert=True)
             return
         ann_id = data[len("ann_view_"):]
+        safe_answer(call.id)
+        _track_view(user_id, call.message.chat.id, call.message.message_id, "ann_detail")
+        with _active_views_lock:
+            if user_id in _active_views:
+                _active_views[user_id]["ann_id"] = ann_id
         txt, mk = _render_announcement_detail_view(ann_id)
         safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
         return
