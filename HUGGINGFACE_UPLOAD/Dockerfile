@@ -7,7 +7,7 @@ ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONPATH=/app
 ENV DEBIAN_FRONTEND=noninteractive
-ENV PORT=7860
+ENV PORT=10000
 ENV DISPLAY=:99
 
 # تثبيت خادم الشاشة الافتراضية Xvfb والخطوط والأدوات الأساسية بحزم مستقرة 100%
@@ -49,7 +49,7 @@ COPY --chown=1000:1000 . .
 
 USER 1000
 
-EXPOSE 7860
+EXPOSE 10000 7860
 
-# تشغيل البوت داخل شاشة عرض افتراضية حقيقية بدقة 1080p
-CMD ["xvfb-run", "-a", "-s", "-screen 0 1920x1080x24 -ac +extension GLX +render -noreset", "python", "fb_operator/telegram_bot.py"]
+# تشغيل البوت مع خادم الـ Health Check الفوري
+CMD ["xvfb-run", "-a", "-s", "-screen 0 1920x1080x24 -ac +extension GLX +render -noreset", "python", "-u", "fb_operator/server.py"]
