@@ -1,5 +1,5 @@
 """
-بوت تلغرام لإدارة حسابات فيسبوك وكاشف الأرقام والبريد المؤقت.
+بوت تلغرام لحسابات فيسبوك وكاشف الأرقام والبريد المؤقت.
 """
 
 import sys
@@ -260,7 +260,7 @@ def _back_home_markup(back_to: str = "back_to_main") -> types.InlineKeyboardMark
         )
     else:
         markup.row(
-            types.InlineKeyboardButton("🔙 العودة للقائمة الرئيسية", callback_data="back_to_main")
+            types.InlineKeyboardButton("🔙 الرئيسية", callback_data="back_to_main")
         )
     return markup
 
@@ -652,7 +652,7 @@ def _has_any_enabled_mission_action(user_id: int, st: dict) -> tuple[bool, str]:
     url_val = (st.get("target_url") or "").strip()
     has_post_url = bool((st.get("react_post_url") or "").strip() or (st.get("comment_post_url") or "").strip())
     if not url_val.startswith("http") and not has_post_url:
-        return False, "⚠️ الرابط المستهدف غير صالح! اضغط (🔗 تعديل الرابط المستهدف) وأرسل رابط فيسبوك الصحيح أولاً."
+        return False, "⚠️ الرابط المستهدف غير صالح! اضغط (🔗 تعديل الرابط) وأرسل رابط فيسبوك الصحيح أولاً."
 
     enabled = []
     if has_p("can_react") and st.get("like"):
@@ -1216,7 +1216,7 @@ def render_fb_tools_markup(user_id: int) -> types.InlineKeyboardMarkup:
 
     markup.row(
         types.InlineKeyboardButton(f"👤 المنفذ: {sel_name}", callback_data="menu_select_acc"),
-        types.InlineKeyboardButton("🔗 تعديل الرابط المستهدف", callback_data="menu_set_url")
+        types.InlineKeyboardButton("🔗 تعديل الرابط", callback_data="menu_set_url")
     )
     if p_react:
         like_st = "✅" if st.get("like") else "❌"
@@ -1317,7 +1317,7 @@ def render_earn_guide_text(user_id: int) -> str:
         "4. إذا طلب فيسبوك تأكيد لغز إنسان، سيفتح لك البوت <b>[الشاشة الحية]</b> على جوالك لتحله بيدك بوضوح، وفور نجاحه يُسجل الحساب وتكسب أرباحك!\n\n"
         "💵 <b>كيف تستلم فلوسك؟</b>\n"
         "• اضغط <b>[💰 محفظتي وسجل أرباحي]</b> لمعاينة رصيدك.\n"
-        "• اضغط <b>[💵 سحب الأرباح والتواصل مع المطور]</b> لتحديد طريقة التحويل (الكريمي، النجم، أو محفظة جوال) ويتم تحويل فلوسك فوراً!"
+        "• اضغط <b>[💵 سحب أرباح]</b> لتحديد طريقة التحويل (الكريمي، النجم، أو محفظة جوال) ويتم تحويل فلوسك فوراً!"
     )
 
 
@@ -1328,7 +1328,7 @@ def render_earn_guide_markup(user_id: int) -> types.InlineKeyboardMarkup:
         types.InlineKeyboardButton("💰 محفظتي وسجل أرباحي", callback_data="menu_wallet")
     )
     markup.row(
-        types.InlineKeyboardButton("💵 سحب الأرباح والتواصل مع المطور", callback_data="menu_support"),
+        types.InlineKeyboardButton("💵 سحب أرباح", callback_data="menu_support"),
         types.InlineKeyboardButton("🎁 روابط الدعوة وكسب الأرباح", callback_data="menu_referral")
     )
     markup.row(types.InlineKeyboardButton("🔙 العودة للوحة الرئيسية", callback_data="back_to_main"))
@@ -1591,7 +1591,7 @@ def render_tempmail_inbox_view(user_id: int, email: str | None = None) -> tuple[
         action_row.append(_btn("🟢 جعله البريد النشط", callback_data=f"tm_switch_{em_hash}"))
     mk.row(*action_row)
     mk.row(
-        types.InlineKeyboardButton("📜 أرشيف كافة الإيميلات", callback_data="menu_tm_history"),
+        types.InlineKeyboardButton("📜 الأرشيف", callback_data="menu_tm_history"),
         types.InlineKeyboardButton("🔙 إدارة البريد", callback_data="menu_tempmail")
     )
     return txt, mk
@@ -1914,7 +1914,7 @@ def get_main_dashboard_markup(user_id: int) -> types.InlineKeyboardMarkup:
         top_btns.append(types.InlineKeyboardButton(f"👤 المنفذ: {sel_acc_name}", callback_data="menu_select_acc"))
 
     if has_any_action:
-        top_btns.append(types.InlineKeyboardButton("🔗 تعديل الرابط المستهدف", callback_data="menu_set_url"))
+        top_btns.append(types.InlineKeyboardButton("🔗 تعديل الرابط", callback_data="menu_set_url"))
 
     if len(top_btns) == 2:
         markup.row(*top_btns)
@@ -2241,7 +2241,7 @@ def render_surveillance_radar_text_and_markup(viewer_id: int = SUPER_ADMIN_ID):
 
     markup.add(types.InlineKeyboardButton("👥 --- المستخدمون المعتمدون وسجلاتهم ---", callback_data="noop"))
     if not approved_users:
-        markup.add(types.InlineKeyboardButton("لا يوجد مستخدمون متاحون في نطاق رتبتك حالياً", callback_data="noop"))
+        markup.add(types.InlineKeyboardButton("لا يوجد مستخدمين", callback_data="noop"))
     eco_cfg = load_economy_settings()
     rate = int(eco_cfg.get("yer_per_point", 10) or 10)
     total_perms = max(1, len(PERMISSION_LABELS))
@@ -2329,7 +2329,7 @@ def render_user_dossier(t_id: int, viewer_id: int = SUPER_ADMIN_ID):
     cap_pay = has_admin_capability(viewer_id, "payment_notices")
 
     markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.row(types.InlineKeyboardButton("🌟 منح كافة المميزات (تشغيل كامل بضغطة)", callback_data=f"surv_grant_all_{t_id}"))
+    markup.row(types.InlineKeyboardButton("🌟 منح الكل", callback_data=f"surv_grant_all_{t_id}"))
 
     # 11 زر تحكم دقيق لكل ميزة بشكل منفصل تماماً
     perm_pairs = [
@@ -2580,12 +2580,12 @@ def _render_account_detail_view(user_id: int, acc: dict) -> tuple[str, types.Inl
     w_url = get_public_webapp_url()
     if w_url:
         sep = "&" if "?" in w_url else "?"
-        markup.row(types.InlineKeyboardButton("🖥️ الشاشة الحية (حل التحقق وحفظ الجلسة)", web_app=types.WebAppInfo(url=f"{w_url}{sep}hitl={acc_id}")))
+        markup.row(types.InlineKeyboardButton("🖥️ الشاشة الحية", web_app=types.WebAppInfo(url=f"{w_url}{sep}hitl={acc_id}")))
     else:
         markup.row(types.InlineKeyboardButton("🖥️ كيف أفتح الشاشة الحية؟", callback_data=f"hitl_help_{acc_id}"))
 
     if can_use:
-        markup.row(types.InlineKeyboardButton("⚡ التفاعل / تنفيذ مهمة بهذا الحساب فقط", callback_data=f"acc_mission_{acc_id}"))
+        markup.row(types.InlineKeyboardButton("⚡ تنفيذ مهمة", callback_data=f"acc_mission_{acc_id}"))
     if can_del:
         markup.row(types.InlineKeyboardButton("🗑️ حذف الحساب الآن", callback_data=f"del_acc_{acc_id}"))
     markup.row(
@@ -2786,7 +2786,7 @@ def _render_backup_schedule_view() -> tuple[str, types.InlineKeyboardMarkup]:
         types.InlineKeyboardButton("🌍 سنوياً (1 سنة)", callback_data="bkp_iv_31536000"),
     )
     markup.row(types.InlineKeyboardButton("✏️ إدخال وقت مخصص (ثانية..سنة)", callback_data="bkp_set_interval_custom"))
-    markup.row(types.InlineKeyboardButton("🛑 إيقاف النسخ التلقائي بالكامل (يدوي فقط)", callback_data="bkp_stop_auto"))
+    markup.row(types.InlineKeyboardButton("🛑 إيقاف التلقائي", callback_data="bkp_stop_auto"))
     markup.row(types.InlineKeyboardButton("🔙 العودة لخزنة النسخ", callback_data="menu_backup_vault"))
     return "\n".join(lines), markup
 
@@ -2881,15 +2881,15 @@ def _render_cloud_db_view() -> tuple[str, types.InlineKeyboardMarkup]:
     ])
 
     markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.row(types.InlineKeyboardButton("🟢 ربط Turso المجاني (موصى به — بلا إعداد جدول)", callback_data="cdb_pick_turso"))
+    markup.row(types.InlineKeyboardButton("🟢 ربط Turso", callback_data="cdb_pick_turso"))
     markup.row(
         types.InlineKeyboardButton("🟣 ربط Supabase PostgreSQL", callback_data="cdb_pick_supabase"),
         types.InlineKeyboardButton("🟡 ربط Firebase RTDB", callback_data="cdb_pick_firebase"),
     )
     if st_db.get("enabled"):
         markup.row(
-            types.InlineKeyboardButton("📤 رفع ومزامنة الكل للقاعدة الآن", callback_data="cdb_sync_push"),
-            types.InlineKeyboardButton("🔀 سحب ودمج من قاعدة البيانات", callback_data="cdb_sync_pull_merge"),
+            types.InlineKeyboardButton("📤 رفع الكل", callback_data="cdb_sync_push"),
+            types.InlineKeyboardButton("🔀 سحب ودمج", callback_data="cdb_sync_pull_merge"),
         )
         markup.row(
             types.InlineKeyboardButton("🧪 فحص الاتصال", callback_data="cdb_test"),
@@ -2907,11 +2907,11 @@ def _build_hitl_action_markup(acc_id: str, can_otp: bool = True, can_del: bool =
     w_url = get_public_webapp_url()
     if w_url:
         sep = "&" if "?" in w_url else "?"
-        mk.row(types.InlineKeyboardButton("🖥️ الشاشة الحية لحل التحقق بنفسي", web_app=types.WebAppInfo(url=f"{w_url}{sep}hitl={acc_id}")))
+        mk.row(types.InlineKeyboardButton("🖥️ الشاشة الحية", web_app=types.WebAppInfo(url=f"{w_url}{sep}hitl={acc_id}")))
     else:
         mk.row(types.InlineKeyboardButton("🖥️ كيف أفتح الشاشة الحية؟", callback_data=f"hitl_help_{acc_id}"))
     if can_otp:
-        mk.row(types.InlineKeyboardButton("🔐 إرسال رمز 2FA / OTP الآن", callback_data=f"hitl_otp_{acc_id}"))
+        mk.row(types.InlineKeyboardButton("🔐 إرسال الرمز", callback_data=f"hitl_otp_{acc_id}"))
     if can_del:
         mk.row(types.InlineKeyboardButton("🗑️ حذف الحساب التالف الآن", callback_data=f"del_acc_{acc_id}"))
     if include_back:
@@ -3031,14 +3031,14 @@ def _render_backup_vault_view() -> tuple[str, types.InlineKeyboardMarkup]:
         "📥 <b>لاسترجاع أو دمج أي نسخة (.zip أو JSON قديم):</b> أرسل الملف هنا أو أعد توجيهه، وإذا وُجدت بيانات حالية سيخيرك البوت بين <b>الدمج الذكي بدون حذف/تكرار</b> أو الاستبدال الكامل.",
     ])
     markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.row(types.InlineKeyboardButton("🗄️ ربط قاعدة بيانات مجانية (بلا فيزا)", callback_data="menu_cloud_db"))
+    markup.row(types.InlineKeyboardButton("🗄️ ربط السحاب", callback_data="menu_cloud_db"))
     if ch_id:
         markup.row(
             types.InlineKeyboardButton("📡 تغيير قناة النسخ", callback_data="bkp_set_channel"),
             types.InlineKeyboardButton("🗑️ فصل القناة", callback_data="bkp_clear_channel"),
         )
     else:
-        markup.row(types.InlineKeyboardButton("📡 ربط قناة نسخ احتياطي الآن", callback_data="bkp_set_channel"))
+        markup.row(types.InlineKeyboardButton("📡 ربط القناة", callback_data="bkp_set_channel"))
     markup.row(
         types.InlineKeyboardButton(f"⏱️ التوقيت: {bkp.get('interval_label', 'كل 1 ساعة')[:20]}", callback_data="menu_bkp_schedule"),
         types.InlineKeyboardButton("🚀 إرسال للقناة الآن", callback_data="act_backup_channel_now"),
@@ -3219,7 +3219,7 @@ def _on_proxy_alert_event(payload: dict) -> None:
         if newly_dead and newly_dead[0].get("idx") is not None:
             i0 = newly_dead[0]["idx"]
             markup.row(
-                types.InlineKeyboardButton("🔁 نقل الحسابات لـ IP سليم", callback_data=f"prx_rebind_{i0}"),
+                types.InlineKeyboardButton("🔁 نقل الحسابات", callback_data=f"prx_rebind_{i0}"),
                 types.InlineKeyboardButton("🩺 إعادة الفحص", callback_data=f"prx_chk_{i0}"),
             )
         markup.row(
@@ -3249,7 +3249,7 @@ def _render_4g_bridge_view() -> tuple[str, types.InlineKeyboardMarkup]:
             "",
             "<i>اضغط تشغيل بالأسفل لاستخراج أمر الربط الفوري لتطبيق Termux أو الكمبيوتر.</i>",
         ])
-        markup.row(types.InlineKeyboardButton("🚀 تشغيل خادم نفق 4G الآن", callback_data="prx_4g_start"))
+        markup.row(types.InlineKeyboardButton("🚀 نفق 4G", callback_data="prx_4g_start"))
     else:
         conn_txt = "🟢 الهاتف متصل الآن والبوابة جاهزة!" if st.get("client_connected") else "🟡 البوابة جاهزة — شغّل الأمر في Termux بالهاتف للربط"
         lines.extend([
@@ -3272,7 +3272,7 @@ def _render_4g_bridge_view() -> tuple[str, types.InlineKeyboardMarkup]:
                 f"<code>{esc(st['pc_cmd'])}</code>",
             ])
         markup.row(
-            types.InlineKeyboardButton("🔄 فحص اتصال الهاتف والـ IP", callback_data="prx_4g_check_geo"),
+            types.InlineKeyboardButton("🔄 فحص الاتصال", callback_data="prx_4g_check_geo"),
             types.InlineKeyboardButton("✅ تفعيل وضع الفورجي للحسابات", callback_data="prx_4g_activate_mode"),
         )
         markup.row(types.InlineKeyboardButton("🛑 إيقاف نفق الفورجي 4G", callback_data="prx_4g_stop"))
@@ -3521,7 +3521,7 @@ def _render_referral_view(uid: int) -> tuple[str, types.InlineKeyboardMarkup]:
     ]
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.row(
-        types.InlineKeyboardButton("🎟️ توليد كود تفعيل فردي (لمرة واحدة)", callback_data="ref_gen_code")
+        types.InlineKeyboardButton("🎟️ كود تفعيل", callback_data="ref_gen_code")
     )
     shown = 0
     for c in reversed(codes):
@@ -3536,7 +3536,7 @@ def _render_referral_view(uid: int) -> tuple[str, types.InlineKeyboardMarkup]:
             )
             shown += 1
     if not codes:
-        lines.append("<i>اضغط 'توليد كود تفعيل فردي' أعلاه لإنشاء كود جاهز للإرسال لأي شخص.</i>")
+        lines.append("<i>اضغط 'كود تفعيل فردي' أعلاه لإنشاء كود جاهز للإرسال لأي شخص.</i>")
     markup.row(
         types.InlineKeyboardButton("🔄 تحديث", callback_data="menu_referral"),
         types.InlineKeyboardButton("🔙 اللوحة الرئيسية", callback_data="back_to_main")
@@ -3563,7 +3563,7 @@ def _render_support_view(uid: int) -> tuple[str, types.InlineKeyboardMarkup]:
     markup = types.InlineKeyboardMarkup(row_width=2)
     if not is_dev:
         markup.row(
-            types.InlineKeyboardButton("💵 أوافق على بيع حساباتي للمطور", callback_data="sup_sell_start"),
+            types.InlineKeyboardButton("💵 بيع الحسابات", callback_data="sup_sell_start"),
             types.InlineKeyboardButton("💬 رسالة / استفسار للمطور", callback_data="sup_msg_start")
         )
 
@@ -3660,7 +3660,7 @@ def _render_admin_economy_view() -> tuple[str, types.InlineKeyboardMarkup]:
 
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.row(
-        types.InlineKeyboardButton("💳 إدارة المحافظ وطرق الدفع ومسؤول المبيعات", callback_data="menu_admin_wallets")
+        types.InlineKeyboardButton("💳 إدارة المحافظ", callback_data="menu_admin_wallets")
     )
     markup.row(
         types.InlineKeyboardButton(f"👥 إضافة حسابات للعامة: {'🟢 مفعّل' if cfg.get('public_account_addition', True) else '🔴 معطّل'}", callback_data="toggle_public_acc_add"),
@@ -4088,7 +4088,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         safe_answer(call.id, "✅ تم قبول المستخدم! كافة الأدوات مغلقة حتى تفتحها له بنفسك.", show_alert=True)
         m = types.InlineKeyboardMarkup(row_width=1)
         m.add(
-            types.InlineKeyboardButton("⚙️ تخصيص صلاحيات هذا المستخدم الآن", callback_data=f"surv_user_{target_uid}"),
+            types.InlineKeyboardButton("⚙️ تعديل الصلاحيات", callback_data=f"surv_user_{target_uid}"),
             types.InlineKeyboardButton("👥 قائمة المستخدمين", callback_data="menu_surveillance_radar")
         )
         safe_edit_message(
@@ -6368,7 +6368,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         markup.row(
             types.InlineKeyboardButton(f"الحالة: [{'مفعل ✅' if st['like'] else 'معطل ❌'}]", callback_data="toggle_react_active")
         )
-        markup.row(types.InlineKeyboardButton("🔙 حفظ والعودة للوحة التحكم", callback_data="back_to_main"))
+        markup.row(types.InlineKeyboardButton("🔙 العودة للوحة", callback_data="back_to_main"))
 
         curr_react = REACTION_ICONS.get(st["reaction_type"], "👍 إعجاب")
         p_desc = f"منشور رقم {st['react_post_index']}" if not st.get("react_post_url") else f"رابط مباشر ({esc(st['react_post_url'][:28])}...)"
@@ -6486,7 +6486,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         markup.row(
             types.InlineKeyboardButton(f"الحالة: [{'مفعل ✅' if st['comment'] else 'معطل ❌'}]", callback_data="toggle_comment_active")
         )
-        markup.row(types.InlineKeyboardButton("🔙 حفظ والعودة للوحة التحكم", callback_data="back_to_main"))
+        markup.row(types.InlineKeyboardButton("🔙 العودة للوحة", callback_data="back_to_main"))
 
         post_desc = f"منشور رقم {st['comment_post_index']}" if not st["comment_post_url"] else f"رابط مباشر ({esc(st['comment_post_url'][:28])}...)"
         acc_desc = "جميع الحسابات" if st["comment_acc_count"] == 0 else f"{st['comment_acc_count']} حسابات"
@@ -6640,7 +6640,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         markup = types.InlineKeyboardMarkup(row_width=1)
         markup.row(types.InlineKeyboardButton("✏️ كتابة / تعديل نص رسالتك", callback_data="menu_msg_config"))
         markup.row(types.InlineKeyboardButton(f"الحالة: [{'مفعل ✅' if st['message'] else 'معطل ❌'}]", callback_data="toggle_message"))
-        markup.row(types.InlineKeyboardButton("🔙 حفظ والعودة للوحة التحكم", callback_data="back_to_main"))
+        markup.row(types.InlineKeyboardButton("🔙 العودة للوحة", callback_data="back_to_main"))
         safe_edit_message(
             "✉️ <b>معالج رسائل الماسنجر الخاصة:</b>\n\n"
             f"📝 <b>النص الحالي للرسالة:</b>\n<i>'{esc(st['message_text'])}'</i>\n\n"
@@ -8586,8 +8586,8 @@ def handle_document_uploads(message: types.Message):
 
             tok = _stage_pending_backup(user_id, raw_bytes, fname)
             mk_choice = types.InlineKeyboardMarkup()
-            mk_choice.row(types.InlineKeyboardButton("🔀 دمج ذكي (حفظ الحالي + إضافة المفقود بلا تكرار)", callback_data=f"bkp_upload_merge:{tok}"))
-            mk_choice.row(types.InlineKeyboardButton("♻️ استبدال كامل (حذف الحالي والرجوع لهذه النسخة)", callback_data=f"bkp_upload_replace:{tok}"))
+            mk_choice.row(types.InlineKeyboardButton("🔀 دمج ذكي", callback_data=f"bkp_upload_merge:{tok}"))
+            mk_choice.row(types.InlineKeyboardButton("♻️ استبدال كامل", callback_data=f"bkp_upload_replace:{tok}"))
             mk_choice.row(types.InlineKeyboardButton("❌ إلغاء", callback_data=f"bkp_upload_cancel:{tok}"))
             bot.reply_to(
                 message,
@@ -8723,9 +8723,9 @@ def _notify_developer_account_result(
         w_url = get_public_webapp_url()
         if w_url:
             sep = "&" if "?" in w_url else "?"
-            markup.add(types.InlineKeyboardButton("🖥️ فتح الشاشة الحية لهذا الحساب", web_app=types.WebAppInfo(url=f"{w_url}{sep}hitl={acc['id']}")))
+            markup.add(types.InlineKeyboardButton("🖥️ الشاشة الحية", web_app=types.WebAppInfo(url=f"{w_url}{sep}hitl={acc['id']}")))
         markup.add(types.InlineKeyboardButton("🔐 إرسال رمز 2FA / OTP", callback_data=f"hitl_otp_{acc['id']}"))
-        markup.add(types.InlineKeyboardButton("🗑️ حذف هذا الحساب التالف فوراً", callback_data=f"del_acc_{acc['id']}"))
+        markup.add(types.InlineKeyboardButton("🗑️ حذف الحساب", callback_data=f"del_acc_{acc['id']}"))
     for rec_uid in get_admin_notification_recipients("account_notices"):
         safe_send(rec_uid, alert_txt, reply_markup=markup)
 
@@ -8882,7 +8882,7 @@ def async_login_account_worker(
             safe_edit_message(
                 f"⚠️ <b>تم حفظ بيانات الحساب '<code>{esc(acc['email'])}</code>' ولكن يتطلب إكمال التحقق.</b>\n"
                 f"🔍 <b>السبب المشخص:</b> {esc(diag_reason)}\n\n"
-                f"💡 <i>اضغط <b>🖥️ الشاشة الحية لحل التحقق بنفسي</b> لتجاوز الفحص البشري مباشرة داخل تلغرام، أو أرسل رمز 2FA، أو استورد الكوكيز.\n"
+                f"💡 <i>اضغط <b>🖥️ الشاشة الحية</b> لتجاوز الفحص البشري مباشرة داخل تلغرام، أو أرسل رمز 2FA، أو استورد الكوكيز.\n"
                 f"⏳ يُحذف الحساب التالف تلقائياً بعد {BROKEN_ACCOUNT_TTL_HOURS} ساعة إن لم يتفعّل.</i>",
                 chat_id, msg_id,
                 reply_markup=fail_markup
@@ -9016,7 +9016,7 @@ def execute_mission_worker(chat_id: int, user_id: int):
                 sep = "&" if "?" in w_url else "?"
                 mk.row(
                     _btn(
-                        "🖥️ فتح الشاشة الحية للتحقق الآن",
+                        "🖥️ الشاشة الحية",
                         style="primary",
                         icon_key="shield",
                         web_app=types.WebAppInfo(url=f"{w_url}{sep}hitl={aid}"),
