@@ -1,5 +1,5 @@
 # بيئة متكاملة لتشغيل Playwright ومتصفح جوجل كروم الحقيقي مع بيئة شاشة سطح مكتب افتراضية Xvfb
-FROM mcr.microsoft.com/playwright/python:v1.49.0-noble
+FROM mcr.microsoft.com/playwright/python:v1.49.0-jammy
 
 WORKDIR /app
 
@@ -10,21 +10,15 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV PORT=7860
 ENV DISPLAY=:99
 
-# تثبيت خادم الشاشة الافتراضية Xvfb وخطوط اللغة العربية والإيموجي
+# تثبيت خادم الشاشة الافتراضية Xvfb والخطوط والأدوات الأساسية بحزم مستقرة 100%
 RUN apt-get update && apt-get install -y --no-install-recommends \
     xvfb \
     x11-utils \
-    libxss1 \
-    libasound2 \
-    libnss3 \
-    fonts-noto-core \
-    fonts-noto-cjk \
-    fonts-noto-extra \
-    fonts-noto-ui-core \
-    fonts-noto-color-emoji \
     wget \
     curl \
+    gnupg \
     ca-certificates \
+    fonts-noto-color-emoji \
     && rm -rf /var/lib/apt/lists/*
 
 # تثبيت متصفح Google Chrome الرسمي
