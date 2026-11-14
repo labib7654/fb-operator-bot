@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: fb-operator-bot
+    runtime: docker
+    dockerfilePath: Dockerfile
+    plan: free
+    region: frankfurt
+    envVars:
+      - key: SUPER_ADMIN_ID
+        value: "7411444902"
+      - key: CLOUD_DB_TYPE
+        value: "supabase"
