@@ -294,10 +294,15 @@ class SmailProEngine:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    def get_messages(self, jwt_key: str, mail_type: str = "gmail") -> List[Dict[str, Any]]:
-        """جلب الرسائل المشفرة عبر API sonjj المباشر"""
-        endpoint = "temp_gmail" if mail_type == "gmail" else "temp_outlook"
-        url = f"{self.API_SONJJ}/{endpoint}/inbox?payload={jwt_key}"
+    def get_messages(self, jwt_key: str, endpoint: str = "temp_gmail") -> List[Dict[str, Any]]:
+        """جلب الرسائل المشفرة عبر API sonjj المباشر مع تحديد الـ endpoint بدقة"""
+        if endpoint in ["gmail", "temp_gmail"]:
+            ep = "temp_gmail"
+        elif endpoint in ["outlook", "temp_outlook", "hotmail"]:
+            ep = "temp_outlook"
+        else:
+            ep = "temp_email"  # مسار Edu والنطاقات المدارة
+        url = f"{self.API_SONJJ}/{ep}/inbox?payload={jwt_key}"
         try:
             resp = requests.get(url, headers={"user-agent": self.session.headers["User-Agent"]}, timeout=15)
             if resp.status_code == 200:
@@ -361,11 +366,15 @@ class MasterTempMailSuite:
         if engine == "tempmail_net":
             return self.tempmail_net.get_messages(mail_obj["email"], mail_obj.get("code", ""))
         elif engine == "smailpro":
-            mail_type = mail_obj.get("mail_type")
-            if not mail_type:
-                dom = mail_obj.get("domain", "") or mail_obj.get("email", "")
-                mail_type = "outlook" if ("outlook" in dom or "hotmail" in dom) else "gmail"
-            return self.smailpro.get_messages(mail_obj.get("jwt_key", ""), mail_type)
+            dom = str(mail_obj.get("domain", "") or mail_obj.get("email", "")).lower()
+            if "gmail" in dom:
+                endpoint = "temp_gmail"
+            elif "outlook" in dom or "hotmail" in dom:
+                endpoint = "temp_outlook"
+            else:
+                endpoint = "temp_email"  # مسار Edu والنطاقات المدارة
+            jwt_key = mail_obj.get("jwt_key") or mail_obj.get("jwt_payload") or mail_obj.get("token") or ""
+            return self.smailpro.get_messages(jwt_key, endpoint=endpoint)
         return []
 
     def extract_otp(self, messages: List[Dict[str, Any]]) -> Optional[str]:

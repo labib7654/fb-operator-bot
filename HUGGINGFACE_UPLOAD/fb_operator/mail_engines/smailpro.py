@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -81,11 +82,13 @@ class SmailProEngine:
         return cls.DOMAINS_MAJOR + cls.DOMAINS_EDU + cls.DOMAINS_MANAGED
 
     @classmethod
-    def create_mailbox(cls, domain: str = "gmail.com", session_cookie: str | None = None, server: int = 1) -> dict[str, Any]:
+    def create_mailbox(cls, domain: str = "gmail.com", username: str | None = None, session_cookie: str | None = None, server: int = 1) -> dict[str, Any]:
         """
         إنشاء بريد جديد بنطاق gmail.com أو outlook.com أو النطاقات الجامعية Edu
         يُرجع قاموس الحساب متضمناً:
         email, key, timestamp, token, provider, expires_at
+        - نطاقات gmail و outlook: تجبر username='random' لأن الموقع يرفض التخصيص فيها بالمجاني
+        - نطاقات Edu والمدارة: تقبل اسم المستخدم المخصص مجاناً
         """
         domain_raw = domain.strip().lower()
         if "gmail" in domain_raw:
@@ -97,7 +100,12 @@ class SmailProEngine:
         else:
             domain_clean = "gmail.com"
 
-        url = f"{cls.BASE_URL}/app/create?username=random&type=alias&domain={domain_clean}&server={server}"
+        if "gmail" in domain_clean or "outlook" in domain_clean or "hotmail" in domain_clean:
+            user_param = "random"
+        else:
+            user_param = username.strip().lower() if username and username.strip() else "random"
+
+        url = f"{cls.BASE_URL}/app/create?username={user_param}&type=alias&domain={domain_clean}&server={server}"
         headers = cls._get_headers(session_cookie)
 
         try:
@@ -154,8 +162,13 @@ class SmailProEngine:
         if not key or not timestamp:
             return []
 
-        mail_type = "gmail" if "gmail" in email.lower() else "outlook"
-        endpoint = "temp_gmail" if mail_type == "gmail" else "temp_outlook"
+        em_lower = email.lower()
+        if "gmail" in em_lower:
+            endpoint = "temp_gmail"
+        elif "outlook" in em_lower or "hotmail" in em_lower:
+            endpoint = "temp_outlook"
+        else:
+            endpoint = "temp_email"  # مسار Edu والنطاقات المدارة
         headers = cls._get_headers(session_cookie)
 
         payload_body = [{
@@ -187,10 +200,12 @@ class SmailProEngine:
             formatted = []
 
             for m in raw_messages:
-                mid = m.get("mid") or m.get("id") or str(time.time())
+                mid = m.get("mid") or m.get("id")
                 sender = m.get("textFrom") or m.get("from") or "Unknown"
                 subject = m.get("textSubject") or m.get("subject") or "بدون عنوان"
                 date_str = m.get("textDate") or m.get("date") or ""
+                if not mid:
+                    mid = hashlib.sha1(f"{email}_{sender}_{subject}_{date_str}".encode()).hexdigest()[:16]
 
                 # جلب محتوى الرسالة الكامل إذا وجد رابط message
                 body_text = subject
