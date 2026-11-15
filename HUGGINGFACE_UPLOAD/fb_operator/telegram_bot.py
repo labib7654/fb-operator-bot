@@ -1442,10 +1442,17 @@ def render_tempmail_main_view(user_id: int) -> tuple[str, types.InlineKeyboardMa
         vip_tag = "⭐ <b>البريد المميز:</b>\n" if active.get("is_vip") else "📬 <b>البريد الحالي:</b>\n"
         expires_info = ""
         if active.get("is_vip"):
-            rem_sec = max(0, int(active.get("expires_at_ts", 0) - time.time()))
-            rem_m = rem_sec // 60
-            rem_s = rem_sec % 60
-            expires_info = f"\n⏳ <b>الصلاحية:</b> {rem_m}:{rem_s:02d} دقيقة (حذف تلقائي إن لم يُستخدم)"
+            exp_ts = active.get("expires_at_ts")
+            if exp_ts is not None:
+                try:
+                    exp_val = float(exp_ts)
+                    if exp_val > 0:
+                        rem_sec = max(0, int(exp_val - time.time()))
+                        rem_m = rem_sec // 60
+                        rem_s = rem_sec % 60
+                        expires_info = f"\n⏳ <b>الصلاحية:</b> {rem_m}:{rem_s:02d} دقيقة (حذف تلقائي إن لم يُستخدم)"
+                except Exception:
+                    pass
         txt = (
             f"{header_title}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -1495,17 +1502,26 @@ def render_tempmail_main_view(user_id: int) -> tuple[str, types.InlineKeyboardMa
 
 def render_tempmail_vip_menu(user_id: int) -> tuple[str, types.InlineKeyboardMarkup]:
     txt = (
-        "⭐ <b>البريد المعتمد (Gmail / Outlook)</b>\n"
+        "⭐ <b>البريد المعتمد والجامعي (Gmail / Outlook / Edu)</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "بريد سريع مخصص للتسجيل في منصات الذكاء الاصطناعي والمواقع العالمية:\n"
+        "بريد رسمي وسريع مخصص للتسجيل في منصات الذكاء الاصطناعي والمواقع العالمية والخصومات الجامعية:\n"
         "• <b>Gmail:</b> @gmail.com\n"
-        "• <b>Outlook:</b> @outlook.com\n\n"
-        "اختر المزود للإنشاء فوراً:"
+        "• <b>Outlook:</b> @outlook.com\n"
+        "• <b>Edu الجامعي:</b> @singapore.edu.pl | @paris.edu.pl\n\n"
+        "اختر المزود أو النطاق للإنشاء فوراً:"
     )
     mk = types.InlineKeyboardMarkup(row_width=2)
     mk.row(
-        types.InlineKeyboardButton("جيميل Gmail 🔴", callback_data="tm_vip_create_gmail"),
-        types.InlineKeyboardButton("أوتلوك Outlook 🔵", callback_data="tm_vip_create_outlook")
+        types.InlineKeyboardButton("🔴 جيميل Gmail", callback_data="tm_vip_create_gmail"),
+        types.InlineKeyboardButton("🔵 أوتلوك Outlook", callback_data="tm_vip_create_outlook")
+    )
+    mk.row(
+        types.InlineKeyboardButton("🎓 سنغافورة Edu", callback_data="tm_vip_create_singapore.edu.pl"),
+        types.InlineKeyboardButton("🎓 باريس Edu", callback_data="tm_vip_create_paris.edu.pl")
+    )
+    mk.row(
+        types.InlineKeyboardButton("🎓 فرنسا Edu", callback_data="tm_vip_create_france.edu.pl"),
+        types.InlineKeyboardButton("🌐 استعراض كافة النطاقات (43+)", callback_data="tm_dompage_0")
     )
     mk.row(types.InlineKeyboardButton("🔙 رجوع لإدارة البريد", callback_data="menu_tempmail"))
     return txt, mk
@@ -1525,7 +1541,7 @@ def render_tempmail_pick_domain_view(user_id: int, page: int = 0) -> tuple[str, 
     page_domains = domains[start_idx:start_idx + per_page]
 
     txt = (
-        f"🌐 <b>اختيار نطاق البريد (23+ نطاقاً)</b>\n"
+        f"🌐 <b>اختيار نطاق البريد (43+ نطاقاً)</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"الصفحة: {page + 1} من {total_pages} | إجمالي النطاقات: {len(domains)}\n"
         f"اضغط على النطاق المطلوب لاختياره وتحديد اسمك:"
@@ -4467,11 +4483,18 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
         return
 
-    elif data in ("tm_vip_create_gmail", "tm_vip_create_outlook"):
+    elif data.startswith("tm_vip_create_"):
         if not is_feature_enabled(user_id, "tempmail") and not is_super_admin(user_id):
             safe_answer(call.id, "⛔ ميزة البريد مغلقة حالياً.", show_alert=True)
             return
-        domain = "gmail.com" if "gmail" in data else "outlook.com"
+        tag = data.replace("tm_vip_create_", "").strip()
+        if tag == "gmail":
+            domain = "gmail.com"
+        elif tag == "outlook":
+            domain = "outlook.com"
+        else:
+            domain = tag
+
         safe_answer(call.id, f"⏳ جاري إنشاء بريد {domain}...")
         try:
             mb = tm_m.create_vip_email(
@@ -4479,7 +4502,7 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
                 domain=domain,
                 auto_delete_sec=0
             )
-            safe_answer(call.id, "✅ تم إنشاء البريد بنجاح!", show_alert=False)
+            safe_answer(call.id, f"✅ تم إنشاء بريد {domain} بنجاح!", show_alert=False)
         except Exception:
             try:
                 mb = tm_m.create_random_email(user_id)
@@ -4487,8 +4510,11 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
             except Exception:
                 safe_answer(call.id, "تعذر إنشاء البريد، حاول مجدداً.", show_alert=True)
                 return
-        txt, mk = render_tempmail_main_view(user_id)
-        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
+        try:
+            txt, mk = render_tempmail_main_view(user_id)
+            safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
+        except Exception as e:
+            logger.error(f"Error rendering main view: {e}")
         return
 
     elif data.startswith("tm_dompage_"):

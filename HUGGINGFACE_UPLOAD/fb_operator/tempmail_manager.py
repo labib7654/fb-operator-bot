@@ -86,18 +86,24 @@ def _get_trash() -> list[dict[str, Any]]:
 
 
 def get_available_domains() -> list[dict[str, str]]:
-    """جلب قائمة النطاقات الـ 23+ المدعومة رسمياً"""
+    """جلب قائمة كافة النطاقات الـ 43+ المدعومة رسمياً"""
     flat = []
-    # 1. النطاقات المفتوحة المجانية بدون كوكيز (Temporary-Mail.net)
+    # 1. النطاقات المفتوحة المجانية بدون كوكيز وبدون حظر (Temporary-Mail.net)
     for d in DOMAINS_CATALOG.get("tempmail_free", []):
         flat.append({"domain": d, "engine": "tempmail_net", "category": "مجاني"})
-    # 2. نطاقات VIP البريميوم
+    # 2. نطاقات VIP البريميوم (Temporary-Mail.net)
     for d in DOMAINS_CATALOG.get("tempmail_vip", []):
         flat.append({"domain": d, "engine": "tempmail_net", "category": "VIP"})
-    # 3. النطاقات الكبرى الرسمية
+    # 3. النطاقات الكبرى الرسمية (Gmail & Outlook)
     for d in DOMAINS_CATALOG.get("major", []):
         flat.append({"domain": d, "engine": "smailpro", "category": "رسمي"})
-    # 4. النطاقات السريعة
+    # 4. نطاقات SmailPro الجامعية والتعليمية Edu
+    for d in DOMAINS_CATALOG.get("smailpro_edu", []):
+        flat.append({"domain": d, "engine": "smailpro", "category": "جامعي Edu"})
+    # 5. نطاقات SmailPro المُدارة الخاصة
+    for d in DOMAINS_CATALOG.get("smailpro_managed", []):
+        flat.append({"domain": d, "engine": "smailpro", "category": "خاص SmailPro"})
+    # 6. النطاقات السريعة (GuerrillaMail)
     for d in DOMAINS_CATALOG.get("guerrilla", []):
         flat.append({"domain": d, "engine": "guerrilla", "category": "سريع"})
     return flat
