@@ -235,7 +235,7 @@ def format_uptime(seconds: float) -> str:
     return f"{s} ثوانٍ"
 
 class HealthAndDashboardHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
+    def _respond(self, is_head: bool = False):
         uptime_str = format_uptime(time.time() - START_TIME)
         path = self.path.split("?")[0].rstrip("/")
 
@@ -246,7 +246,8 @@ class HealthAndDashboardHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            if not is_head:
+                self.wfile.write(body)
             return
 
         if path in ("/health", "/healthz", "/ping", "/status"):
@@ -263,11 +264,27 @@ class HealthAndDashboardHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            if not is_head:
+                self.wfile.write(body)
             return
 
         # أي مسار آخر
         self.send_response(404)
+        self.end_headers()
+
+    def do_HEAD(self):
+        self._respond(is_head=True)
+
+    def do_GET(self):
+        self._respond(is_head=False)
+
+    def do_POST(self):
+        self._respond(is_head=False)
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header("Allow", "GET, HEAD, POST, OPTIONS")
+        self.send_header("Content-Length", "0")
         self.end_headers()
 
     def log_message(self, format, *args):
