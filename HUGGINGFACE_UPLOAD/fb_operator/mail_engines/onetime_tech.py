@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import json
 import random
 import string
@@ -127,8 +128,14 @@ class OneTimeTechEngine:
                     if len(extracted_text) > len(body_text) or not body_text.strip():
                         body_text = extracted_text
 
+                if mid:
+                    stable_id = str(mid)
+                else:
+                    seed = f"{clean_email}_{sender}_{subject}_{date}_{body_text[:50]}"
+                    stable_id = hashlib.sha1(seed.encode("utf-8")).hexdigest()[:16]
+
                 formatted.append({
-                    "id": str(mid or random.random()),
+                    "id": stable_id,
                     "sender": sender,
                     "subject": subject,
                     "date": date,

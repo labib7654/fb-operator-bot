@@ -40,19 +40,37 @@ class SmailProEngine:
             headers["Cookie"] = cookie
         return headers
 
+    DOMAINS_MAJOR = ["gmail.com", "outlook.com", "hotmail.com"]
+    DOMAINS_EDU = ["singapore.edu.pl", "paris.edu.pl", "france.edu.pl"]
+    DOMAINS_MANAGED = [
+        "devpoet.com", "hastana.com", "fenfax.com", "jewby.com",
+        "bogchi.com", "devmant.com", "appbott.com", "animoby.com",
+        "fordemy.com", "meltcoo.com", "brajraj.org", "comproa.org",
+        "damphen.org", "momroad.org", "bussaco.com", "storegmail.net"
+    ]
+
     @classmethod
     def get_domains(cls) -> list[str]:
-        """النطاقات المدعومة في المحرك المميز"""
-        return ["gmail.com", "outlook.com"]
+        """كافة النطاقات المدعومة في محرك SmailPro (العالمية والجامعية والمدارة)"""
+        return cls.DOMAINS_MAJOR + cls.DOMAINS_EDU + cls.DOMAINS_MANAGED
 
     @classmethod
     def create_mailbox(cls, domain: str = "gmail.com", session_cookie: str | None = None, server: int = 1) -> dict[str, Any]:
         """
-        إنشاء بريد جديد بنطاق gmail.com أو outlook.com
+        إنشاء بريد جديد بنطاق gmail.com أو outlook.com أو النطاقات الجامعية Edu
         يُرجع قاموس الحساب متضمناً:
         email, key, timestamp, token, provider, expires_at
         """
-        domain_clean = "gmail.com" if "gmail" in domain.lower() else "outlook.com"
+        domain_raw = domain.strip().lower()
+        if "gmail" in domain_raw:
+            domain_clean = "gmail.com"
+        elif "outlook" in domain_raw or "hotmail" in domain_raw:
+            domain_clean = domain_raw
+        elif domain_raw in cls.DOMAINS_EDU or domain_raw in cls.DOMAINS_MANAGED:
+            domain_clean = domain_raw
+        else:
+            domain_clean = "gmail.com"
+
         url = f"{cls.BASE_URL}/app/create?username=random&type=alias&domain={domain_clean}&server={server}"
         headers = cls._get_headers(session_cookie)
 

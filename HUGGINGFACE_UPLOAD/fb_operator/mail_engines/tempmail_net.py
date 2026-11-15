@@ -28,6 +28,7 @@ class TempMailNetEngine:
     BASE_URL = "https://www.temporary-mail.net"
 
     DOMAINS = [
+        # 🆓 النطاقات المجانية المفتوحة 100%
         "deepmails.org",
         "agogmail.com",
         "rulersonline.com",
@@ -36,7 +37,15 @@ class TempMailNetEngine:
         "inctart.com",
         "deepyinc.com",
         "123mails.org",
-        "besttempmail.com"
+        "besttempmail.com",
+        # 💎 نطاقات الـ VIP البريميوم (بقيمة 20 دولار في الموقع - مفتوحة بالكامل)
+        "pdf-cutter.com",
+        "embassybase.com",
+        "mailsbay.com",
+        "mediaholy.com",
+        "mediaeast.uk",
+        "justdefinition.com",
+        "gongjua.com"
     ]
 
     @classmethod

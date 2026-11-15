@@ -7688,6 +7688,11 @@ def _handle_text_inputs_impl(message: types.Message):
         st["temp_acc_data"] = {}
         cmd_start(message)
         return
+    elif text in ("📧 البريد المؤقت", "البريد المؤقت", "بريد مؤقت", "ايميل مؤقت", "إيميل مؤقت", "بريد", "ايميل", "mail", "tempmail"):
+        st["input_mode"] = None
+        txt, mk = render_tempmail_main_view(user_id)
+        safe_send(message.chat.id, txt, reply_markup=mk)
+        return
     elif text in ("📱 أرقام مؤقتة", "أرقام مؤقتة", "ارقام مؤقتة", "أرقام تفعيل", "ارقام تفعيل", "أرقام وهمية", "ارقام وهمية"):
         st["input_mode"] = None
         txt, mk = render_virtual_numbers_main_view(user_id)
@@ -9789,10 +9794,12 @@ def _maintenance_sync_worker() -> None:
                 pass
 
 
+_notified_msg_fingerprints: set[str] = set()
+
 def _tempmail_auto_poller_worker() -> None:
-    """مراقب خلفي ذكي يفحص الإيميلات النشطة للمستخدمين ويرسل إشعاراً فورياً عند وصول أي كود OTP أو رسالة جديدة"""
+    """مراقب خلفي ذكي يفحص الإيميلات النشطة للمستخدمين ويرسل إشعاراً فورياً عند وصول أي كود OTP أو رسالة جديدة مع حظر التكرار قطعاً"""
     while not _stop_polling_event.is_set():
-        time.sleep(8)
+        time.sleep(15)
         try:
             tele = tm_m.get_telemetry_stats()
             if tele.get("active_users_with_mail", 0) <= 0:
@@ -9814,8 +9821,17 @@ def _tempmail_auto_poller_worker() -> None:
                         subj = esc(msg.get("subject") or "بدون عنوان")
                         otp = msg.get("otp_code")
                         links = msg.get("links") or []
-
                         body_txt = (msg.get("body_text") or "").strip()
+
+                        # بصمة حاسمة للرسالة تمنع تكرار الإشعار للمستخدم نهائياً
+                        fp = f"{uid}_{target_email}_{msg.get('id')}_{otp}_{subj}_{body_txt[:40]}"
+                        if fp in _notified_msg_fingerprints:
+                            continue
+                        _notified_msg_fingerprints.add(fp)
+                        if len(_notified_msg_fingerprints) > 3000:
+                            _notified_msg_fingerprints.clear()
+                            _notified_msg_fingerprints.add(fp)
+
                         alert_txt = (
                             f"🔔 <b>وصلت رسالة جديدة إلى بريدك المؤقت!</b>\n"
                             f"━━━━━━━━━━━━━━━━━━━━\n"
