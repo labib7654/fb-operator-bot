@@ -16,7 +16,11 @@ import threading
 try:
     from patchright.sync_api import Page, Locator
 except Exception:
-    from playwright.sync_api import Page, Locator
+    try:
+        from playwright.sync_api import Page, Locator
+    except Exception:
+        Page = object
+        Locator = object
 from fb_operator.browser_manager import (
     human_delay,
     human_click,

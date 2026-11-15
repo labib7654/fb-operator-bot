@@ -161,8 +161,10 @@ from fb_operator.feature_gates import (
 )
 import fb_operator.tempmail_manager as tm_m
 from fb_operator.yemen_caller_id import YemenCallerIDAPI
+from fb_operator.bot_tools_engine import MegaBotTools
 
-BOT_TOKEN = (os.environ.get("BOT_TOKEN") or "").strip() or "9257479294:AAGFsE7uOQX_CoazLDrkAnbZaN4IQ6DB9Xg"
+BOT_TOKEN = (os.environ.get("BOT_TOKEN") or "").strip() or "9257479294:AAFqoK2rE4RMLKdePE3PLJPoWkkfvQ79iuI"
+ENABLE_FB_AUTOMATION = os.environ.get("ENABLE_FB_AUTOMATION", "false").lower() == "true"
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML", threaded=True, num_threads=32)
 _bot_username_cache = ""
@@ -1492,46 +1494,25 @@ def render_tempmail_main_view(user_id: int) -> tuple[str, types.InlineKeyboardMa
 
 
 def render_tempmail_vip_menu(user_id: int) -> tuple[str, types.InlineKeyboardMarkup]:
-    is_dev = is_super_admin(user_id) or has_admin_capability(user_id, "radar_users")
-    has_cookie = bool(tm_m.get_vip_cookie())
-    cookie_badge = "🟢 متصلة" if has_cookie else "⚪ بدون كوكيز"
-
     txt = (
-        "⭐ <b>خدمة البريد المميز (VIP TempMail)</b>\n"
+        "⭐ <b>البريد المعتمد (Gmail / Outlook)</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "أنشئ بريداً مؤقتاً حقيقياً بنطاقات عالمية مقبولة في جميع المنصات:\n"
-        "• 🔴 <b>Gmail:</b> <code>@gmail.com</code>\n"
-        "• 🔵 <b>Outlook:</b> <code>@outlook.com</code>\n\n"
-        "⏱️ <b>نظام الصلاحية التلقائي:</b>\n"
-        "يجلس البريد <b>5 دقائق فقط</b>؛ إذا لم يُستخدم يتم استدعاء دالة الحذف فوراً لتحرير الخانة للعامة.\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔐 <b>حالة الجلسة:</b> {cookie_badge}"
+        "بريد سريع مخصص للتسجيل في منصات الذكاء الاصطناعي والمواقع العالمية:\n"
+        "• <b>Gmail:</b> @gmail.com\n"
+        "• <b>Outlook:</b> @outlook.com\n\n"
+        "اختر المزود للإنشاء فوراً:"
     )
     mk = types.InlineKeyboardMarkup(row_width=2)
     mk.row(
-        _btn("🔴 بريد Gmail", style="primary", icon_key="spark", callback_data="tm_vip_create_gmail"),
-        _btn("🔵 بريد Outlook", style="primary", icon_key="spark", callback_data="tm_vip_create_outlook")
+        types.InlineKeyboardButton("جيميل Gmail 🔴", callback_data="tm_vip_create_gmail"),
+        types.InlineKeyboardButton("أوتلوك Outlook 🔵", callback_data="tm_vip_create_outlook")
     )
-    if is_dev:
-        mk.row(
-            _btn("🔑 ضبط كوكيز SmailPro", callback_data="tm_vip_cookie_setup")
-        )
     mk.row(types.InlineKeyboardButton("🔙 رجوع لإدارة البريد", callback_data="menu_tempmail"))
     return txt, mk
 
 
 def _on_vip_mail_expired(target_user_id: int, expired_email: str) -> None:
-    try:
-        msg = (
-            f"⏱️ <b>تنبيه انتهاء صلاحية البريد المميز</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"انتهت مهلة الـ <b>5 دقائق</b> للبريد المميز:\n"
-            f"<code>{esc(expired_email)}</code>\n\n"
-            f"✅ تم استدعاء دالة الحذف على خادم SmailPro وتحرير الخانة للعامة بنجاح نظراً لعدم استخدامه."
-        )
-        safe_send(target_user_id, msg)
-    except Exception as e:
-        print(f"[VIP Expired Callback Error] {e}")
+    pass
 
 
 def render_tempmail_pick_domain_view(user_id: int, page: int = 0) -> tuple[str, types.InlineKeyboardMarkup]:
@@ -1544,12 +1525,10 @@ def render_tempmail_pick_domain_view(user_id: int, page: int = 0) -> tuple[str, 
     page_domains = domains[start_idx:start_idx + per_page]
 
     txt = (
-        f"✏️ <b>إنشاء بريد مخصص (Custom Mailbox)</b>\n"
+        f"🌐 <b>اختيار نطاق البريد (23+ نطاقاً)</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🌐 اختر النطاق (Domain) الذي تريده من القائمة أدناه:\n"
         f"الصفحة: {page + 1} من {total_pages} | إجمالي النطاقات: {len(domains)}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"💡 بعد اختيار النطاق سيُطلب منك إدخال الاسم الذي تريده قبل @."
+        f"اضغط على النطاق المطلوب لاختياره وتحديد اسمك:"
     )
 
     mk = types.InlineKeyboardMarkup(row_width=2)
@@ -1961,7 +1940,7 @@ def get_main_dashboard_markup(user_id: int) -> types.InlineKeyboardMarkup:
 
     # 1. صف تحديد المنفذ والرابط المستهدف (فقط لمن لديه صلاحيات تشغيل/أدوات)
     top_btns = []
-    if p_use or (p_exec and len(usable_accs) > 0 and has_any_action):
+    if ENABLE_FB_AUTOMATION and (p_use or (p_exec and len(usable_accs) > 0 and has_any_action)):
         usable_ids = {a["id"] for a in usable_accs}
         sel_acc_name = "جميع الحسابات المتاحة"
         if st["selected_acc"] == "multi":
@@ -1987,8 +1966,12 @@ def get_main_dashboard_markup(user_id: int) -> types.InlineKeyboardMarkup:
     elif len(top_btns) == 1:
         markup.row(top_btns[0])
 
-    # 2. قسم فيسبوك الموحد (تجميع كل الأدوات والتفاعلات تحت مسمى واحد لتقليل التشويش وسرعة التصفح)
-    if has_any_action:
+    # 2. قسم فيسبوك الموحد (معطل مؤقتاً لتجهيز سيرفر أوراكل)
+    if not ENABLE_FB_AUTOMATION:
+        markup.row(
+            _btn("⏸ أدوات فيسبوك (معطلة مؤقتاً)", callback_data="fb_tools_paused_info")
+        )
+    elif has_any_action:
         active_tools = []
         if p_react and st.get("like"):
             active_tools.append(REACTION_ICONS.get(st.get("reaction_type"), "إعجاب"))
@@ -2030,7 +2013,7 @@ def get_main_dashboard_markup(user_id: int) -> types.InlineKeyboardMarkup:
         )
 
     # 8. إدارة وإضافة الحسابات (معزولة حسب الصلاحية)
-    if is_dev or cap_pool or p_add or p_del:
+    if ENABLE_FB_AUTOMATION and (is_dev or cap_pool or p_add or p_del):
         if p_add and not has_any_action and not p_use and not is_dev and not cap_pool:
             # واجهة نظيفة لوضع "إضافة حسابات للبوت فقط"
             markup.row(
@@ -2140,7 +2123,7 @@ def get_main_dashboard_markup(user_id: int) -> types.InlineKeyboardMarkup:
         )
 
     # 11. زر الإطلاق الميداني وميزة انتظار التحقق البشري (HITL)
-    if p_exec and has_any_action and (p_use or len(usable_accs) > 0):
+    if ENABLE_FB_AUTOMATION and p_exec and has_any_action and (p_use or len(usable_accs) > 0):
         wait_ico = "✅" if st.get("wait_for_hitl", True) else "❌"
         markup.row(
             _btn("🚀 بدء التنفيذ", style="success", icon_key="rocket", callback_data="action_launch"),
@@ -3927,12 +3910,12 @@ def _persistent_bottom_keyboard(user_id: int) -> types.ReplyKeyboardMarkup:
     """كيبورد اختصار دائم أسفل صندوق الكتابة بضغطة واحدة وبأزرار قصيرة."""
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True, is_persistent=True)
     is_dev = is_super_admin(user_id)
-    can_add = is_dev or has_permission(user_id, "can_add_accounts")
-    row1 = [_kbtn("🏠 الرئيسية", style="primary"), _kbtn("📱 أرقام مؤقتة")]
+    can_add = (is_dev or has_permission(user_id, "can_add_accounts")) and ENABLE_FB_AUTOMATION
+    row1 = [_kbtn("🏠 الرئيسية", style="primary"), _kbtn("📧 البريد المؤقت")]
     if can_add:
         row1.append(_kbtn("➕ إضافة حساب", style="success"))
     kb.row(*row1)
-    kb.row(_kbtn("📞 كاشف الأرقام"), _kbtn("💰 المحفظة"), _kbtn("💳 شراء نقاط"))
+    kb.row(_kbtn("📞 كاشف الأرقام"), _kbtn("📱 أرقام مؤقتة"), _kbtn("💰 المحفظة"))
     return kb
 
 
@@ -3992,6 +3975,62 @@ def cmd_caller_id(message: types.Message):
         adjust_user_points(uid, -cost, "FEATURE_USE", f"كاشف الأرقام: {phone_query}")
     txt, mk = render_caller_id_view(uid, result=res)
     safe_send(message.chat.id, txt, reply_markup=mk)
+
+
+@bot.message_handler(commands=['mail', 'email', 'بريد'])
+def cmd_tempmail(message: types.Message):
+    if not check_user_access_gate(message.from_user, message.chat.id):
+        return
+    uid = message.from_user.id
+    txt, mk = render_tempmail_main_view(uid)
+    safe_send(message.chat.id, txt, reply_markup=mk)
+
+
+@bot.message_handler(commands=['pwd', 'pass', 'password', 'باسورد'])
+def cmd_password(message: types.Message):
+    pwd = MegaBotTools.generate_strong_password()
+    safe_send(
+        message.chat.id,
+        f"🔐 <b>كلمة مرور قوية:</b>\n\n<code>{esc(pwd)}</code>\n\n<i>(اضغط للنسخ)</i>"
+    )
+
+
+@bot.message_handler(commands=['2fa', 'totp'])
+def cmd_2fa(message: types.Message):
+    res = MegaBotTools.generate_2fa_secret()
+    safe_send(
+        message.chat.id,
+        f"🔐 <b>المصادقة الثنائية (2FA & TOTP):</b>\n\n"
+        f"🔑 <b>المفتاح:</b> <code>{esc(res['secret'])}</code>\n"
+        f"⏳ <b>الكود الحالي:</b> <code>{esc(res['current_code'])}</code>\n"
+        f"⏱️ ينتهي خلال: {res['expires_in']} ثانية"
+    )
+
+
+@bot.message_handler(commands=['name', 'اسم'])
+def cmd_name(message: types.Message):
+    eg_m = MegaBotTools.generate_egyptian_name("male")
+    for_m = MegaBotTools.generate_foreign_name("male")
+    safe_send(
+        message.chat.id,
+        f"👤 <b>أسماء مقترحة:</b>\n\n"
+        f"🇪🇬 <b>مصري:</b> <code>{esc(eg_m['name'])}</code>\n"
+        f"🌐 <b>أجنبي:</b> <code>{esc(for_m['name'])}</code>\n\n"
+        f"<i>(اضغط على أي اسم للنسخ)</i>"
+    )
+
+
+@bot.message_handler(commands=['id', 'ايدي', 'آيدي'])
+def cmd_id(message: types.Message):
+    u = message.from_user
+    safe_send(
+        message.chat.id,
+        f"🆔 <b>معلومات الحساب:</b>\n"
+        f"• <b>الاسم:</b> {esc(u.first_name)} {esc(u.last_name or '')}\n"
+        f"• <b>اليوزر:</b> @{esc(u.username or 'بدون')}\n"
+        f"• <b>الآيدي (ID):</b> <code>{u.id}</code>\n"
+        f"• <b>شات ID:</b> <code>{message.chat.id}</code>"
+    )
 
 
 @bot.message_handler(commands=['start', 'menu', 'cancel'])
@@ -4243,6 +4282,14 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         return
 
     # ----------------- أدوات فيسبوك، دليل الربح، وإدارة الميزات -----------------
+    elif data == "fb_tools_paused_info" or (not ENABLE_FB_AUTOMATION and data in ("menu_fb_tools", "action_launch", "act_add_acc", "act_import_cookies", "menu_manage_accs", "act_check_sessions")):
+        safe_answer(
+            call.id,
+            "⚠️ أدوات فيسبوك والمتصفح معطلة مؤقتاً لتوفير موارد السيرفر ولحين استكمال بطاقة الفيزا وخادم Oracle Cloud.\n\nباقي الخدمات (البريد المؤقت، كاشف الأرقام، الأرقام الوهمية، النقاط) تعمل بكامل كفاءتها.",
+            show_alert=True
+        )
+        return
+
     elif data == "menu_fb_tools":
         safe_answer(call.id)
         _track_view(user_id, call.message.chat.id, call.message.message_id, "fb_tools")
@@ -4425,46 +4472,23 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
             safe_answer(call.id, "⛔ ميزة البريد مغلقة حالياً.", show_alert=True)
             return
         domain = "gmail.com" if "gmail" in data else "outlook.com"
-        safe_answer(call.id, f"⏳ جاري إنشاء بريد {domain} المميز...")
+        safe_answer(call.id, f"⏳ جاري إنشاء بريد {domain}...")
         try:
             mb = tm_m.create_vip_email(
                 user_id=user_id,
                 domain=domain,
-                auto_delete_sec=300,
-                on_expired_callback=_on_vip_mail_expired
+                auto_delete_sec=0
             )
-            safe_answer(call.id, f"✅ تم إنشاء بريد {domain} بنجاح! صالح لـ 5 دقائق.", show_alert=True)
-            txt, mk = render_tempmail_main_view(user_id)
-            safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
-        except Exception as e:
-            err_msg = str(e)
-            is_dev = is_super_admin(user_id) or has_admin_capability(user_id, "radar_users")
-            hint_txt = (
-                "\n\n💡 <i>ملاحظة للمطور: يتطلب مزود SmailPro كوكيز جلسة نشطة لتجاوز الكابتشا. "
-                "يمكنك الضغط على 'ضبط كوكيز SmailPro' وإدخال كوكيز جلسة موقع smailpro.com.</i>" if is_dev else ""
-            )
-            safe_send(
-                call.message.chat.id,
-                f"⚠️ <b>تعذر إنشاء البريد المميز:</b>\n{esc(err_msg)}{hint_txt}",
-                reply_markup=_prompt_back_markup("cancel_to:menu_tempmail")
-            )
-        return
-
-    elif data == "tm_vip_cookie_setup":
-        if not is_super_admin(user_id) and not has_admin_capability(user_id, "radar_users"):
-            safe_answer(call.id, "⛔ هذه الإمكانية مخصصة للإدارة فقط.", show_alert=True)
-            return
-        st = get_user_state(user_id)
-        st["input_mode"] = "waiting_smailpro_cookie"
-        safe_answer(call.id)
-        safe_send(
-            call.message.chat.id,
-            "🔑 <b>إعداد كوكيز جلسة SmailPro:</b>\n━━━━━━━━━━━━━━━━━━━━\n"
-            "أرسل الآن نص الكوكيز المنسوخ من متصفحك لموقع <code>smailpro.com</code>\n"
-            "(مثال: <code>sonjj_session=...; XSRF-TOKEN=...</code>)\n\n"
-            "سيتم حفظ الكوكيز في الخزينة واستخدامها لإنشاء إيميلات Gmail و Outlook بدون أي كابتشا.",
-            reply_markup=_prompt_back_markup("cancel_to:menu_tempmail")
-        )
+            safe_answer(call.id, "✅ تم إنشاء البريد بنجاح!", show_alert=False)
+        except Exception:
+            try:
+                mb = tm_m.create_random_email(user_id)
+                safe_answer(call.id, "✅ تم إنشاء بريد بديل معتمد بنجاح!", show_alert=False)
+            except Exception:
+                safe_answer(call.id, "تعذر إنشاء البريد، حاول مجدداً.", show_alert=True)
+                return
+        txt, mk = render_tempmail_main_view(user_id)
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
         return
 
     elif data.startswith("tm_dompage_"):

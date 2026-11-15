@@ -3,19 +3,22 @@ from .tempmail_io import TempMailIoEngine
 from .mail_tm import MailTmEngine
 from .guerrillamail import GuerrillaMailEngine
 from .smailpro import SmailProEngine
+from .tempmail_net import TempMailNetEngine
 
 class MailEngineManager:
     """
     المنسق الشامل لمحركات البريد المؤقت (Unified Multi-Engine Orchestrator)
     يجمع محركات:
-    1. Instant Mail (1timetech)
-    2. Temp-Mail.io
-    3. Mail.tm
-    4. GuerrillaMail
-    5. SmailPro (Gmail & Outlook VIP)
+    1. Temporary-Mail.net (9 نطاقات مجانية تشمل deepmails.org)
+    2. Instant Mail (1timetech)
+    3. Temp-Mail.io
+    4. Mail.tm
+    5. GuerrillaMail
+    6. SmailPro (Gmail & Outlook VIP)
     مع دعم التبديل التلقائي عند تعثر أي سيرفر وجمع النطاقات الشائعة والمميزة.
     """
     ENGINES = {
+        TempMailNetEngine.NAME: TempMailNetEngine,
         OneTimeTechEngine.NAME: OneTimeTechEngine,
         TempMailIoEngine.NAME: TempMailIoEngine,
         MailTmEngine.NAME: MailTmEngine,
@@ -25,6 +28,7 @@ class MailEngineManager:
 
     # ترتيب الأولوية في الفحص التلقائي
     PRIORITY_ORDER = [
+        TempMailNetEngine.NAME,
         OneTimeTechEngine.NAME,
         TempMailIoEngine.NAME,
         MailTmEngine.NAME,

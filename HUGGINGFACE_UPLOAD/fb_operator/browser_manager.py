@@ -18,8 +18,14 @@ try:
     from patchright.sync_api import sync_playwright, BrowserContext, Page
     USING_PATCHRIGHT = True
 except Exception:
-    from playwright.sync_api import sync_playwright, BrowserContext, Page
-    USING_PATCHRIGHT = False
+    try:
+        from playwright.sync_api import sync_playwright, BrowserContext, Page
+        USING_PATCHRIGHT = False
+    except Exception:
+        sync_playwright = None
+        BrowserContext = object
+        Page = object
+        USING_PATCHRIGHT = False
 from fb_operator.config import DEFAULT_MIN_DELAY, DEFAULT_MAX_DELAY, PROFILES_DIR, SESSIONS_DIR
 
 _LOGIN_ERROR_LOCK = threading.Lock()

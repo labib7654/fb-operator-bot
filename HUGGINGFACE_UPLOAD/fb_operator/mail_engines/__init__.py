@@ -5,6 +5,7 @@ from .tempmail_io import TempMailIoEngine
 from .mail_tm import MailTmEngine
 from .guerrillamail import GuerrillaMailEngine
 from .smailpro import SmailProEngine
+from .tempmail_net import TempMailNetEngine
 
 __all__ = [
     "MailEngineManager",
@@ -12,5 +13,6 @@ __all__ = [
     "TempMailIoEngine",
     "MailTmEngine",
     "GuerrillaMailEngine",
-    "SmailProEngine"
+    "SmailProEngine",
+    "TempMailNetEngine"
 ]
