@@ -444,10 +444,11 @@ def check_inbox(user_id: int, email: str | None = None) -> list[dict[str, Any]]:
 
         for m in api_messages:
             mid = str(m.get("id") or m.get("mid") or "")
-            body_txt = str(m.get("body") or m.get("body_text") or m.get("text") or "")
-            body_html = str(m.get("body_html") or m.get("html") or body_txt)
+            raw_body = str(m.get("body") or m.get("body_text") or m.get("text") or "")
+            body_html = str(m.get("body_html") or m.get("html") or raw_body)
+            body_txt = OtpExtractor.clean_html(raw_body) if ("<" in raw_body and ">" in raw_body) else raw_body
             subj = str(m.get("subject") or "")
-            otp = m.get("otp") or OtpExtractor.extract_otp(f"{subj} {body_txt}", body_html)
+            otp = OtpExtractor.extract_otp(f"{subj} {body_txt}", body_html) or m.get("otp")
             act_link = m.get("action_link")
             links = [act_link] if act_link else OtpExtractor.extract_links(body_txt, body_html)
 

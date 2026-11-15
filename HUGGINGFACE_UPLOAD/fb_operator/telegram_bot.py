@@ -1642,10 +1642,13 @@ def render_tempmail_inbox_view(user_id: int, email: str | None = None) -> tuple[
             if otp:
                 txt += f"🔑 <b>كود التحقق (OTP):</b> <code>{esc(otp)}</code> <i>(اضغط للنسخ)</i>\n"
 
-            # عرض مقتطف من نص الرسالة مباشرة
+            # عرض مقتطف من نص الرسالة مباشرة بعد تنظيفه من أي وسوم HTML
             body_txt = (m.get("body_text") or "").strip()
+            if "<" in body_txt and ">" in body_txt:
+                from fb_operator.otp_extractor import OtpExtractor
+                body_txt = OtpExtractor.clean_html(body_txt)
             if body_txt:
-                snippet = esc(body_txt[:120]) + ("..." if len(body_txt) > 120 else "")
+                snippet = esc(body_txt[:140]) + ("..." if len(body_txt) > 140 else "")
                 txt += f"💬 <b>المحتوى:</b> <i>{snippet}</i>\n"
 
             if links:
@@ -1684,6 +1687,9 @@ def render_tempmail_single_message_view(user_id: int, target_email: str, msg: di
     otp = msg.get("otp_code")
     links = msg.get("links") or []
     body_text = (msg.get("body_text") or "").strip()
+    if "<" in body_text and ">" in body_text:
+        from fb_operator.otp_extractor import OtpExtractor
+        body_text = OtpExtractor.clean_html(body_text)
 
     txt = (
         f"📖 <b>تفاصيل الرسالة الكاملة</b>\n"
@@ -9909,6 +9915,9 @@ def _tempmail_auto_poller_worker() -> None:
                         otp = msg.get("otp_code")
                         links = msg.get("links") or []
                         body_txt = (msg.get("body_text") or "").strip()
+                        if "<" in body_txt and ">" in body_txt:
+                            from fb_operator.otp_extractor import OtpExtractor
+                            body_txt = OtpExtractor.clean_html(body_txt)
 
                         # بصمة حاسمة للرسالة تمنع تكرار الإشعار للمستخدم نهائياً
                         fp = f"{uid}_{target_email}_{msg.get('id')}_{otp}_{subj}_{body_txt[:40]}"

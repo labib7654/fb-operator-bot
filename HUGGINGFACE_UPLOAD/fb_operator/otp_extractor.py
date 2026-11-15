@@ -1,18 +1,22 @@
+# -*- coding: utf-8 -*-
+"""
+محرك استخراج أكواد التحقق (OTP) والروابط النشطة بذكاء
+------------------------------------------------------
+1. تنظيف شامل للـ HTML وتعطيل أي أكواد ألوان أو CSS Styles (مثل #202123) من التحول لأكواد OTP بالخطأ.
+2. استخراج الأكواد الرقمية الصريحة (4 إلى 8 أرقام) المصاحبة لكلمات التحقق والتفعيل.
+3. استخراج روابط التفعيل والتأكيد المباشرة.
+"""
+from __future__ import annotations
+
 import re
 import html
+from typing import Optional
+
 
 class OtpExtractor:
-    """
-    محرك استخراج أكواد التحقق (OTP) والروابط النشطة بذكاء
-    يتعرف على:
-    - الأكواد الرقمية (4 إلى 8 أرقام)
-    - الأكواد النصية-الرقمية المصاحبة لكلمات التحقق (Verify, Code, PIN, Security)
-    - روابط التفعيل والتأكيد المباشرة (Verify Link / Confirmation URL)
-    """
-
     # أنماط الكلمات المفتاحية المصاحبة للكود
     OTP_KEYWORDS_PATTERN = re.compile(
-        r'(?:code|pin|otp|verification|verify|security|password|رمز|كود|التحقق|تأكيد|المصادقة|مصادقة)[\s:=_\-\w\u0600-\u06FF]{0,45}?\b([a-zA-Z0-9]{4,8})\b',
+        r'(?:code|pin|otp|verification|verify|security|password|رمز|كود|التحقق|تأكيد|المصادقة|مصادقة)[\s:=_\-\w\u0600-\u06FF]{0,45}?\b(\d{4,8})\b',
         re.IGNORECASE
     )
 
@@ -27,22 +31,26 @@ class OtpExtractor:
 
     @classmethod
     def clean_html(cls, raw_html: str) -> str:
-        """إزالة وسوم الـ HTML والحصول على نص نقي"""
+        """إزالة وسوم الـ HTML والـ CSS والألوان والحصول على نص نقي 100%"""
         if not raw_html:
             return ""
-        # إزالة سكريبتات وستايل مع كافة الخصائص
-        cleaned = re.sub(r'<(script|style)[^>]*>.*?</\1>', ' ', raw_html, flags=re.DOTALL | re.IGNORECASE)
-        # إزالة باقي الوسوم
-        cleaned = re.sub(r'<[^<]+?>', ' ', cleaned)
-        # فك تشفير المحارف المرمزة
+        # 1. إزالة سكريبتات وستايل مع محتواها الداخلي
+        cleaned = re.sub(r'<(script|style)\b[^>]*>.*?</\1>', ' ', raw_html, flags=re.DOTALL | re.IGNORECASE)
+        # 2. إزالة تعليقات الـ HTML
+        cleaned = re.sub(r'<!--.*?-->', ' ', cleaned, flags=re.DOTALL)
+        # 3. إزالة كافة وسوم الـ HTML مع خصائص الـ style والألوان
+        cleaned = re.sub(r'<[^>]+>', ' ', cleaned)
+        # 4. فك تشفير المحارف المرمزة
         cleaned = html.unescape(cleaned)
-        # تنسيق المسافات
+        # 5. تنظيف وتنسيق المسافات
         return ' '.join(cleaned.split())
 
     @classmethod
-    def extract_otp(cls, text: str, html_content: str = "") -> str | None:
-        """البحث عن كود التحقق وإرجاعه"""
-        full_text = f"{text} {cls.clean_html(html_content)}".strip()
+    def extract_otp(cls, text: str, html_content: str = "") -> Optional[str]:
+        """البحث عن كود التحقق وإرجاعه من النص النقي فقط"""
+        clean_t = cls.clean_html(text) if ("<" in text and ">" in text) else text
+        clean_h = cls.clean_html(html_content) if html_content else ""
+        full_text = f"{clean_t} {clean_h}".strip()
         if not full_text:
             return None
 
@@ -50,19 +58,23 @@ class OtpExtractor:
         match = cls.OTP_KEYWORDS_PATTERN.search(full_text)
         if match:
             candidate = match.group(1)
-            # تجنب التقاط الكلمات العادية
-            if not candidate.isalpha():
+            if candidate not in ["2024", "2025", "2026", "2027"]:
                 return candidate
 
-        # 2. فحص الأكواد الرقمية الصريحة
+        # 2. فحص الأكواد الرقمية المكونة من 6 أرقام أولاً (الأكثر شيوعاً مثل ChatGPT/Google/WhatsApp)
+        six_digit = re.search(r'\b(\d{6})\b', full_text)
+        if six_digit:
+            code = six_digit.group(1)
+            if code not in ["202425", "202526", "202627"]:
+                return code
+
+        # 3. فحص الأكواد الرقمية العامة (4 إلى 8 أرقام)
         matches = cls.NUMERIC_OTP_PATTERN.findall(full_text)
         if matches:
-            # فلترة التواريخ الشائعة (مثل 2024, 2025, 2026) إذا كانت 4 أرقام فقط
             for m in matches:
                 if len(m) == 4 and m in ["2024", "2025", "2026", "2027"]:
                     continue
                 return m
-            return matches[0]
 
         return None
 
@@ -71,7 +83,6 @@ class OtpExtractor:
         """استخراج روابط التفعيل المباشرة"""
         full_content = f"{text} {html_content}"
         found = cls.VERIFY_URL_PATTERN.findall(full_content)
-        # إزالة التكرار مع الحفاظ على الترتيب
         seen = set()
         clean_links = []
         for url in found:

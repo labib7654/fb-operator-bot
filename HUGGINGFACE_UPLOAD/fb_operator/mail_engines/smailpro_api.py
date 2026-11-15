@@ -330,12 +330,15 @@ class SmailProAPI:
     def extract_otp(text: str) -> Optional[str]:
         if not text:
             return None
-        clean_text = re.sub(r"<style\b[^>]*>.*?</style>", "", text, flags=re.DOTALL)
-        clean_text = re.sub(r"<script\b[^>]*>.*?</script>", "", clean_text, flags=re.DOTALL)
+        import html as _html
+        clean_text = re.sub(r"<(style|script)\b[^>]*>.*?</\1>", " ", text, flags=re.DOTALL | re.IGNORECASE)
+        clean_text = re.sub(r"<!--.*?-->", " ", clean_text, flags=re.DOTALL)
         clean_text = re.sub(r"<[^>]+>", " ", clean_text)
+        clean_text = _html.unescape(clean_text)
+        clean_text = ' '.join(clean_text.split())
 
         patterns = [
-            r"(?:code|otp|رمز|كود|verification|pin|secret|passcode|confirmation|المصادقة)[^\d\n\r]{0,30}(\b\d{4,8}\b)",
+            r"(?:code|otp|رمز|كود|verification|pin|secret|passcode|confirmation|المصادقة)[^\d\n\r]{0,35}(\b\d{4,8}\b)",
             r"(\b\d{6}\b)",
             r"(\b\d{4,5}\b)",
             r"(\b\d{7,8}\b)"
