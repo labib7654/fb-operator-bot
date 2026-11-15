@@ -4502,14 +4502,10 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
                 domain=domain,
                 auto_delete_sec=0
             )
-            safe_answer(call.id, f"✅ تم إنشاء بريد {domain} بنجاح!", show_alert=False)
-        except Exception:
-            try:
-                mb = tm_m.create_random_email(user_id)
-                safe_answer(call.id, "✅ تم إنشاء بريد بديل معتمد بنجاح!", show_alert=False)
-            except Exception:
-                safe_answer(call.id, "تعذر إنشاء البريد، حاول مجدداً.", show_alert=True)
-                return
+            safe_answer(call.id, f"✅ تم إنشاء بريد {mb.get('email')} بنجاح!", show_alert=False)
+        except Exception as e:
+            safe_answer(call.id, f"❌ تعذر إنشاء بريد {domain}: {e}", show_alert=True)
+            return
         try:
             txt, mk = render_tempmail_main_view(user_id)
             safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)

@@ -18,6 +18,7 @@
 
 import requests
 import re
+import os
 import time
 import random
 import json
@@ -203,6 +204,38 @@ class SmailProEngine:
         self.has_cookies = False
         if cookies:
             self.set_cookies(cookies)
+        else:
+            self.auto_load_cookies()
+
+    def auto_load_cookies(self):
+        """تحميل الكوكيز تلقائياً من البيئة أو الملفات المحلية"""
+        # 1. متغير البيئة
+        c_env = os.environ.get("SMAILPRO_COOKIE", "").strip()
+        if c_env:
+            self.set_cookies(c_env)
+            return
+
+        # 2. ملفات smailpro_cookie.txt
+        from pathlib import Path
+        for d in [Path(__file__).parent, Path(__file__).parent.parent, Path(".")]:
+            cf = d / "smailpro_cookie.txt"
+            if cf.exists():
+                try:
+                    c = cf.read_text(encoding="utf-8").strip()
+                    if c:
+                        self.set_cookies(c)
+                        return
+                except Exception:
+                    pass
+
+        # 3. من مدير البريد
+        try:
+            import fb_operator.tempmail_manager as tm_m
+            c_mgr = tm_m.get_vip_cookie()
+            if c_mgr:
+                self.set_cookies(c_mgr)
+        except Exception:
+            pass
 
     def set_cookies(self, raw_cookies: str):
         """تعيين كوكيز الجلسة لتجاوز حظر الكابتشا في SmailPro"""
@@ -298,41 +331,25 @@ class MasterTempMailSuite:
 
         # 1. طلب Gmail
         if dom in ["gmail", "gmail.com"]:
-            if self.smailpro.has_cookies:
-                res = self.smailpro.create_mailbox("gmail.com")
-                if res.get("success"):
-                    return res
-            # البديل الفوري المضمون: نطاق gmail10p.com المعتمد والمقبول في ChatGPT
-            try:
-                try:
-                    from .onetime_tech import OneTimeTechEngine
-                except Exception:
-                    from fb_operator.mail_engines.onetime_tech import OneTimeTechEngine
-                mb_1t = OneTimeTechEngine.create_mailbox(domain="gmail10p.com")
-                if mb_1t and mb_1t.get("email"):
-                    return {
-                        "success": True,
-                        "email": mb_1t["email"],
-                        "token": "",
-                        "domain": "gmail10p.com",
-                        "engine": "1timetech"
-                    }
-            except Exception:
-                pass
-            # الخطة البديلة المفتوحة: deepmails.org
-            return self.tempmail_net.create_custom_email(username=username, domain="deepmails.org")
+            res = self.smailpro.create_mailbox("gmail.com")
+            if res.get("success"):
+                return res
+            # محاولة أخيرة عبر Temporary-Mail.net
+            res_alias = self.tempmail_net.create_gmail_alias()
+            if res_alias.get("success"):
+                return res_alias
+            return res
 
         # 2. طلب Outlook أو Hotmail
         elif dom in ["outlook", "outlook.com", "hotmail", "hotmail.com"]:
-            if self.smailpro.has_cookies:
-                res = self.smailpro.create_mailbox("outlook.com")
-                if res.get("success"):
-                    return res
-            return self.tempmail_net.create_custom_email(username=username, domain="agogmail.com")
+            dom_target = "outlook.com" if "outlook" in dom else "hotmail.com"
+            res = self.smailpro.create_mailbox(dom_target)
+            return res
 
         # 3. طلب نطاقات SmailPro التعليمية (Edu) أو النطاقات المدارة
         elif dom in DOMAINS_CATALOG.get("smailpro_edu", []) or dom in DOMAINS_CATALOG.get("smailpro_managed", []):
-            return self.smailpro.create_mailbox(dom)
+            res = self.smailpro.create_mailbox(dom)
+            return res
 
         # 4. النطاقات المخصصة والمجانية والـ VIP لـ Temporary-Mail.net (16 نطاقاً)
         else:

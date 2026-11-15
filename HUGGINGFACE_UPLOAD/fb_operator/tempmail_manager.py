@@ -570,21 +570,26 @@ def create_vip_email(user_id: int, domain: str = "gmail.com", session_cookie: st
         if effective_cookie and not master_suite.smailpro.has_cookies:
             master_suite.smailpro.set_cookies(effective_cookie)
 
-        # توليد البريد عبر المحرك الذكي
+        # توليد البريد عبر المحرك الذكي للنطاق المطلوب حصراً
         res = master_suite.generate_email(domain)
         if not res or not res.get("success"):
-            res = master_suite.generate_email("deepmails.org")
+            err_msg = res.get("error") if res else "فشل توليد البريد"
+            raise RuntimeError(f"تعذر إنشاء بريد على نطاق {domain}: {err_msg}")
 
         now_dt = datetime.datetime.now()
         now_ts = now_dt.timestamp()
-        clean_email = res.get("email", f"user_{int(now_ts)%10000}@deepmails.org").strip().lower()
+        clean_email = res.get("email", "").strip().lower()
+        if not clean_email:
+            raise RuntimeError(f"لم يتم إرجاع عنوان بريد صالح لنطاق {domain}")
+
         code = res.get("code") or res.get("token") or res.get("jwt_key", "")
+        engine_name = res.get("engine") or ("smailpro" if any(k in clean_email for k in ["gmail", "outlook", "edu", "devpoet"]) else "tempmail_net")
 
         mailbox_record = {
             "id": hashlib.sha1(f"{user_id}_{clean_email}_{now_ts}".encode()).hexdigest()[:12],
             "user_id": int(user_id),
             "email": clean_email,
-            "provider": res.get("engine", "tempmail_net"),
+            "provider": engine_name,
             "token": code,
             "code": code,
             "jwt_key": res.get("jwt_key", ""),

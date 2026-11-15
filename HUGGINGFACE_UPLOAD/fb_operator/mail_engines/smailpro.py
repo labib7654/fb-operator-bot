@@ -30,7 +30,33 @@ class SmailProEngine:
     def _get_cookie(cls, session_cookie: str | None = None) -> str | None:
         if session_cookie and session_cookie.strip():
             return session_cookie.strip()
-        return os.environ.get("SMAILPRO_COOKIE", "").strip() or None
+        env_c = os.environ.get("SMAILPRO_COOKIE", "").strip()
+        if env_c:
+            return env_c
+        # البحث في الملفات المحلية المحفوظة
+        from pathlib import Path
+        search_dirs = [
+            Path(__file__).parent,
+            Path(__file__).parent.parent,
+            Path("."),
+            Path("fb_operator"),
+            Path("fb_operator/mail_engines")
+        ]
+        for d in search_dirs:
+            cf = d / "smailpro_cookie.txt"
+            if cf.exists():
+                try:
+                    c = cf.read_text(encoding="utf-8").strip()
+                    if c:
+                        return c
+                except Exception:
+                    pass
+        try:
+            import fb_operator.tempmail_manager as tm_m
+            return tm_m.get_vip_cookie()
+        except Exception:
+            pass
+        return None
 
     @classmethod
     def _get_headers(cls, session_cookie: str | None = None) -> dict[str, str]:
