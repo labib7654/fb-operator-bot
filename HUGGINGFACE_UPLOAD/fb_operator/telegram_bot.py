@@ -1502,26 +1502,50 @@ def render_tempmail_main_view(user_id: int) -> tuple[str, types.InlineKeyboardMa
 
 def render_tempmail_vip_menu(user_id: int) -> tuple[str, types.InlineKeyboardMarkup]:
     txt = (
-        "⭐ <b>البريد المعتمد والجامعي (Gmail / Outlook / Edu)</b>\n"
+        "👑 <b>النطاقات الملكية المعتمدة (12 نطاقاً مفحوصاً ومستقراً 100%)</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "بريد رسمي وسريع مخصص للتسجيل في منصات الذكاء الاصطناعي والمواقع العالمية والخصومات الجامعية:\n"
-        "• <b>Gmail:</b> @gmail.com\n"
-        "• <b>Outlook:</b> @outlook.com\n"
-        "• <b>Edu الجامعي:</b> @singapore.edu.pl | @paris.edu.pl\n\n"
-        "اختر المزود أو النطاق للإنشاء فوراً:"
+        "بريد رسمي وسريع مفحوص ميدانياً لاستقبال أكواد OTP في منصات الذكاء الاصطناعي والمواقع العالمية:\n\n"
+        "🔴 <b>فئة Google الرسمية:</b>\n"
+        "• @gmail.com | @googlemail.com\n\n"
+        "🔵 <b>فئة Microsoft الرسمية:</b>\n"
+        "• @outlook.com | @hotmail.com\n\n"
+        "🎓 <b>فئة الجامعات Edu (تدعم كتابة اسمك المخصص):</b>\n"
+        "• @singapore.edu.pl | @paris.edu.pl | @france.edu.pl\n\n"
+        "💼 <b>فئة الشركات النظيفة .com (تدعم كتابة اسمك المخصص):</b>\n"
+        "• @devpoet.com | @fordemy.com | @appbott.com | @animoby.com | @meltcoo.com\n\n"
+        "اختر المزود أو النطاق للبدء:"
     )
     mk = types.InlineKeyboardMarkup(row_width=2)
+    # 1. فئة Google
     mk.row(
-        types.InlineKeyboardButton("🔴 جيميل Gmail", callback_data="tm_vip_create_gmail"),
-        types.InlineKeyboardButton("🔵 أوتلوك Outlook", callback_data="tm_vip_create_outlook")
+        types.InlineKeyboardButton("🔴 @gmail.com", callback_data="tm_vip_create_gmail.com"),
+        types.InlineKeyboardButton("🇬🇧 @googlemail.com", callback_data="tm_vip_create_googlemail.com")
+    )
+    # 2. فئة Microsoft
+    mk.row(
+        types.InlineKeyboardButton("🔵 @outlook.com", callback_data="tm_vip_create_outlook.com"),
+        types.InlineKeyboardButton("🔷 @hotmail.com", callback_data="tm_vip_create_hotmail.com")
+    )
+    # 3. فئة الجامعات Edu
+    mk.row(
+        types.InlineKeyboardButton("🎓 @singapore.edu.pl", callback_data="tm_vip_pick_singapore.edu.pl"),
+        types.InlineKeyboardButton("🎓 @paris.edu.pl", callback_data="tm_vip_pick_paris.edu.pl")
     )
     mk.row(
-        types.InlineKeyboardButton("🎓 سنغافورة Edu", callback_data="tm_vip_create_singapore.edu.pl"),
-        types.InlineKeyboardButton("🎓 باريس Edu", callback_data="tm_vip_create_paris.edu.pl")
+        types.InlineKeyboardButton("🎓 @france.edu.pl", callback_data="tm_vip_pick_france.edu.pl")
+    )
+    # 4. فئة الشركات النظيفة .com
+    mk.row(
+        types.InlineKeyboardButton("💼 @devpoet.com", callback_data="tm_vip_pick_devpoet.com"),
+        types.InlineKeyboardButton("💼 @fordemy.com", callback_data="tm_vip_pick_fordemy.com")
     )
     mk.row(
-        types.InlineKeyboardButton("🎓 فرنسا Edu", callback_data="tm_vip_create_france.edu.pl"),
-        types.InlineKeyboardButton("🌐 استعراض كافة النطاقات (43+)", callback_data="tm_dompage_0")
+        types.InlineKeyboardButton("💼 @appbott.com", callback_data="tm_vip_pick_appbott.com"),
+        types.InlineKeyboardButton("💼 @animoby.com", callback_data="tm_vip_pick_animoby.com")
+    )
+    mk.row(
+        types.InlineKeyboardButton("💼 @meltcoo.com", callback_data="tm_vip_pick_meltcoo.com"),
+        types.InlineKeyboardButton("🌐 النطاقات المجانية (35+)", callback_data="tm_dompage_0")
     )
     mk.row(types.InlineKeyboardButton("🔙 رجوع لإدارة البريد", callback_data="menu_tempmail"))
     return txt, mk
@@ -4511,6 +4535,47 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
             safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
         except Exception as e:
             logger.error(f"Error rendering main view: {e}")
+        return
+
+    elif data.startswith("tm_vip_pick_"):
+        if not is_feature_enabled(user_id, "tempmail") and not is_super_admin(user_id):
+            safe_answer(call.id, "⛔ ميزة البريد مغلقة حالياً.", show_alert=True)
+            return
+        dom = data.replace("tm_vip_pick_", "").strip()
+        st = get_user_state(user_id)
+        st["tm_pending_domain"] = dom
+        st["input_mode"] = "waiting_tm_custom_name"
+        safe_answer(call.id)
+        mk = types.InlineKeyboardMarkup(row_width=1)
+        mk.row(types.InlineKeyboardButton(f"🎲 توليد اسم عشوائي فوراً على @{dom}", callback_data=f"tm_vip_randcreate_{dom}"))
+        mk.row(types.InlineKeyboardButton("🔙 رجوع لقائمة النطاقات الملكية", callback_data="tm_vip_menu"))
+        safe_send(
+            call.message.chat.id,
+            f"✏️ <b>أرسل الآن اسم المستخدم المطلوب للبريد:</b>\n\n"
+            f"🌐 النطاق المختار: <code>@{esc(dom)}</code>\n"
+            f"مثال: أرسل <code>john.dev</code> ليكون البريد <code>john.dev@{esc(dom)}</code>\n\n"
+            f"💡 أو اضغط على الزر أدناه للتوليد السريع دون كتابة.",
+            reply_markup=mk
+        )
+        return
+
+    elif data.startswith("tm_vip_randcreate_"):
+        if not is_feature_enabled(user_id, "tempmail") and not is_super_admin(user_id):
+            safe_answer(call.id, "⛔ ميزة البريد مغلقة حالياً.", show_alert=True)
+            return
+        dom = data.replace("tm_vip_randcreate_", "").strip()
+        safe_answer(call.id, f"⏳ جاري إنشاء بريد على @{dom}...")
+        try:
+            mb = tm_m.create_vip_email(user_id=user_id, domain=dom, auto_delete_sec=0)
+            safe_answer(call.id, f"✅ تم إنشاء بريد {mb.get('email')} بنجاح!", show_alert=False)
+        except Exception as e:
+            safe_answer(call.id, f"❌ تعذر إنشاء بريد: {e}", show_alert=True)
+            return
+        try:
+            txt, mk = render_tempmail_main_view(user_id)
+            safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
+        except Exception:
+            pass
         return
 
     elif data.startswith("tm_dompage_"):

@@ -23,9 +23,10 @@ from pathlib import Path
 from typing import Any
 
 import fb_operator.config as config
-from fb_operator.mail_engines import MailEngineManager
-from fb_operator.mail_engines.master_tempmail_suite import master_suite, DOMAINS_CATALOG
 from fb_operator.otp_extractor import OtpExtractor
+from fb_operator.mail_engines import UnifiedMailAPI
+
+unified_mail_api = UnifiedMailAPI()
 
 _tm_lock = threading.RLock()
 
@@ -86,25 +87,29 @@ def _get_trash() -> list[dict[str, Any]]:
 
 
 def get_available_domains() -> list[dict[str, str]]:
-    """جلب قائمة كافة النطاقات الـ 43+ المدعومة رسمياً"""
+    """جلب قائمة كافة النطاقات المعتمدة رسمياً عبر UnifiedMailAPI"""
     flat = []
-    # 1. النطاقات المفتوحة المجانية بدون كوكيز وبدون حظر (Temporary-Mail.net)
-    for d in DOMAINS_CATALOG.get("tempmail_free", []):
+    catalog = unified_mail_api.get_all_supported_domains()
+    # 1. النطاقات المفتوحة المجانية (Temporary-Mail.net)
+    for d in catalog.get("tempmail_net_free", []):
         flat.append({"domain": d, "engine": "tempmail_net", "category": "مجاني"})
-    # 2. نطاقات VIP البريميوم (Temporary-Mail.net)
-    for d in DOMAINS_CATALOG.get("tempmail_vip", []):
+    # 2. نطاقات VIP
+    for d in catalog.get("tempmail_net_vip", []):
         flat.append({"domain": d, "engine": "tempmail_net", "category": "VIP"})
-    # 3. النطاقات الكبرى الرسمية (Gmail & Outlook)
-    for d in DOMAINS_CATALOG.get("major", []):
-        flat.append({"domain": d, "engine": "smailpro", "category": "رسمي"})
-    # 4. نطاقات SmailPro الجامعية والتعليمية Edu
-    for d in DOMAINS_CATALOG.get("smailpro_edu", []):
+    # 3. النطاقات الكبرى الرسمية (Google & Microsoft)
+    for d in catalog.get("google_gmail", []):
+        flat.append({"domain": d, "engine": "smailpro", "category": "رسمي Google"})
+    for d in catalog.get("microsoft_outlook", []):
+        flat.append({"domain": d, "engine": "smailpro", "category": "رسمي Microsoft"})
+    # 4. نطاقات الجامعات Edu
+    for d in catalog.get("university_edu", []):
         flat.append({"domain": d, "engine": "smailpro", "category": "جامعي Edu"})
-    # 5. نطاقات SmailPro المُدارة الخاصة
-    for d in DOMAINS_CATALOG.get("smailpro_managed", []):
-        flat.append({"domain": d, "engine": "smailpro", "category": "خاص SmailPro"})
+    # 5. نطاقات الشركات النظيفة والمُدارة
+    for d in catalog.get("smailpro_managed", []):
+        if d != "storegmail.net":
+            flat.append({"domain": d, "engine": "smailpro", "category": "نطاق نظيف"})
     # 6. النطاقات السريعة (GuerrillaMail)
-    for d in DOMAINS_CATALOG.get("guerrilla", []):
+    for d in catalog.get("guerrillamail", []):
         flat.append({"domain": d, "engine": "guerrilla", "category": "سريع"})
     return flat
 
@@ -115,23 +120,27 @@ def create_random_email(user_id: int, preferred_engine: str | None = None) -> di
         import random
         import time
         # اختيار نطاق مجاني مفضل مثل deepmails.org أو agogmail.com
-        free_domains = DOMAINS_CATALOG.get("tempmail_free", ["deepmails.org", "agogmail.com"])
+        free_domains = ["deepmails.org", "agogmail.com", "besttempmail.com", "swagpapa.com", "123mails.org"]
         target_domain = random.choice(free_domains)
-        res = master_suite.generate_email(target_domain)
-        if not res or not res.get("success"):
-            res = master_suite.generate_email("deepmails.org")
+        res = unified_mail_api.create_mailbox(domain=target_domain)
+        if not res or not res.get("address"):
+            res = unified_mail_api.create_mailbox(domain="deepmails.org")
 
         now = datetime.datetime.now().isoformat()
-        clean_email = res.get("email", f"user_{int(time.time()) % 10000}@deepmails.org")
-        code = res.get("code") or res.get("token") or ""
+        clean_email = (res.get("address") or res.get("email") or f"user_{int(time.time()) % 10000}@deepmails.org").strip().lower()
+        code = res.get("code") or res.get("token") or res.get("key") or ""
 
         mailbox_record = {
             "id": hashlib.sha1(f"{user_id}_{clean_email}_{now}".encode()).hexdigest()[:12],
             "user_id": int(user_id),
             "email": clean_email,
-            "provider": res.get("engine", "tempmail_net"),
+            "address": clean_email,
+            "provider": res.get("provider", "tempmail_net"),
             "token": code,
             "code": code,
+            "key": res.get("key", ""),
+            "jwt_payload": res.get("jwt_payload", ""),
+            "timestamp": res.get("timestamp", int(time.time())),
             "domain": res.get("domain", clean_email.split("@")[-1] if "@" in clean_email else "deepmails.org"),
             "username": clean_email.split("@")[0] if "@" in clean_email else "user",
             "created_at": now,
@@ -151,26 +160,31 @@ def create_random_email(user_id: int, preferred_engine: str | None = None) -> di
 def create_custom_email(user_id: int, username: str, domain: str) -> dict[str, Any]:
     """توليد بريد مخصص باسم ونطاق يختارهما المستخدم وتعيينه كبريد نشط"""
     with _tm_lock:
+        import time
         clean_user = re.sub(r'[^a-zA-Z0-9._-]', '', username.strip().lower())
         if not clean_user:
             clean_user = f"user_{int(user_id) % 10000}"
 
         clean_dom = domain.strip().lower().replace("@", "")
-        res = master_suite.generate_email(clean_dom, username=clean_user)
-        if not res or not res.get("success"):
-            res = master_suite.generate_email("deepmails.org", username=clean_user)
+        res = unified_mail_api.create_mailbox(domain=clean_dom, username=clean_user)
+        if not res or not res.get("address"):
+            res = unified_mail_api.create_mailbox(domain="deepmails.org", username=clean_user)
 
         now = datetime.datetime.now().isoformat()
-        clean_email = res.get("email", f"{clean_user}@{clean_dom}")
-        code = res.get("code") or res.get("token") or ""
+        clean_email = (res.get("address") or res.get("email") or f"{clean_user}@{clean_dom}").strip().lower()
+        code = res.get("code") or res.get("token") or res.get("key") or ""
 
         mailbox_record = {
             "id": hashlib.sha1(f"{user_id}_{clean_email}_{now}".encode()).hexdigest()[:12],
             "user_id": int(user_id),
             "email": clean_email,
-            "provider": res.get("engine", "tempmail_net"),
+            "address": clean_email,
+            "provider": res.get("provider", "smailpro" if any(x in clean_dom for x in ["edu", "devpoet", "fordemy", "appbott", "animoby", "meltcoo"]) else "tempmail_net"),
             "token": code,
             "code": code,
+            "key": res.get("key", ""),
+            "jwt_payload": res.get("jwt_payload", ""),
+            "timestamp": res.get("timestamp", int(time.time())),
             "domain": res.get("domain", clean_dom),
             "username": clean_user,
             "created_at": now,
@@ -178,6 +192,13 @@ def create_custom_email(user_id: int, username: str, domain: str) -> dict[str, A
         }
 
         data = _get_data()
+        data["users"][str(user_id)] = mailbox_record
+        data["history"].insert(0, mailbox_record)
+        data["history"] = data["history"][:300]
+
+        _atomic_write_json(TEMP_EMAILS_FILE, data)
+        _notify_persistence("tempmail_custom_created")
+        return mailbox_record
         data["users"][str(user_id)] = mailbox_record
         data["history"].insert(0, mailbox_record)
         data["history"] = data["history"][:300]
@@ -372,45 +393,76 @@ def restore_deleted_email(email: str, target_user_id: int | None = None, restore
 def check_inbox(user_id: int, email: str | None = None) -> list[dict[str, Any]]:
     """
     فحص البريد الوارد لصندوق المستخدم:
-    يجلب الرسائل، يستخرج أكواد التحقق OTP وروابط التفعيل، ويسجل الرسائل المقروءة.
+    يجلب الرسائل عبر UnifiedMailAPI (مع Two-Step retrieval وتجديد توكن JWT تلقائياً)،
+    ويستخرج أكواد التحقق OTP وروابط التفعيل، ويسجل الرسائل في الأرشيف الدائم.
     """
     with _tm_lock:
+        import time
         data = _get_data()
         active = data["users"].get(str(user_id))
         target_email = email or (active.get("email") if active else None)
         if not target_email:
             return []
 
-        provider = active.get("provider", "1timetech") if (active and active.get("email") == target_email) else "1timetech"
-        token = active.get("token", "") if (active and active.get("email") == target_email) else ""
-
-        # إذا لم يتم العثور على المزود في النشط، ابحث في الأرشيف
-        if not token:
+        matched_record = None
+        if active and active.get("email", "").lower() == target_email.lower():
+            matched_record = active
+        else:
             for h in data.get("history", []):
                 if h.get("email", "").lower() == target_email.strip().lower():
-                    provider = h.get("provider", provider)
-                    token = h.get("token", token)
+                    matched_record = h
                     break
 
-    # استدعاء المحرك المباشر عبر master_suite أولاً ثم MailEngineManager
+        if not matched_record:
+            matched_record = {
+                "address": target_email,
+                "email": target_email,
+                "domain": target_email.split("@")[-1] if "@" in target_email else "gmail.com",
+                "provider": "smailpro" if any(x in target_email for x in ["gmail", "outlook", "hotmail", "edu", "devpoet", "fordemy", "appbott", "animoby", "meltcoo"]) else "tempmail_net"
+            }
+
     raw_messages = []
+    # 1. الاستدعاء المباشر عبر UnifiedMailAPI (الموجه الشامل الأحدث مع فك التشفير التلقائي)
     try:
-        mail_obj = {
+        box_req = {
+            "address": target_email,
             "email": target_email,
-            "engine": "tempmail_net" if provider != "smailpro" else "smailpro",
-            "code": token,
-            "token": token,
-            "jwt_key": token
+            "domain": matched_record.get("domain") or (target_email.split("@")[-1] if "@" in target_email else "gmail.com"),
+            "timestamp": matched_record.get("timestamp") or matched_record.get("created_ts") or int(time.time()),
+            "key": matched_record.get("key") or matched_record.get("jwt_key") or matched_record.get("token") or "",
+            "jwt_payload": matched_record.get("jwt_payload"),
+            "provider": matched_record.get("provider"),
+            "token": matched_record.get("token") or matched_record.get("code") or "",
+            "code": matched_record.get("code") or matched_record.get("token") or ""
         }
-        raw_messages = master_suite.fetch_inbox(mail_obj)
+        api_messages = unified_mail_api.get_messages(box_req)
+        # إذا تم تجديد jwt_payload تلقائياً بواسطة smailpro_api، نحفظه في السجل
+        if box_req.get("jwt_payload") and box_req.get("jwt_payload") != matched_record.get("jwt_payload"):
+            with _tm_lock:
+                matched_record["jwt_payload"] = box_req.get("jwt_payload")
+                _atomic_write_json(TEMP_EMAILS_FILE, data)
+
+        for m in api_messages:
+            mid = str(m.get("id") or m.get("mid") or "")
+            body_txt = str(m.get("body") or m.get("body_text") or m.get("text") or "")
+            body_html = str(m.get("body_html") or m.get("html") or body_txt)
+            subj = str(m.get("subject") or "")
+            otp = m.get("otp") or OtpExtractor.extract_otp(f"{subj} {body_txt}", body_html)
+            act_link = m.get("action_link")
+            links = [act_link] if act_link else OtpExtractor.extract_links(body_txt, body_html)
+
+            raw_messages.append({
+                "id": mid,
+                "sender": m.get("sender") or m.get("from") or "Unknown",
+                "subject": subj,
+                "date": m.get("date") or "",
+                "body_text": body_txt,
+                "body_html": body_html,
+                "otp_code": otp,
+                "links": links
+            })
     except Exception:
         raw_messages = []
-
-    if not raw_messages:
-        try:
-            raw_messages = MailEngineManager.check_inbox(target_email, provider, token)
-        except Exception:
-            raw_messages = []
 
     parsed_messages = []
 
@@ -560,39 +612,46 @@ def set_vip_cookie(cookie_str: str) -> None:
         _notify_persistence("smailpro_cookie_updated")
 
 
-def create_vip_email(user_id: int, domain: str = "gmail.com", session_cookie: str | None = None, auto_delete_sec: int = 300, on_expired_callback: Any = None) -> dict[str, Any]:
+def create_vip_email(user_id: int, domain: str = "gmail.com", username: str | None = None, session_cookie: str | None = None, auto_delete_sec: int = 0, on_expired_callback: Any = None) -> dict[str, Any]:
     """
-    إنشاء بريد معتمد (Gmail أو Outlook أو بديل فوري معتمد مثل deepmails.org)
-    بدون أي أخطاء أو تعليق، مع التبديل التلقائي الذكي.
+    إنشاء بريد معتمد (Gmail أو Outlook أو Edu أو النطاقات النظيفة)
+    عبر محرك UnifiedMailAPI مباشرة مع تخزين كافة مفاتيح JWT والـ Payload لضمان فك التشفير واستقبال أكواد الـ OTP.
     """
-    effective_cookie = session_cookie or get_vip_cookie()
+    clean_dom = domain.strip().lower().replace("@", "")
     with _tm_lock:
-        if effective_cookie and not master_suite.smailpro.has_cookies:
-            master_suite.smailpro.set_cookies(effective_cookie)
+        import time
+        if clean_dom in ["gmail.com", "googlemail.com", "outlook.com", "hotmail.com"]:
+            res = unified_mail_api.create_mailbox(domain=clean_dom, username="random")
+        else:
+            clean_user = re.sub(r'[^a-zA-Z0-9._-]', '', (username or "").strip().lower())
+            if not clean_user:
+                clean_user = f"user_{int(time.time()) % 100000}"
+            res = unified_mail_api.create_mailbox(domain=clean_dom, username=clean_user)
 
-        # توليد البريد عبر المحرك الذكي للنطاق المطلوب حصراً
-        res = master_suite.generate_email(domain)
-        if not res or not res.get("success"):
-            err_msg = res.get("error") if res else "فشل توليد البريد"
-            raise RuntimeError(f"تعذر إنشاء بريد على نطاق {domain}: {err_msg}")
+        if not res or not (res.get("address") or res.get("email")):
+            raise RuntimeError(f"تعذر إنشاء بريد على نطاق {clean_dom}")
 
         now_dt = datetime.datetime.now()
         now_ts = now_dt.timestamp()
-        clean_email = res.get("email", "").strip().lower()
-        if not clean_email:
-            raise RuntimeError(f"لم يتم إرجاع عنوان بريد صالح لنطاق {domain}")
+        clean_email = (res.get("address") or res.get("email", "")).strip().lower()
 
-        code = res.get("code") or res.get("token") or res.get("jwt_key", "")
-        engine_name = res.get("engine") or ("smailpro" if any(k in clean_email for k in ["gmail", "outlook", "edu", "devpoet"]) else "tempmail_net")
+        code = res.get("code") or res.get("token") or res.get("key", "")
+        key = res.get("key", "")
+        jwt_payload = res.get("jwt_payload", "")
+        provider = res.get("provider", "smailpro")
 
         mailbox_record = {
             "id": hashlib.sha1(f"{user_id}_{clean_email}_{now_ts}".encode()).hexdigest()[:12],
             "user_id": int(user_id),
             "email": clean_email,
-            "provider": engine_name,
+            "address": clean_email,
+            "provider": provider,
             "token": code,
             "code": code,
-            "jwt_key": res.get("jwt_key", ""),
+            "key": key,
+            "jwt_key": key,
+            "jwt_payload": jwt_payload,
+            "timestamp": res.get("timestamp", int(now_ts)),
             "domain": res.get("domain", clean_email.split("@")[-1]),
             "username": clean_email.split("@")[0],
             "created_at": now_dt.isoformat(),
@@ -655,11 +714,7 @@ def _execute_vip_auto_cleanup(user_id: int, email: str, on_expired_callback: Any
         if active.get("used") or msg_count > 0:
             return
 
-    # 1. استدعاء دالة الحذف على خادم SmailPro لتحرير الخانة للعامة
-    cookie = get_vip_cookie()
-    MailEngineManager.delete_mailbox(clean_email, provider="smailpro", session_cookie=cookie)
-
-    # 2. نقله محلياً إلى سلة المحذوفات
+    # 1. نقله محلياً إلى سلة المحذوفات
     delete_user_email(user_id, clean_email, deleted_by=0)
 
     # 3. إشعار المستخدم عبر التليجرام
