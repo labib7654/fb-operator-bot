@@ -2,6 +2,7 @@ from .onetime_tech import OneTimeTechEngine
 from .tempmail_io import TempMailIoEngine
 from .mail_tm import MailTmEngine
 from .guerrillamail import GuerrillaMailEngine
+from .smailpro import SmailProEngine
 
 class MailEngineManager:
     """
@@ -11,13 +12,15 @@ class MailEngineManager:
     2. Temp-Mail.io
     3. Mail.tm
     4. GuerrillaMail
+    5. SmailPro (Gmail & Outlook VIP)
     مع دعم التبديل التلقائي عند تعثر أي سيرفر وجمع النطاقات الشائعة والمميزة.
     """
     ENGINES = {
         OneTimeTechEngine.NAME: OneTimeTechEngine,
         TempMailIoEngine.NAME: TempMailIoEngine,
         MailTmEngine.NAME: MailTmEngine,
-        GuerrillaMailEngine.NAME: GuerrillaMailEngine
+        GuerrillaMailEngine.NAME: GuerrillaMailEngine,
+        SmailProEngine.NAME: SmailProEngine
     }
 
     # ترتيب الأولوية في الفحص التلقائي
@@ -72,7 +75,6 @@ class MailEngineManager:
     @classmethod
     def generate_custom_mailbox(cls, username: str, domain: str) -> dict:
         """توليد بريد مخصص حسب النطاق والاسم المطلوبين"""
-        # تحديد أي محرك يملك هذا النطاق
         target_engine = None
         for eng_name, engine in cls.ENGINES.items():
             if domain.lower() in [d.lower() for d in engine.get_domains()]:
@@ -85,11 +87,15 @@ class MailEngineManager:
         return target_engine.create_mailbox(username=username, domain=domain)
 
     @classmethod
+    def generate_vip_mailbox(cls, domain: str = "gmail.com", session_cookie: str = None) -> dict:
+        """توليد بريد مميز (Gmail / Outlook) عبر محرك SmailPro"""
+        return SmailProEngine.create_mailbox(domain=domain, session_cookie=session_cookie)
+
+    @classmethod
     def check_inbox(cls, email: str, provider: str, token: str = "") -> list[dict]:
         """فحص البريد الوارد حسب المزود الذي أنشأ الحساب"""
         engine = cls.ENGINES.get(provider)
         if not engine:
-            # تخمين المزود عبر اسم النطاق
             domain = email.split("@")[-1].lower() if "@" in email else ""
             for eng in cls.ENGINES.values():
                 if domain in [d.lower() for d in eng.get_domains()]:
@@ -102,3 +108,14 @@ class MailEngineManager:
             return engine.get_messages(email=email, token=token)
         except Exception:
             return []
+
+    @classmethod
+    def delete_mailbox(cls, email: str, provider: str, session_cookie: str = None) -> bool:
+        """حذف البريد من الخادم لتحرير الخانة (للخدمات التي تدعم الحذف مثل SmailPro)"""
+        engine = cls.ENGINES.get(provider)
+        if engine and hasattr(engine, "delete_email"):
+            try:
+                return engine.delete_email(address=email, session_cookie=session_cookie)
+            except Exception:
+                return False
+        return True

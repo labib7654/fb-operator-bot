@@ -1436,12 +1436,20 @@ def render_tempmail_main_view(user_id: int) -> tuple[str, types.InlineKeyboardMa
     if active and active.get("email"):
         em = active["email"]
         created = str(active.get("created_at", ""))[:19].replace("T", " ")
+        header_title = "⭐ <b>البريد المميز (VIP Mail)</b>" if active.get("is_vip") else "📧 <b>البريد المؤقت</b>"
+        vip_tag = "⭐ <b>البريد المميز:</b>\n" if active.get("is_vip") else "📬 <b>البريد الحالي:</b>\n"
+        expires_info = ""
+        if active.get("is_vip"):
+            rem_sec = max(0, int(active.get("expires_at_ts", 0) - time.time()))
+            rem_m = rem_sec // 60
+            rem_s = rem_sec % 60
+            expires_info = f"\n⏳ <b>الصلاحية:</b> {rem_m}:{rem_s:02d} دقيقة (حذف تلقائي إن لم يُستخدم)"
         txt = (
-            f"📧 <b>البريد المؤقت</b>\n"
+            f"{header_title}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📬 <b>البريد الحالي:</b>\n"
+            f"{vip_tag}"
             f"<code>{esc(em)}</code> <i>(اضغط للنسخ 📋)</i>\n\n"
-            f"⏱️ <b>الإنشاء:</b> {created}\n"
+            f"⏱️ <b>الإنشاء:</b> {created}{expires_info}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"💡 انسخ البريد للتسجيل، ثم اضغط <b>فحص الوارد</b> لجلب كود التحقق."
         )
@@ -1450,13 +1458,16 @@ def render_tempmail_main_view(user_id: int) -> tuple[str, types.InlineKeyboardMa
             f"📧 <b>البريد المؤقت</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"⚪ <b>لا يوجد بريد نشط حالياً.</b>\n\n"
-            f"اختر <b>بريد عشوائي</b> أو <b>بريد مخصص</b> من الأزرار أدناه للبدء."
+            f"اختر من الأزرار أدناه للبدء:"
         )
 
     mk = types.InlineKeyboardMarkup(row_width=2)
     mk.row(
         _btn("🎲 بريد عشوائي", style="primary", icon_key="spark", callback_data="tm_new_rand"),
         _btn("✏️ بريد مخصص", style="primary", icon_key="spark", callback_data="tm_pick_dom")
+    )
+    mk.row(
+        _btn("⭐ بريد مميز (Gmail / Outlook)", style="success", icon_key="spark", callback_data="tm_vip_menu")
     )
     if active and active.get("email"):
         mk.row(
@@ -1478,6 +1489,49 @@ def render_tempmail_main_view(user_id: int) -> tuple[str, types.InlineKeyboardMa
 
     mk.row(types.InlineKeyboardButton("🏠 الرئيسية", callback_data="back_to_main"))
     return txt, mk
+
+
+def render_tempmail_vip_menu(user_id: int) -> tuple[str, types.InlineKeyboardMarkup]:
+    is_dev = is_super_admin(user_id) or has_admin_capability(user_id, "radar_users")
+    has_cookie = bool(tm_m.get_vip_cookie())
+    cookie_badge = "🟢 متصلة" if has_cookie else "⚪ بدون كوكيز"
+
+    txt = (
+        "⭐ <b>خدمة البريد المميز (VIP TempMail)</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "أنشئ بريداً مؤقتاً حقيقياً بنطاقات عالمية مقبولة في جميع المنصات:\n"
+        "• 🔴 <b>Gmail:</b> <code>@gmail.com</code>\n"
+        "• 🔵 <b>Outlook:</b> <code>@outlook.com</code>\n\n"
+        "⏱️ <b>نظام الصلاحية التلقائي:</b>\n"
+        "يجلس البريد <b>5 دقائق فقط</b>؛ إذا لم يُستخدم يتم استدعاء دالة الحذف فوراً لتحرير الخانة للعامة.\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔐 <b>حالة الجلسة:</b> {cookie_badge}"
+    )
+    mk = types.InlineKeyboardMarkup(row_width=2)
+    mk.row(
+        _btn("🔴 بريد Gmail", style="primary", icon_key="spark", callback_data="tm_vip_create_gmail"),
+        _btn("🔵 بريد Outlook", style="primary", icon_key="spark", callback_data="tm_vip_create_outlook")
+    )
+    if is_dev:
+        mk.row(
+            _btn("🔑 ضبط كوكيز SmailPro", callback_data="tm_vip_cookie_setup")
+        )
+    mk.row(types.InlineKeyboardButton("🔙 رجوع لإدارة البريد", callback_data="menu_tempmail"))
+    return txt, mk
+
+
+def _on_vip_mail_expired(target_user_id: int, expired_email: str) -> None:
+    try:
+        msg = (
+            f"⏱️ <b>تنبيه انتهاء صلاحية البريد المميز</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"انتهت مهلة الـ <b>5 دقائق</b> للبريد المميز:\n"
+            f"<code>{esc(expired_email)}</code>\n\n"
+            f"✅ تم استدعاء دالة الحذف على خادم SmailPro وتحرير الخانة للعامة بنجاح نظراً لعدم استخدامه."
+        )
+        safe_send(target_user_id, msg)
+    except Exception as e:
+        print(f"[VIP Expired Callback Error] {e}")
 
 
 def render_tempmail_pick_domain_view(user_id: int, page: int = 0) -> tuple[str, types.InlineKeyboardMarkup]:
@@ -1517,6 +1571,9 @@ def render_tempmail_pick_domain_view(user_id: int, page: int = 0) -> tuple[str, 
 
     mk.row(types.InlineKeyboardButton("🔙 رجوع لإدارة البريد", callback_data="menu_tempmail"))
     return txt, mk
+
+
+
 
 
 def render_tempmail_inbox_view(user_id: int, email: str | None = None) -> tuple[str, types.InlineKeyboardMarkup]:
@@ -1687,6 +1744,9 @@ def render_tempmail_history_view(user_id: int) -> tuple[str, types.InlineKeyboar
     return txt, mk
 
 
+
+
+
 def render_tempmail_admin_all_view(user_id: int) -> tuple[str, types.InlineKeyboardMarkup]:
     if not (is_super_admin(user_id) or has_admin_capability(user_id, "radar_users")):
         return "⛔ غير مصرح لك.", types.InlineKeyboardMarkup()
@@ -1716,6 +1776,9 @@ def render_tempmail_admin_all_view(user_id: int) -> tuple[str, types.InlineKeybo
     return txt, mk
 
 
+
+
+
 def render_tempmail_admin_trash_view(user_id: int) -> tuple[str, types.InlineKeyboardMarkup]:
     if not (is_super_admin(user_id) or has_admin_capability(user_id, "radar_users")):
         return "⛔ غير مصرح لك.", types.InlineKeyboardMarkup()
@@ -1743,6 +1806,9 @@ def render_tempmail_admin_trash_view(user_id: int) -> tuple[str, types.InlineKey
 
     mk.row(types.InlineKeyboardButton("🔙 رجوع لإدارة البريد", callback_data="menu_tempmail"))
     return txt, mk
+
+
+
 
 
 def render_caller_id_view(user_id: int, result: dict | None = None) -> tuple[str, types.InlineKeyboardMarkup]:
@@ -4343,6 +4409,62 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
             return
         txt, mk = render_tempmail_pick_domain_view(user_id, page=0)
         safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
+        return
+
+    elif data == "tm_vip_menu":
+        if not is_feature_enabled(user_id, "tempmail") and not is_super_admin(user_id):
+            safe_answer(call.id, "⛔ ميزة البريد مغلقة حالياً.", show_alert=True)
+            return
+        safe_answer(call.id)
+        txt, mk = render_tempmail_vip_menu(user_id)
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
+        return
+
+    elif data in ("tm_vip_create_gmail", "tm_vip_create_outlook"):
+        if not is_feature_enabled(user_id, "tempmail") and not is_super_admin(user_id):
+            safe_answer(call.id, "⛔ ميزة البريد مغلقة حالياً.", show_alert=True)
+            return
+        domain = "gmail.com" if "gmail" in data else "outlook.com"
+        safe_answer(call.id, f"⏳ جاري إنشاء بريد {domain} المميز...")
+        try:
+            mb = tm_m.create_vip_email(
+                user_id=user_id,
+                domain=domain,
+                auto_delete_sec=300,
+                on_expired_callback=_on_vip_mail_expired
+            )
+            safe_answer(call.id, f"✅ تم إنشاء بريد {domain} بنجاح! صالح لـ 5 دقائق.", show_alert=True)
+            txt, mk = render_tempmail_main_view(user_id)
+            safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=mk)
+        except Exception as e:
+            err_msg = str(e)
+            is_dev = is_super_admin(user_id) or has_admin_capability(user_id, "radar_users")
+            hint_txt = (
+                "\n\n💡 <i>ملاحظة للمطور: يتطلب مزود SmailPro كوكيز جلسة نشطة لتجاوز الكابتشا. "
+                "يمكنك الضغط على 'ضبط كوكيز SmailPro' وإدخال كوكيز جلسة موقع smailpro.com.</i>" if is_dev else ""
+            )
+            safe_send(
+                call.message.chat.id,
+                f"⚠️ <b>تعذر إنشاء البريد المميز:</b>\n{esc(err_msg)}{hint_txt}",
+                reply_markup=_prompt_back_markup("cancel_to:menu_tempmail")
+            )
+        return
+
+    elif data == "tm_vip_cookie_setup":
+        if not is_super_admin(user_id) and not has_admin_capability(user_id, "radar_users"):
+            safe_answer(call.id, "⛔ هذه الإمكانية مخصصة للإدارة فقط.", show_alert=True)
+            return
+        st = get_user_state(user_id)
+        st["input_mode"] = "waiting_smailpro_cookie"
+        safe_answer(call.id)
+        safe_send(
+            call.message.chat.id,
+            "🔑 <b>إعداد كوكيز جلسة SmailPro:</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+            "أرسل الآن نص الكوكيز المنسوخ من متصفحك لموقع <code>smailpro.com</code>\n"
+            "(مثال: <code>sonjj_session=...; XSRF-TOKEN=...</code>)\n\n"
+            "سيتم حفظ الكوكيز في الخزينة واستخدامها لإنشاء إيميلات Gmail و Outlook بدون أي كابتشا.",
+            reply_markup=_prompt_back_markup("cancel_to:menu_tempmail")
+        )
         return
 
     elif data.startswith("tm_dompage_"):
@@ -7875,6 +7997,18 @@ def _handle_text_inputs_impl(message: types.Message):
             f"📬 <code>{esc(mb['email'])}</code> <i>(اضغط للنسخ)</i>\n\n"
             f"💡 يمكنك استخدام هذا البريد في أي موقع، ثم فحص الوارد مباشرة من الزر أدناه.",
             reply_markup=mk
+        )
+        return
+
+    elif mode == "waiting_smailpro_cookie":
+        st["input_mode"] = None
+        cookie_text = text.strip()
+        tm_m.set_vip_cookie(cookie_text)
+        bot.reply_to(
+            message,
+            "✅ <b>تم حفظ وتفعيل كوكيز SmailPro بنجاح!</b>\n"
+            "يمكنك الآن توليد إيميلات Gmail و Outlook المميزة مباشرة وبدون كابتشا.",
+            reply_markup=_prompt_back_markup("cancel_to:menu_tempmail")
         )
         return
 

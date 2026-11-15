@@ -522,3 +522,138 @@ def get_telemetry_stats() -> dict[str, int]:
             "trash_emails_count": len(trash),
             "seen_messages_count": sum(len(v) for v in data.get("seen_messages", {}).values())
         }
+
+
+# ==============================================================================
+# إدارة البريد المميز (SmailPro VIP Engine) والحذف التلقائي بعد 5 دقائق
+# ==============================================================================
+_vip_timers: dict[str, threading.Timer] = {}
+
+
+def get_vip_cookie() -> str | None:
+    """جلب كوكيز SmailPro المحفوظة إما من متغيرات البيئة أو إعدادات المشرف"""
+    cookie = os.environ.get("SMAILPRO_COOKIE", "").strip()
+    if cookie:
+        return cookie
+    data = _get_data()
+    return data.get("smailpro_cookie")
+
+
+def set_vip_cookie(cookie_str: str) -> None:
+    """تحديث كوكيز SmailPro"""
+    with _tm_lock:
+        data = _get_data()
+        data["smailpro_cookie"] = cookie_str.strip()
+        _atomic_write_json(TEMP_EMAILS_FILE, data)
+        _notify_persistence("smailpro_cookie_updated")
+
+
+def create_vip_email(user_id: int, domain: str = "gmail.com", session_cookie: str | None = None, auto_delete_sec: int = 300, on_expired_callback: Any = None) -> dict[str, Any]:
+    """
+    إنشاء بريد مميز حقيقي بنطاق @gmail.com أو @outlook.com
+    مع جدولة حذف تلقائي بعد 5 دقائق (300 ثانية) إذا لم يُستخدم لتحرير الخانة للعامة.
+    """
+    effective_cookie = session_cookie or get_vip_cookie()
+    with _tm_lock:
+        mb = MailEngineManager.generate_vip_mailbox(domain=domain, session_cookie=effective_cookie)
+        if not mb or not mb.get("email"):
+            raise RuntimeError("تعذر إنشاء البريد المميز من مزود الخدمة.")
+
+        now_dt = datetime.datetime.now()
+        now_ts = now_dt.timestamp()
+        clean_email = mb["email"].strip().lower()
+
+        mailbox_record = {
+            "id": hashlib.sha1(f"{user_id}_{clean_email}_{now_ts}".encode()).hexdigest()[:12],
+            "user_id": int(user_id),
+            "email": clean_email,
+            "provider": "smailpro",
+            "token": mb.get("token", ""),
+            "domain": mb.get("domain", domain),
+            "username": mb.get("username", clean_email.split("@")[0]),
+            "created_at": now_dt.isoformat(),
+            "created_ts": now_ts,
+            "expires_at_ts": now_ts + auto_delete_sec,
+            "is_vip": True,
+            "used": False,
+            "auto_notify": True
+        }
+
+        data = _get_data()
+        data["users"][str(user_id)] = mailbox_record
+        data["history"].insert(0, mailbox_record)
+        data["history"] = data["history"][:300]
+        _atomic_write_json(TEMP_EMAILS_FILE, data)
+        _notify_persistence("tempmail_vip_created")
+
+        # جدولة مؤقت الحذف التلقائي بعد 5 دقائق
+        _schedule_vip_auto_cleanup(user_id, clean_email, auto_delete_sec, on_expired_callback)
+
+        return mailbox_record
+
+
+def _schedule_vip_auto_cleanup(user_id: int, email: str, delay_sec: int = 300, on_expired_callback: Any = None) -> None:
+    """جدولة مؤقت الحذف التلقائي بعد انتهاء المهلة"""
+    clean_email = email.strip().lower()
+    old_timer = _vip_timers.pop(clean_email, None)
+    if old_timer:
+        try:
+            old_timer.cancel()
+        except Exception:
+            pass
+
+    def _worker():
+        try:
+            _execute_vip_auto_cleanup(user_id, clean_email, on_expired_callback)
+        except Exception as e:
+            print(f"[VIP TempMail Expiry Error] {e}")
+
+    t = threading.Timer(delay_sec, _worker)
+    t.daemon = True
+    _vip_timers[clean_email] = t
+    t.start()
+
+
+def _execute_vip_auto_cleanup(user_id: int, email: str, on_expired_callback: Any = None) -> None:
+    """تنفيذ الحذف التلقائي واستدعاء delete_email على خادم المزود إن لم يُستخدم البريد"""
+    clean_email = email.strip().lower()
+    with _tm_lock:
+        data = _get_data()
+        uid_str = str(user_id)
+        active = data.get("users", {}).get(uid_str)
+
+        # التحقق هل البريد لا يزال هو النشط
+        if not active or active.get("email", "").lower() != clean_email:
+            return
+
+        # التحقق هل تم استخدامه (استلام رسائل أو تأكيد الاستخدام)
+        msg_count = len(data.get("mailbox_messages", {}).get(clean_email, []))
+        if active.get("used") or msg_count > 0:
+            return
+
+    # 1. استدعاء دالة الحذف على خادم SmailPro لتحرير الخانة للعامة
+    cookie = get_vip_cookie()
+    MailEngineManager.delete_mailbox(clean_email, provider="smailpro", session_cookie=cookie)
+
+    # 2. نقله محلياً إلى سلة المحذوفات
+    delete_user_email(user_id, clean_email, deleted_by=0)
+
+    # 3. إشعار المستخدم عبر التليجرام
+    if on_expired_callback:
+        try:
+            on_expired_callback(user_id, clean_email)
+        except Exception:
+            pass
+
+
+def mark_vip_email_used(user_id: int, email: str) -> None:
+    """تحديد أن المستخدم استخدم البريد المميز لمنع حذفه التلقائي"""
+    clean_email = email.strip().lower()
+    with _tm_lock:
+        data = _get_data()
+        uid_str = str(user_id)
+        active = data.get("users", {}).get(uid_str)
+        if active and active.get("email", "").lower() == clean_email:
+            active["used"] = True
+            _atomic_write_json(TEMP_EMAILS_FILE, data)
+

@@ -1853,4 +1853,28 @@ def start_webapp_and_tunnel(bot_token: str, hooks: dict[str, Any], port: int | N
             update_menu_button_for_user(bot_inst, int(super_id), is_allowed=True)
 
     start_public_tunnel_discovery(listen_port, on_url_ready=on_tunnel_ready)
+
+    # تشغيل آلية الإبقاء الحية (Keep-Alive Self Pinger) كل 5 دقائق لمنع خمول السيرفر في Render و HuggingFace
+    def _keep_alive_worker():
+        time.sleep(45)
+        while True:
+            try:
+                ext_url = os.environ.get("SELF_PING_URL") or os.environ.get("RENDER_EXTERNAL_URL")
+                if ext_url:
+                    if not ext_url.startswith("http"):
+                        ext_url = f"https://{ext_url}"
+                    target = f"{ext_url.rstrip('/')}/health"
+                    req = urllib.request.Request(target, headers={"User-Agent": "FB-Operator-KeepAlive/1.0"})
+                    with urllib.request.urlopen(req, timeout=10) as resp:
+                        pass
+                else:
+                    req = urllib.request.Request(f"http://127.0.0.1:{listen_port}/health", headers={"User-Agent": "FB-Operator-KeepAlive/1.0"})
+                    with urllib.request.urlopen(req, timeout=5) as resp:
+                        pass
+            except Exception:
+                pass
+            time.sleep(300)
+
+    threading.Thread(target=_keep_alive_worker, daemon=True, name="KeepAlivePinger").start()
+
     return server

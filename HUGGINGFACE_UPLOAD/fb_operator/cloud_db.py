@@ -101,7 +101,11 @@ def _normalize_turso_http_url(raw_url: str) -> str:
 def _load_file_cfg_unlocked() -> dict:
     cfg_path, _ = _active_db_paths()
     if not cfg_path.exists():
-        return {}
+        fallback = Path(__file__).resolve().parent / "cloud_db_config.json"
+        if fallback.exists():
+            cfg_path = fallback
+        else:
+            return {}
     try:
         data = json.loads(cfg_path.read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else {}
