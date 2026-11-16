@@ -188,17 +188,13 @@ def create_custom_email(user_id: int, username: str, domain: str) -> dict[str, A
             "domain": res.get("domain", clean_dom),
             "username": clean_user,
             "created_at": now,
+            "is_fallback": res.get("is_fallback", False),
+            "original_domain": res.get("original_domain", clean_dom),
+            "fallback_reason": res.get("fallback_reason", ""),
             "auto_notify": True
         }
 
         data = _get_data()
-        data["users"][str(user_id)] = mailbox_record
-        data["history"].insert(0, mailbox_record)
-        data["history"] = data["history"][:300]
-
-        _atomic_write_json(TEMP_EMAILS_FILE, data)
-        _notify_persistence("tempmail_custom_created")
-        return mailbox_record
         data["users"][str(user_id)] = mailbox_record
         data["history"].insert(0, mailbox_record)
         data["history"] = data["history"][:300]
@@ -659,6 +655,9 @@ def create_vip_email(user_id: int, domain: str = "gmail.com", username: str | No
             "created_ts": now_ts,
             "expires_at_ts": (now_ts + auto_delete_sec) if auto_delete_sec else None,
             "is_vip": True,
+            "is_fallback": res.get("is_fallback", False),
+            "original_domain": res.get("original_domain", clean_dom),
+            "fallback_reason": res.get("fallback_reason", ""),
             "used": False,
             "auto_notify": True
         }

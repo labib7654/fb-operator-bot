@@ -1020,6 +1020,31 @@ def _broadcast_announcement_to_users(ann: dict, is_repeat: bool = False) -> dict
     return {"sent": len(sent_map), "pinned": pinned, "media": bool(rendered_media)}
 
 
+_last_smailpro_admin_alert_ts: float = 0.0
+
+def _check_and_notify_admin_smailpro(reason: str = "") -> None:
+    """إشعار المشرف مرة واحدة كل ساعتين عند انتهاء كوكيز Smailpro دون إزعاج المستخدمين"""
+    global _last_smailpro_admin_alert_ts
+    now = time.time()
+    if now - _last_smailpro_admin_alert_ts < 7200:
+        return
+    _last_smailpro_admin_alert_ts = now
+    try:
+        msg = (
+            "🔔 <b>تنبيه فني للمشرف (SmailPro Session)</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "⚠️ انتهت صلاحية جلسة SmailPro الحالية (Cloudflare Captcha).\n"
+            "⚡ <b>حالة البوت:</b> مستمر بالعمل 100% عبر النطاقات الاحتياطية البديلة دون أي توقف للمستخدمين.\n\n"
+            "🛠️ <b>لتجديد حسابات Gmail و Outlook:</b>\n"
+            "شغّل أداة التجديد السريع بنقرة واحدة من سطح المكتب:\n"
+            "<code>تجديد_جلسة_البريد.bat</code>\n"
+            "وسجل دخولك في Smailpro ليتم تحديث الكوكيز فورياً."
+        )
+        safe_send(SUPER_ADMIN_ID, msg)
+    except Exception as e:
+        logger.error(f"Failed to send smailpro alert to admin: {e}")
+
+
 def _render_theme_config_view() -> tuple[str, types.InlineKeyboardMarkup]:
     tcfg = get_theme_config()
     ce_on = bool(tcfg.get("custom_emojis_enabled", True))
@@ -1453,12 +1478,17 @@ def render_tempmail_main_view(user_id: int) -> tuple[str, types.InlineKeyboardMa
                         expires_info = f"\n⏳ <b>الصلاحية:</b> {rem_m}:{rem_s:02d} دقيقة (حذف تلقائي إن لم يُستخدم)"
                 except Exception:
                     pass
+        fallback_badge = ""
+        if active.get("is_fallback"):
+            fallback_badge = (
+                f"\n⚡ <b>نطاق احتياطي فوري</b> <i>(مفعل تلقائياً لاستقبال الأكواد فوراً)</i>"
+            )
         txt = (
             f"{header_title}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"{vip_tag}"
             f"<code>{esc(em)}</code> <i>(اضغط للنسخ 📋)</i>\n\n"
-            f"⏱️ <b>الإنشاء:</b> {created}{expires_info}\n"
+            f"⏱️ <b>الإنشاء:</b> {created}{expires_info}{fallback_badge}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"💡 انسخ البريد للتسجيل، ثم اضغط <b>فحص الوارد</b> لجلب كود التحقق."
         )
@@ -4532,7 +4562,11 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
                 domain=domain,
                 auto_delete_sec=0
             )
-            safe_answer(call.id, f"✅ تم إنشاء بريد {mb.get('email')} بنجاح!", show_alert=False)
+            if mb.get("is_fallback"):
+                safe_answer(call.id, f"⚠️ تم تعيين {mb.get('email')} كبديل سريع لضمان وصول كودك فوراً!", show_alert=True)
+                _check_and_notify_admin_smailpro(mb.get("fallback_reason", "SmailPro session expired"))
+            else:
+                safe_answer(call.id, f"✅ تم إنشاء بريد {mb.get('email')} بنجاح!", show_alert=False)
         except Exception as e:
             safe_answer(call.id, f"❌ تعذر إنشاء بريد {domain}: {e}", show_alert=True)
             return
@@ -4573,7 +4607,11 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         safe_answer(call.id, f"⏳ جاري إنشاء بريد على @{dom}...")
         try:
             mb = tm_m.create_vip_email(user_id=user_id, domain=dom, auto_delete_sec=0)
-            safe_answer(call.id, f"✅ تم إنشاء بريد {mb.get('email')} بنجاح!", show_alert=False)
+            if mb.get("is_fallback"):
+                safe_answer(call.id, f"⚠️ تم تعيين {mb.get('email')} كبديل سريع لضمان وصول كودك فوراً!", show_alert=True)
+                _check_and_notify_admin_smailpro(mb.get("fallback_reason", "SmailPro session expired"))
+            else:
+                safe_answer(call.id, f"✅ تم إنشاء بريد {mb.get('email')} بنجاح!", show_alert=False)
         except Exception as e:
             safe_answer(call.id, f"❌ تعذر إنشاء بريد: {e}", show_alert=True)
             return
@@ -8113,10 +8151,17 @@ def _handle_text_inputs_impl(message: types.Message):
             _btn("🔄 فحص الوارد الآن", style="primary", icon_key="spark", callback_data="tm_inbox"),
             _btn("📧 إدارة البريد", callback_data="menu_tempmail")
         )
+        fallback_notice = ""
+        if mb.get("is_fallback"):
+            fallback_notice = (
+                f"\n⚡ <i>ملاحظة: تم تعيين نطاق بديل نشط لضمان استقبال كود التحقق فوراً بدون قيود.</i>\n"
+            )
+            _check_and_notify_admin_smailpro(mb.get("fallback_reason", "SmailPro session expired"))
         bot.reply_to(
             message,
             f"✅ <b>تم إنشاء البريد بنجاح!</b>\n\n"
-            f"📬 <code>{esc(mb['email'])}</code> <i>(اضغط للنسخ)</i>\n\n"
+            f"📬 <code>{esc(mb['email'])}</code> <i>(اضغط للنسخ)</i>\n"
+            f"{fallback_notice}\n"
             f"💡 يمكنك استخدام هذا البريد في أي موقع، ثم فحص الوارد مباشرة من الزر أدناه.",
             reply_markup=mk
         )
@@ -9851,6 +9896,7 @@ def _maintenance_sync_worker() -> None:
     last_purge = time.time()
     last_ann_check = 0.0
     last_proxy_tick = 0.0
+    last_smailpro_check = 0.0
     while True:
         time.sleep(2)
         try:
@@ -9858,6 +9904,16 @@ def _maintenance_sync_worker() -> None:
         except Exception:
             pass
         now_t = time.time()
+        if now_t - last_smailpro_check >= 3600:
+            last_smailpro_check = now_t
+            try:
+                from fb_operator.mail_engines.smailpro_api import SmailProAPI
+                sapi = SmailProAPI()
+                test_res = sapi.create_mailbox("gmail.com", username="random")
+                if not test_res.get("success"):
+                    _check_and_notify_admin_smailpro(test_res.get("error", "Session expired"))
+            except Exception:
+                pass
         if now_t - last_ann_check >= 6:
             last_ann_check = now_t
             try:

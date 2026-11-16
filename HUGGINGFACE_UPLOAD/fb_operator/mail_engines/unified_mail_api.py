@@ -69,21 +69,51 @@ class UnifiedMailAPI:
             return "guerrillamail"
         return "tempmail_net"
 
-    def create_mailbox(self, domain: str = "gmail.com", username: str = None) -> dict[str, Any]:
+    def create_mailbox(self, domain: str = "gmail.com", username: str = None, auto_failover: bool = True) -> dict[str, Any]:
         """
         Creates a mailbox by intelligently routing to the responsible provider.
+        Supports Auto-Failover: If primary provider (like Smailpro) fails (403/session/captcha),
+        automatically fails over to 24/7 open providers without captcha.
         """
         domain = domain.lower().strip() if domain else "gmail.com"
         provider = self.detect_provider(domain)
 
-        if provider == "smailpro":
-            return self.smailpro.create_mailbox(domain=domain, username=username or "random")
-        elif provider == "tempmail_net":
-            return self.tempmail_net.create_mailbox(username=username, domain=domain)
-        elif provider == "guerrillamail":
-            return self.guerrilla.create_mailbox(username=username, domain=domain)
-        else:
-            return self.tempmail_net.create_mailbox(username=username, domain=domain)
+        res = None
+        try:
+            if provider == "smailpro":
+                target_user = username
+                if domain in ["gmail.com", "googlemail.com", "outlook.com", "hotmail.com"]:
+                    target_user = "random"
+                res = self.smailpro.create_mailbox(domain=domain, username=target_user or "random")
+            elif provider == "tempmail_net":
+                res = self.tempmail_net.create_mailbox(username=username, domain=domain)
+            elif provider == "guerrillamail":
+                res = self.guerrilla.create_mailbox(username=username, domain=domain)
+            else:
+                res = self.tempmail_net.create_mailbox(username=username, domain=domain)
+        except Exception as e:
+            res = {"success": False, "error": str(e), "domain": domain}
+
+        if res and res.get("success"):
+            return res
+
+        # خطة الطوارئ الفورية (Auto-Failover): توليد فوري من النطاقات المفتوحة 24/7 بدون كابتشا
+        if auto_failover:
+            fallback_domains = ["deepmails.org", "agogmail.com", "besttempmail.com", "sharklasers.com", "guerrillamail.com"]
+            for fb_dom in fallback_domains:
+                if fb_dom == domain:
+                    continue
+                try:
+                    fb_res = self.create_mailbox(domain=fb_dom, username=username, auto_failover=False)
+                    if fb_res and fb_res.get("success"):
+                        fb_res["is_fallback"] = True
+                        fb_res["original_domain"] = domain
+                        fb_res["fallback_reason"] = res.get("error") if res else "Primary provider unavailable"
+                        return fb_res
+                except Exception:
+                    continue
+
+        return res or {"success": False, "error": "تعذر الاتصال بجميع سيرفرات البريد حالياً."}
 
     def get_messages(self, mailbox_data: dict[str, Any]) -> list[dict[str, Any]]:
         """
