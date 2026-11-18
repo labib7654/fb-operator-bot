@@ -444,13 +444,16 @@ def check_inbox(user_id: int, email: str | None = None) -> list[dict[str, Any]]:
             body_html = str(m.get("body_html") or m.get("html") or raw_body)
             body_txt = OtpExtractor.clean_html(raw_body) if ("<" in raw_body and ">" in raw_body) else raw_body
             subj = str(m.get("subject") or "")
-            otp = OtpExtractor.extract_otp(f"{subj} {body_txt}", body_html) or m.get("otp")
+            sender_name = m.get("sender") or m.get("from") or "Unknown"
+            platform = OtpExtractor.detect_platform(sender_name, subj, body_txt)
+            otp = OtpExtractor.extract_otp(body_txt, html_content=body_html, subject=subj) or m.get("otp")
             act_link = m.get("action_link")
             links = [act_link] if act_link else OtpExtractor.extract_links(body_txt, body_html)
 
             raw_messages.append({
                 "id": mid,
-                "sender": m.get("sender") or m.get("from") or "Unknown",
+                "sender": sender_name,
+                "platform": platform,
                 "subject": subj,
                 "date": m.get("date") or "",
                 "body_text": body_txt,
@@ -476,9 +479,10 @@ def check_inbox(user_id: int, email: str | None = None) -> list[dict[str, Any]]:
             body_html = msg.get("body_html", "")
             subject = msg.get("subject", "")
 
-            # استخراج كود الـ OTP وروابط التفعيل
-            otp_code = OtpExtractor.extract_otp(f"{subject} {body_text}", body_html)
-            links = OtpExtractor.extract_links(body_text, body_html)
+            # استخراج كود الـ OTP وروابط التفعيل واسم المنصة
+            otp_code = msg.get("otp_code") or OtpExtractor.extract_otp(body_text, html_content=body_html, subject=subject)
+            links = msg.get("links") or OtpExtractor.extract_links(body_text, body_html)
+            platform = msg.get("platform") or OtpExtractor.detect_platform(msg.get("sender", ""), subject, body_text)
 
             is_new = msg_id not in seen_list
             if msg_id:
@@ -487,6 +491,7 @@ def check_inbox(user_id: int, email: str | None = None) -> list[dict[str, Any]]:
             p_item = {
                 "id": msg_id,
                 "sender": msg.get("sender", "Unknown"),
+                "platform": platform,
                 "subject": subject,
                 "date": msg.get("date", ""),
                 "body_text": body_text,

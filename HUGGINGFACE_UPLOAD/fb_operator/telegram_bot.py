@@ -1658,6 +1658,7 @@ def render_tempmail_inbox_view(user_id: int, email: str | None = None) -> tuple[
         )
         for idx, m in enumerate(messages[:10], start=1):
             sender = esc(m.get("sender") or "مجهول")
+            platform = esc(m.get("platform") or "")
             subj = esc(m.get("subject") or "بدون عنوان")
             otp = m.get("otp_code")
             links = m.get("links") or []
@@ -1665,7 +1666,8 @@ def render_tempmail_inbox_view(user_id: int, email: str | None = None) -> tuple[
             mid = str(m.get("id") or idx)
             msg_hash = hashlib.sha1(f"{target_email}_{mid}".encode()).hexdigest()[:8]
 
-            txt += f"<b>[{idx}] من:</b> {sender}\n"
+            plat_badge = f" | {platform}" if platform and platform != "🌐 منصة إلكترونية" else ""
+            txt += f"<b>[{idx}] من:</b> {sender}{plat_badge}\n"
             txt += f"📌 <b>الموضوع:</b> {subj}\n"
             if date:
                 txt += f"⏱️ <b>الوقت:</b> {date}\n"
@@ -1712,6 +1714,7 @@ def render_tempmail_single_message_view(user_id: int, target_email: str, msg: di
     mk = types.InlineKeyboardMarkup(row_width=1)
 
     sender = esc(msg.get("sender") or "مجهول")
+    platform = esc(msg.get("platform") or "")
     subj = esc(msg.get("subject") or "بدون عنوان")
     date = esc(str(msg.get("date") or ""))
     otp = msg.get("otp_code")
@@ -1721,10 +1724,12 @@ def render_tempmail_single_message_view(user_id: int, target_email: str, msg: di
         from fb_operator.otp_extractor import OtpExtractor
         body_text = OtpExtractor.clean_html(body_text)
 
+    plat_line = f"🌐 <b>المنصة:</b> {platform}\n" if platform and platform != "🌐 منصة إلكترونية" else ""
     txt = (
         f"📖 <b>تفاصيل الرسالة الكاملة</b>\n"
         f"📭 <b>صندوق البريد:</b> <code>{esc(target_email)}</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"{plat_line}"
         f"👤 <b>المرسل:</b> {sender}\n"
         f"📌 <b>الموضوع:</b> {subj}\n"
     )
@@ -9967,6 +9972,7 @@ def _tempmail_auto_poller_worker() -> None:
                     new_msgs = [m for m in tm_m.check_inbox(uid, target_email) if m.get("is_new")]
                     for msg in new_msgs:
                         sender = esc(msg.get("sender") or "مجهول")
+                        platform = esc(msg.get("platform") or "")
                         subj = esc(msg.get("subject") or "بدون عنوان")
                         otp = msg.get("otp_code")
                         links = msg.get("links") or []
@@ -9984,9 +9990,11 @@ def _tempmail_auto_poller_worker() -> None:
                             _notified_msg_fingerprints.clear()
                             _notified_msg_fingerprints.add(fp)
 
+                        plat_line = f"🌐 <b>المنصة:</b> {platform}\n" if platform and platform != "🌐 منصة إلكترونية" else ""
                         alert_txt = (
                             f"🔔 <b>وصلت رسالة جديدة إلى بريدك المؤقت!</b>\n"
                             f"━━━━━━━━━━━━━━━━━━━━\n"
+                            f"{plat_line}"
                             f"📬 <b>البريد:</b> <code>{esc(target_email)}</code>\n"
                             f"👤 <b>من:</b> {sender}\n"
                             f"📌 <b>الموضوع:</b> {subj}\n"
