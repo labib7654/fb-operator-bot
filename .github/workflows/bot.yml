@@ -1,69 +1,22 @@
-name: FB Operator 24/7 Cloud Bot (Real Desktop Environment)
-
-on:
-  push:
-    branches: [ main ]
-    paths-ignore:
-      - 'fb_operator_vault.json'
-  workflow_dispatch:
-  schedule:
-    - cron: '0 */5 * * *'
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
-permissions:
-  contents: write
-
-jobs:
-  run-fb-operator:
-    runs-on: ubuntu-latest
-    timeout-minutes: 315
-    steps:
-      - name: 📥 جلب الكود
-        uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          persist-credentials: true
-
-      - name: 🐍 إعداد بايثون 3.12
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: 🖥️ تثبيت بيئة سطح المكتب والمتصفح واعتماديات التشغيل
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y --no-install-recommends \
-            xvfb \
-            x11-utils \
-            fonts-noto-core \
-            fonts-noto-cjk \
-            fonts-noto-extra \
-            fonts-noto-ui-core \
-            fonts-noto-color-emoji
-
-          if [ -f "HUGGINGFACE_UPLOAD/requirements.txt" ]; then
-            pip install -r HUGGINGFACE_UPLOAD/requirements.txt
-          elif [ -f "requirements.txt" ]; then
-            pip install -r requirements.txt
-          fi
-
-          pip install patchright playwright || true
-          patchright install --with-deps chromium || true
-          playwright install --with-deps chromium || true
-
-      - name: 🚀 تشغيل البوت في بيئة ديسكتوب حقيقية 1920x1080 (Xvfb)
+            chmod +x /tmp/cloudflared && sudo mv /tmp/cloudflared /usr/local/bin/cloudflared || true
+          curl -sSL https://github.com/go-gost/gost/releases/download/v3.3.3/gost_3.3.3_linux_amd64.tar.gz -o /tmp/gost.tar.gz && \
+            tar -xzf /tmp/gost.tar.gz -C /tmp gost && chmod +x /tmp/gost && sudo mv /tmp/gost /usr/local/bin/gost && \
+            rm -f /tmp/gost.tar.gz || true
+      - name: 🚀 تشغيل البوت في بيئة ديسكتوب حقيقية 1920x1080 (Xvfb Real Display)
         env:
           _SECRET_BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           FB_VAULT_KEY: ${{ secrets.FB_VAULT_KEY }}
           CLOUD_DB_TYPE: ${{ secrets.CLOUD_DB_TYPE }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          FB_PROXY: ${{ secrets.FB_PROXY }}
+          FB_PROXY_POOL: ${{ secrets.FB_PROXY_POOL }}
+          FB_4G_TUNNEL: ${{ secrets.FB_4G_TUNNEL }}
           PYTHONUNBUFFERED: "1"
         run: |
           if [ -n "$_SECRET_BOT_TOKEN" ]; then export BOT_TOKEN="$_SECRET_BOT_TOKEN"; fi
+          
+          # ضبط مسار بايثون ليشمل مجلد البوت دائماً
           export PYTHONPATH="$PWD/HUGGINGFACE_UPLOAD:$PWD:$PYTHONPATH"
           
           rc=0
@@ -71,6 +24,8 @@ jobs:
             timeout -k 30s --signal=SIGTERM 295m xvfb-run -a -s "-screen 0 1920x1080x24 -ac +extension GLX +render -noreset" python HUGGINGFACE_UPLOAD/fb_operator/telegram_bot.py || rc=$?
           elif [ -f "fb_operator/telegram_bot.py" ]; then
             timeout -k 30s --signal=SIGTERM 295m xvfb-run -a -s "-screen 0 1920x1080x24 -ac +extension GLX +render -noreset" python fb_operator/telegram_bot.py || rc=$?
+          elif [ -f "telegram_bot.py" ]; then
+            timeout -k 30s --signal=SIGTERM 295m xvfb-run -a -s "-screen 0 1920x1080x24 -ac +extension GLX +render -noreset" python telegram_bot.py || rc=$?
           else
             echo "❌ لم يتم العثور على ملف telegram_bot.py!"
             exit 1
