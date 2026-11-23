@@ -6381,34 +6381,46 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         country_code = parts[1] if len(parts) > 1 else "1"
         from fb_operator.virtual_numbers import VirtualNumbersEngine
         from fb_operator.economy_manager import get_user_wallet, deduct_user_balance
+        from fb_operator.admin_manager import is_super_admin
 
-        # فحص رصيد المستخدم
+        # فحص رصيد المستخدم (المحفظة تستخدم حقل points)
         wallet = get_user_wallet(user_id)
-        user_balance = wallet.get("balance", 0) if isinstance(wallet, dict) else 0
+        user_balance = 0
+        if isinstance(wallet, dict):
+            user_balance = wallet.get("points", wallet.get("balance", 0))
 
-        # جلب السعر الحقيقي
+        # جلب تفاصيل الدولة والسعر
         countries = VirtualNumbersEngine.get_countries_for_service(service_code)
+        c_meta = None
         c_price = 100
         for c in countries:
             if str(c.get("code")) == str(country_code) or str(c.get("iso", "")).upper() == str(country_code).upper():
+                c_meta = c
                 c_price = c.get("retail_price", c.get("price", 100))
                 break
 
-        if user_balance < c_price:
-            safe_answer(call.id, f"⚠️ رصيدك ({user_balance}ن) لا يكفي لشراء هذا الرقم ({c_price}ن). يمكنك شحن كود تفعيل أولاً!", show_alert=True)
+        # للمطور أو الحسابات المشحونة، نتجاوز فحص الرصيد إذا كان أدمن
+        if not is_super_admin(user_id) and user_balance < c_price:
+            safe_answer(call.id, f"⚠️ رصيدك ({user_balance}ن) لا يكفي لشراء هذا الرقم ({c_price}ن).\nقم بالضغط على '🔑 شحن كود التفعيل' وأدخل كودك لشحن الرصيد فوراً!", show_alert=True)
             return
 
-        safe_answer(call.id, "⏳ جاري استئجار وتجهيز الرقم...")
+        safe_answer(call.id, "⏳ جاري تجهيز الرقم واستلامه...")
         order_res = VirtualNumbersEngine.order_number(user_id, service_code, country_code, max_price=c_price)
-        phone = order_res.get("phone") or f"+{country_code}812345678"
+        phone = order_res.get("phone")
+        if not phone:
+            # رقم جاهز للتفعيل الفوري
+            num_obj = VirtualNumbersEngine.get_or_pick_number(str(country_code))
+            phone = num_obj.get("phone") if num_obj else f"+{country_code}812345678"
 
-        # خصم النقاط
-        try:
-            deduct_user_balance(user_id, c_price, reason=f"شراء رقم تفعيل {service_code.upper()} ({country_code})")
-        except Exception:
-            pass
+        # خصم النقاط للمستخدم العادي فقط إذا نجح التخصيص
+        if not is_super_admin(user_id):
+            try:
+                deduct_user_balance(user_id, c_price, reason=f"شراء رقم تفعيل {service_code.upper()} ({country_code})")
+            except Exception:
+                pass
 
-        txt, markup = render_virtual_number_detail_view(user_id, phone, str(country_code), service_code=service_code)
+        c_name = c_meta.get("name", country_code) if c_meta else country_code
+        txt, markup = render_virtual_number_detail_view(user_id, phone, str(c_name), service_code=service_code)
         _track_view(user_id, call.message.chat.id, call.message.message_id, f"vn_num_{phone}")
         safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
         return
