@@ -410,8 +410,8 @@ class VirtualNumbersEngine:
             req = urllib.request.Request(url, data=payload, headers=headers)
             with urllib.request.urlopen(req, timeout=10) as resp:
                 res = json.loads(resp.read().decode("utf-8"))
-                if res.get("status") == "SUCCESS" or res.get("success"):
-                    coins = res.get("coins", 0)
+                if res.get("status") == "SUCCESS" or res.get("success") is True:
+                    coins = res.get("coins_added", res.get("coins", 0))
                     return {"success": True, "coins": coins, "message": f"تم تفعيل الكود بنجاح وإضافة {coins} نقطة!"}
                 else:
                     msg = res.get("message", "الكود غير صالح أو مستخدم مسبقاً")
@@ -421,6 +421,30 @@ class VirtualNumbersEngine:
             return {"success": False, "coins": 0, "message": f"خطأ في التحقق من الكود ({e.code})"}
         except Exception as e:
             return {"success": False, "coins": 0, "message": str(e)}
+
+    @classmethod
+    def generate_voucher(cls, coins: int = 100, package: str = "VIP Points") -> Dict[str, Any]:
+        """توليد كود شحن فوري جديد عبر سيرفر Supabase RPC"""
+        supabase_url = os.environ.get("SUPABASE_URL", "https://pnjqmgrgmijtrqwpzfhx.supabase.co")
+        anon_key = os.environ.get("SUPABASE_ANON_KEY", "sb_publishable_fwH6Mh8ehuabCV5IVDAR2Q_rFIWu9HR")
+        url = f"{supabase_url}/rest/v1/rpc/generate_voucher"
+        headers = {
+            "apikey": anon_key,
+            "Authorization": f"Bearer {anon_key}",
+            "Content-Type": "application/json"
+        }
+        payload = json.dumps({
+            "p_package": package,
+            "p_coins": int(coins)
+        }).encode("utf-8")
+        try:
+            req = urllib.request.Request(url, data=payload, headers=headers)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                raw_code = resp.read().decode("utf-8").strip().strip('"')
+                return {"success": True, "code": raw_code, "coins": coins}
+        except Exception as e:
+            logger.error("Failed to generate voucher: %s", e)
+            return {"success": False, "error": str(e)}
 
     # -------------------------------------------------------------
     # دوال التوافق القديمة (Compatibility methods for telegram_bot.py)

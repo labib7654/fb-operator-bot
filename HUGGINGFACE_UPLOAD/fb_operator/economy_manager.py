@@ -472,6 +472,16 @@ def adjust_user_points(
     }
 
 
+def credit_user_balance(uid: int, points: int | float, reason: str = "") -> dict:
+    """إيداع نقاط في محفظة المستخدم"""
+    return adjust_user_points(uid, points, tx_type="REWARD", reason=reason or "شحن رصيد")
+
+
+def deduct_user_balance(uid: int, points: int | float, reason: str = "") -> dict:
+    """خصم نقاط من محفظة المستخدم"""
+    return adjust_user_points(uid, -abs(points), tx_type="MISSION", reason=reason or "خصم رصيد", allow_partial_zero=True)
+
+
 def reward_account_activation(
     owner_id: int,
     acc_id: str,

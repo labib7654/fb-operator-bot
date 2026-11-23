@@ -7925,6 +7925,7 @@ def _handle_text_inputs_impl(message: types.Message):
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"🪙 تم إضافة: <b>+{coins}</b> نقطة إلى محفظتك بنجاح.\n"
                 f"📱 يمكنك الآن طلب أرقام التفعيل فوراً من قائمة الأرقام!",
+                parse_mode="HTML",
                 reply_markup=types.InlineKeyboardMarkup().row(
                     types.InlineKeyboardButton("📱 طلب رقم تفعيل", callback_data="menu_virtual_numbers")
                 )
@@ -7933,6 +7934,7 @@ def _handle_text_inputs_impl(message: types.Message):
             bot.reply_to(
                 message,
                 f"❌ <b>فشل تفعيل الكود:</b>\n{esc(v_res.get('message', 'الكود غير صالح'))}",
+                parse_mode="HTML",
                 reply_markup=types.InlineKeyboardMarkup().row(
                     types.InlineKeyboardButton("🔙 العودة للأرقام", callback_data="menu_virtual_numbers")
                 )
