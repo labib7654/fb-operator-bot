@@ -7,11 +7,10 @@ on:
       - 'fb_operator_vault.json'
   workflow_dispatch:
   schedule:
-    # يتجدد التشغيل تلقائياً كل 5 ساعات ليبقى شغالاً في السحاب 24/7 دون توقف
     - cron: '0 */5 * * *'
 
 concurrency:
-  group: fb-operator-24-7-bot
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -45,29 +44,38 @@ jobs:
             fonts-noto-ui-core \
             fonts-noto-color-emoji
 
-          # تثبيت متطلبات بايثون ومتصفح Chromium بكامل مكتبات النظام المتوافقة مع أوبونتو تلقائياً
-          if [ -d "HUGGINGFACE_UPLOAD" ]; then
+          if [ -f "HUGGINGFACE_UPLOAD/requirements.txt" ]; then
             pip install -r HUGGINGFACE_UPLOAD/requirements.txt
-            playwright install --with-deps chromium
-          else
+          elif [ -f "requirements.txt" ]; then
             pip install -r requirements.txt
-            playwright install --with-deps chromium
           fi
 
-      - name: 🚀 تشغيل البوت في بيئة ديسكتوب حقيقية 1920x1080 (Xvfb Real Display)
+          pip install patchright playwright || true
+          patchright install --with-deps chromium || true
+          playwright install --with-deps chromium || true
+
+      - name: 🚀 تشغيل البوت في بيئة ديسكتوب حقيقية 1920x1080 (Xvfb)
         env:
           _SECRET_BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           FB_VAULT_KEY: ${{ secrets.FB_VAULT_KEY }}
+          CLOUD_DB_TYPE: ${{ secrets.CLOUD_DB_TYPE }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           PYTHONUNBUFFERED: "1"
         run: |
           if [ -n "$_SECRET_BOT_TOKEN" ]; then export BOT_TOKEN="$_SECRET_BOT_TOKEN"; fi
-          # حفظ تلقائي قبل انتهاء الدورة بـ 5 دقائق ومنع خطأ خروج timeout 124/143
+          export PYTHONPATH="$PWD/HUGGINGFACE_UPLOAD:$PWD:$PYTHONPATH"
+          
           rc=0
-          if [ -d "HUGGINGFACE_UPLOAD" ]; then
+          if [ -f "HUGGINGFACE_UPLOAD/fb_operator/telegram_bot.py" ]; then
             timeout -k 30s --signal=SIGTERM 295m xvfb-run -a -s "-screen 0 1920x1080x24 -ac +extension GLX +render -noreset" python HUGGINGFACE_UPLOAD/fb_operator/telegram_bot.py || rc=$?
-          else
+          elif [ -f "fb_operator/telegram_bot.py" ]; then
             timeout -k 30s --signal=SIGTERM 295m xvfb-run -a -s "-screen 0 1920x1080x24 -ac +extension GLX +render -noreset" python fb_operator/telegram_bot.py || rc=$?
+          else
+            echo "❌ لم يتم العثور على ملف telegram_bot.py!"
+            exit 1
           fi
+          
           if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && [ "$rc" -ne 143 ]; then
             exit "$rc"
           fi
