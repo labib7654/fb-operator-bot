@@ -1,7 +1,63 @@
+name: FB Operator 24/7 Cloud Bot (Real Desktop Environment)
+
+on:
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - 'fb_operator_vault.json'
+  workflow_dispatch:
+  schedule:
+    # يتجدد التشغيل تلقائياً كل 5 ساعات ليبقى شغالاً في السحاب 24/7 دون توقف
+    - cron: '0 */5 * * *'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  run-fb-operator:
+    runs-on: ubuntu-latest
+    timeout-minutes: 315
+    steps:
+      - name: 📥 جلب الكود
+        uses: actions/checkout@v4
+
+      - name: 🐍 إعداد بايثون 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 🖥️ تثبيت بيئة سطح المكتب والمتصفح واعتماديات التشغيل
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            xvfb \
+            x11-utils \
+            fonts-noto-core \
+            fonts-noto-cjk \
+            fonts-noto-extra \
+            fonts-noto-ui-core \
+            fonts-noto-color-emoji
+
+          # تثبيت متطلبات بايثون
+          if [ -f "HUGGINGFACE_UPLOAD/requirements.txt" ]; then
+            pip install -r HUGGINGFACE_UPLOAD/requirements.txt
+          elif [ -f "requirements.txt" ]; then
+            pip install -r requirements.txt
+          fi
+
+          # تثبيت محركات التصفح المضادة للكشف
+          pip install patchright playwright || true
+          patchright install --with-deps chromium || true
+          playwright install --with-deps chromium || true
+
+          # تثبيت أدوات الشبكة والبروكسي
+          curl -sSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /tmp/cloudflared && \
             chmod +x /tmp/cloudflared && sudo mv /tmp/cloudflared /usr/local/bin/cloudflared || true
           curl -sSL https://github.com/go-gost/gost/releases/download/v3.3.3/gost_3.3.3_linux_amd64.tar.gz -o /tmp/gost.tar.gz && \
             tar -xzf /tmp/gost.tar.gz -C /tmp gost && chmod +x /tmp/gost && sudo mv /tmp/gost /usr/local/bin/gost && \
             rm -f /tmp/gost.tar.gz || true
+
       - name: 🚀 تشغيل البوت في بيئة ديسكتوب حقيقية 1920x1080 (Xvfb Real Display)
         env:
           _SECRET_BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
