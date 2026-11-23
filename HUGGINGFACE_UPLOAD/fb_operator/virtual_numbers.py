@@ -257,7 +257,7 @@ class VirtualNumbersEngine:
         url = f"{VSMS_BASE_URL}/v1/vsms/numbers"
         try:
             req = urllib.request.Request(url, data=body, headers=headers)
-            with urllib.request.urlopen(req, timeout=12) as resp:
+            with urllib.request.urlopen(req, timeout=4) as resp:
                 res_data = json.loads(resp.read().decode("utf-8"))
                 order_id = res_data.get("id") or f"ord_{int(time.time())}"
                 phone = res_data.get("phone_number", "")

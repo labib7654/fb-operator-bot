@@ -3613,7 +3613,9 @@ def render_virtual_numbers_countries_view(user_id: int, service_code: str) -> tu
         c_code = c.get("code") or c.get("iso")
         c_name = c.get("name")
         c_price = c.get("retail_price", c.get("price", 0))
-        btn_text = f"{c.get('flag', '🌐')} {c_name} ({c_price}ن)"
+        iso = str(c.get("iso", "")).strip().upper()
+        flag = "".join(chr(ord(ch) + 127397) for ch in iso) if len(iso) == 2 and iso.isalpha() else "🌐"
+        btn_text = f"{flag} {c_name} ({c_price}ن)"
         c_btns.append(types.InlineKeyboardButton(btn_text, callback_data=f"vn_buy_{service_code}_{c_code}"))
     for i in range(0, len(c_btns), 2):
         markup.row(*c_btns[i:i+2])
@@ -6383,6 +6385,8 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         from fb_operator.economy_manager import get_user_wallet, deduct_user_balance
         from fb_operator.admin_manager import is_super_admin
 
+        safe_answer(call.id)
+
         # فحص رصيد المستخدم (المحفظة تستخدم حقل points)
         wallet = get_user_wallet(user_id)
         user_balance = 0
@@ -6399,12 +6403,29 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
                 c_price = c.get("retail_price", c.get("price", 100))
                 break
 
-        # للمطور أو الحسابات المشحونة، نتجاوز فحص الرصيد إذا كان أدمن
+        c_name = c_meta.get("name", country_code) if c_meta else country_code
+        iso = str(c_meta.get("iso", "")).strip().upper() if c_meta else ""
+        flag = "".join(chr(ord(ch) + 127397) for ch in iso) if len(iso) == 2 and iso.isalpha() else "🌐"
+
+        # إذا كان الرصيد غير كافٍ وليس سوبر أدمن، نعرض شاشة توضيحية فورية مع زر الشحن
         if not is_super_admin(user_id) and user_balance < c_price:
-            safe_answer(call.id, f"⚠️ رصيدك ({user_balance}ن) لا يكفي لشراء هذا الرقم ({c_price}ن).\nقم بالضغط على '🔑 شحن كود التفعيل' وأدخل كودك لشحن الرصيد فوراً!", show_alert=True)
+            lines = [
+                "⚠️ <b>رصيدك غير كافٍ لشراء هذا الرقم</b>",
+                "━━━━━━━━━━━━━━━━━━━━",
+                f"• الخدمة: <b>{service_code.upper()}</b>",
+                f"• الدولة: <b>{flag} {c_name}</b>",
+                f"• التكلفة المطلوبة: <b>{c_price} نقطة</b>",
+                f"• رصيدك المتوفر: <b>{user_balance} نقطة</b>",
+                "",
+                "💡 اشحن رصيدك عبر إدخال كود التفعيل (Voucher) لتتمكن من استخراج الرقم فوراً!"
+            ]
+            markup = types.InlineKeyboardMarkup(row_width=1)
+            markup.row(types.InlineKeyboardButton("🔑 شحن كود التفعيل (Voucher)", callback_data="vn_redeem_prompt"))
+            markup.row(types.InlineKeyboardButton("🔙 اختيار دولة أخرى", callback_data=f"vn_srv_{service_code}"))
+            markup.row(types.InlineKeyboardButton("🏠 الرئيسية", callback_data="back_to_main"))
+            safe_edit_message("\n".join(lines), call.message.chat.id, call.message.message_id, reply_markup=markup)
             return
 
-        safe_answer(call.id, "⏳ جاري تجهيز الرقم واستلامه...")
         order_res = VirtualNumbersEngine.order_number(user_id, service_code, country_code, max_price=c_price)
         phone = order_res.get("phone")
         if not phone:
@@ -6419,7 +6440,6 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
             except Exception:
                 pass
 
-        c_name = c_meta.get("name", country_code) if c_meta else country_code
         txt, markup = render_virtual_number_detail_view(user_id, phone, str(c_name), service_code=service_code)
         _track_view(user_id, call.message.chat.id, call.message.message_id, f"vn_num_{phone}")
         safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
