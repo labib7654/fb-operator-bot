@@ -6429,11 +6429,24 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         order_res = VirtualNumbersEngine.order_number(user_id, service_code, country_code, max_price=c_price)
         phone = order_res.get("phone")
         if not phone:
-            # رقم جاهز للتفعيل الفوري
-            num_obj = VirtualNumbersEngine.get_or_pick_number(str(country_code))
-            phone = num_obj.get("phone") if num_obj else f"+{country_code}812345678"
+            err_msg = order_res.get("error") or "المزود لم يوفر رقماً لهذه الدولة حالياً، أو يتطلب توكن حساب مفعل."
+            lines = [
+                "❌ <b>تعذر استخراج رقم حقيقي من المزود</b>",
+                "━━━━━━━━━━━━━━━━━━━━",
+                f"• الخدمة: <b>{service_code.upper()}</b>",
+                f"• الدولة: <b>{flag} {c_name}</b>",
+                "",
+                f"⚠️ <b>استجابة السيرفر:</b> <code>{esc(str(err_msg)[:120])}</code>",
+                "",
+                "💡 <b>ملاحظة:</b> لم يتم خصم أي نقاط من محفظتك. يرجى تجربة دولة أخرى أو ربط توكن VirtuNum."
+            ]
+            markup = types.InlineKeyboardMarkup(row_width=1)
+            markup.row(types.InlineKeyboardButton("🔙 اختيار دولة أخرى", callback_data=f"vn_srv_{service_code}"))
+            markup.row(types.InlineKeyboardButton("🏠 الرئيسية", callback_data="back_to_main"))
+            safe_edit_message("\n".join(lines), call.message.chat.id, call.message.message_id, reply_markup=markup)
+            return
 
-        # خصم النقاط للمستخدم العادي فقط إذا نجح التخصيص
+        # خصم النقاط للمستخدم العادي فقط إذا تم استخراج رقم حقيقي بنجاح من المزود
         if not is_super_admin(user_id):
             try:
                 deduct_user_balance(user_id, c_price, reason=f"شراء رقم تفعيل {service_code.upper()} ({country_code})")

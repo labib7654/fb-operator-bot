@@ -259,8 +259,8 @@ class VirtualNumbersEngine:
             req = urllib.request.Request(url, data=body, headers=headers)
             with urllib.request.urlopen(req, timeout=4) as resp:
                 res_data = json.loads(resp.read().decode("utf-8"))
-                order_id = res_data.get("id") or f"ord_{int(time.time())}"
-                phone = res_data.get("phone_number", "")
+                order_id = str(res_data.get("numberId") or res_data.get("id") or f"ord_{int(time.time())}")
+                phone = str(res_data.get("number") or res_data.get("phone_number") or res_data.get("phone") or "")
                 expires = int(time.time()) + (res_data.get("expiration_time", 20) * 60)
 
                 db_path = _get_db_path()
