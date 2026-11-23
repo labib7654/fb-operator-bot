@@ -392,8 +392,11 @@ class VirtualNumbersEngine:
     def redeem_voucher(cls, code: str, user_id: int) -> Dict[str, Any]:
         """شحن كود التفعيل عبر Supabase"""
         code = code.strip().upper()
-        supabase_url = os.environ.get("SUPABASE_URL", "https://pnjqmgrgmijtrqwpzfhx.supabase.co")
-        anon_key = os.environ.get("SUPABASE_ANON_KEY", "sb_publishable_fwH6Mh8ehuabCV5IVDAR2Q_rFIWu9HR")
+        if not code.startswith("VN-"):
+            code = f"VN-{code}"
+
+        supabase_url = os.environ.get("SUPABASE_URL") or "https://pnjqmgrgmijtrqwpzfhx.supabase.co"
+        anon_key = os.environ.get("SUPABASE_ANON_KEY") or "sb_publishable_fwH6Mh8ehuabCV5IVDAR2Q_rFIWu9HR"
 
         url = f"{supabase_url}/rest/v1/rpc/redeem_activation_code"
         headers = {
@@ -425,8 +428,8 @@ class VirtualNumbersEngine:
     @classmethod
     def generate_voucher(cls, coins: int = 100, package: str = "VIP Points") -> Dict[str, Any]:
         """توليد كود شحن فوري جديد عبر سيرفر Supabase RPC"""
-        supabase_url = os.environ.get("SUPABASE_URL", "https://pnjqmgrgmijtrqwpzfhx.supabase.co")
-        anon_key = os.environ.get("SUPABASE_ANON_KEY", "sb_publishable_fwH6Mh8ehuabCV5IVDAR2Q_rFIWu9HR")
+        supabase_url = os.environ.get("SUPABASE_URL") or "https://pnjqmgrgmijtrqwpzfhx.supabase.co"
+        anon_key = os.environ.get("SUPABASE_ANON_KEY") or "sb_publishable_fwH6Mh8ehuabCV5IVDAR2Q_rFIWu9HR"
         url = f"{supabase_url}/rest/v1/rpc/generate_voucher"
         headers = {
             "apikey": anon_key,
