@@ -3575,57 +3575,90 @@ def _render_admin_wallets_view() -> tuple[str, types.InlineKeyboardMarkup]:
 
 
 def render_virtual_numbers_main_view(user_id: int) -> tuple[str, types.InlineKeyboardMarkup]:
-    from fb_operator.virtual_numbers import VirtualNumbersEngine
-    countries = VirtualNumbersEngine.list_countries()
+    from fb_operator.virtual_numbers import VirtualNumbersEngine, POPULAR_SERVICES
     lines = [
-        "📱 <b>أرقام التفعيل</b>",
+        "📱 <b>منظومة أرقام التفعيل الحية (VirtuNum API)</b>",
         "━━━━━━━━━━━━━━━━━━━━",
-        "اختر الدولة لطلب الرقم:"
+        "⚡ اختر التطبيق المطلوب استخراج رقم تفعيل له:",
     ]
     markup = types.InlineKeyboardMarkup(row_width=2)
-    c_btns = []
-    for c in countries:
-        c_btns.append(types.InlineKeyboardButton(f"{c['flag']} {c['name']}", callback_data=f"vn_c_{c['code']}"))
-    for i in range(0, len(c_btns), 2):
-        markup.row(*c_btns[i:i+2])
+    s_btns = []
+    for s in POPULAR_SERVICES:
+        s_btns.append(types.InlineKeyboardButton(f"{s['icon']} {s['name']}", callback_data=f"vn_srv_{s['code']}"))
+    for i in range(0, len(s_btns), 2):
+        markup.row(*s_btns[i:i+2])
 
-    markup.row(types.InlineKeyboardButton("🎲 رقم عشوائي", callback_data="vn_pick_random"))
+    markup.row(types.InlineKeyboardButton("🔑 شحن كود التفعيل (Voucher)", callback_data="vn_redeem_prompt"))
     markup.row(types.InlineKeyboardButton("🏠 الرئيسية", callback_data="back_to_main"))
     return "\n".join(lines), markup
 
 
-def render_virtual_number_detail_view(user_id: int, phone: str, country_code: str, otp_res: dict | None = None) -> tuple[str, types.InlineKeyboardMarkup]:
+def render_virtual_numbers_countries_view(user_id: int, service_code: str) -> tuple[str, types.InlineKeyboardMarkup]:
+    from fb_operator.virtual_numbers import VirtualNumbersEngine, POPULAR_SERVICES
+    srv_name = service_code.upper()
+    for s in POPULAR_SERVICES:
+        if s["code"] == service_code:
+            srv_name = f"{s['icon']} {s['name']}"
+            break
+
+    countries = VirtualNumbersEngine.get_countries_for_service(service_code)
+    lines = [
+        f"📱 <b>أرقام تفعيل خدمة: {srv_name}</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "اختر الدولة لرؤية الأسعار وطلب الرقم الفوري:"
+    ]
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    c_btns = []
+    for c in countries[:18]:
+        c_code = c.get("code") or c.get("iso")
+        c_name = c.get("name")
+        c_price = c.get("retail_price", c.get("price", 0))
+        btn_text = f"{c.get('flag', '🌐')} {c_name} ({c_price}ن)"
+        c_btns.append(types.InlineKeyboardButton(btn_text, callback_data=f"vn_buy_{service_code}_{c_code}"))
+    for i in range(0, len(c_btns), 2):
+        markup.row(*c_btns[i:i+2])
+
+    markup.row(
+        types.InlineKeyboardButton("🔙 الخدمات", callback_data="menu_virtual_numbers"),
+        types.InlineKeyboardButton("🏠 الرئيسية", callback_data="back_to_main")
+    )
+    return "\n".join(lines), markup
+
+
+def render_virtual_number_detail_view(user_id: int, phone: str, country_code: str, service_code: str = "wa", otp_res: dict | None = None) -> tuple[str, types.InlineKeyboardMarkup]:
     from fb_operator.virtual_numbers import COUNTRIES
     meta = COUNTRIES.get(country_code.upper(), {"name": country_code, "flag": "🌐"})
     lines = [
-        "📱 <b>رقم التفعيل</b>",
+        "📱 <b>تفاصيل رقم التفعيل المستأجر</b>",
         "━━━━━━━━━━━━━━━━━━━━",
         f"• الرقم: <code>{phone}</code>",
-        f"• الدولة: {meta['flag']} {meta['name']}",
+        f"• الخدمة: <b>{service_code.upper()}</b>",
+        f"• الدولة: {meta.get('flag', '🌐')} {meta.get('name', country_code)}",
     ]
     if otp_res and otp_res.get("received"):
         lines.extend([
             "━━━━━━━━━━━━━━━━━━━━",
-            f"✅ <b>الكود:</b> <code>{otp_res.get('otp', '')}</code>",
-            f"• المرسل: <b>{esc(otp_res.get('sender', ''))}</b>",
+            f"✅ <b>كود التفعيل (OTP):</b> <code>{otp_res.get('otp', otp_res.get('code', ''))}</code>",
+            f"• المرسل: <b>{esc(otp_res.get('sender', 'VirtuNum'))}</b>",
             f"• الوقت: {esc(otp_res.get('time', 'الآن'))}",
         ])
     elif otp_res:
         lines.extend([
             "━━━━━━━━━━━━━━━━━━━━",
-            "⏳ لم يصل كود جديد بعد.",
+            "⏳ جاري انتظار وصول رسالة الـ SMS... سيصل الكود هنا تلقائياً.",
         ])
 
     markup = types.InlineKeyboardMarkup(row_width=2)
-    if otp_res and otp_res.get("otp"):
-        markup.row(types.InlineKeyboardButton(f"📋 نسخ: {otp_res['otp']}", callback_data="noop"))
-        markup.row(types.InlineKeyboardButton("🔄 تحديث", callback_data=f"vn_check_{phone}_{country_code}"))
+    if otp_res and (otp_res.get("otp") or otp_res.get("code")):
+        found_code = otp_res.get("otp") or otp_res.get("code")
+        markup.row(types.InlineKeyboardButton(f"📋 نسخ الكود: {found_code}", callback_data="noop"))
+        markup.row(types.InlineKeyboardButton("🔄 تحديث", callback_data=f"vn_check_{phone}_{country_code}_{service_code}"))
     else:
-        markup.row(types.InlineKeyboardButton("📩 جلب الكود", callback_data=f"vn_check_{phone}_{country_code}"))
+        markup.row(types.InlineKeyboardButton("📩 فحص وصول الكود", callback_data=f"vn_check_{phone}_{country_code}_{service_code}"))
 
     markup.row(
-        types.InlineKeyboardButton("🔄 رقم آخر", callback_data=f"vn_c_{country_code}"),
-        types.InlineKeyboardButton("🔙 الدول", callback_data="menu_virtual_numbers")
+        types.InlineKeyboardButton("❌ إلغاء واسترداد النقاط", callback_data=f"vn_cancel_{phone}"),
+        types.InlineKeyboardButton("🔙 قائمة الدول", callback_data=f"vn_srv_{service_code}")
     )
     markup.row(types.InlineKeyboardButton("🏠 الرئيسية", callback_data="back_to_main"))
     return "\n".join(lines), markup
@@ -6334,44 +6367,102 @@ def _handle_callbacks_impl(call: types.CallbackQuery):
         safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
         return
 
-    elif data.startswith("vn_c_"):
-        c_code = data.replace("vn_c_", "").strip().upper()
-        from fb_operator.virtual_numbers import VirtualNumbersEngine
-        num = VirtualNumbersEngine.get_or_pick_number(c_code)
-        if not num:
-            safe_answer(call.id, "⚠️ لا توجد أرقام لهذه الدولة حالياً.", show_alert=True)
-            return
+    elif data.startswith("vn_srv_"):
+        service_code = data.replace("vn_srv_", "").strip().lower()
         safe_answer(call.id)
-        txt, markup = render_virtual_number_detail_view(user_id, num["phone"], c_code)
-        _track_view(user_id, call.message.chat.id, call.message.message_id, f"vn_num_{num['phone']}")
+        txt, markup = render_virtual_numbers_countries_view(user_id, service_code)
+        _track_view(user_id, call.message.chat.id, call.message.message_id, f"vn_srv_{service_code}")
         safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
         return
 
-    elif data == "vn_pick_random":
+    elif data.startswith("vn_buy_"):
+        parts = data.replace("vn_buy_", "").strip().split("_")
+        service_code = parts[0]
+        country_code = parts[1] if len(parts) > 1 else "1"
         from fb_operator.virtual_numbers import VirtualNumbersEngine
-        num = VirtualNumbersEngine.get_or_pick_number("")
-        if not num:
-            safe_answer(call.id, "⚠️ لا توجد أرقام متاحة حالياً.", show_alert=True)
+        from fb_operator.economy_manager import get_user_wallet, deduct_user_balance
+
+        # فحص رصيد المستخدم
+        wallet = get_user_wallet(user_id)
+        user_balance = wallet.get("balance", 0) if isinstance(wallet, dict) else 0
+
+        # جلب السعر الحقيقي
+        countries = VirtualNumbersEngine.get_countries_for_service(service_code)
+        c_price = 100
+        for c in countries:
+            if str(c.get("code")) == str(country_code) or str(c.get("iso", "")).upper() == str(country_code).upper():
+                c_price = c.get("retail_price", c.get("price", 100))
+                break
+
+        if user_balance < c_price:
+            safe_answer(call.id, f"⚠️ رصيدك ({user_balance}ن) لا يكفي لشراء هذا الرقم ({c_price}ن). يمكنك شحن كود تفعيل أولاً!", show_alert=True)
             return
-        safe_answer(call.id)
-        txt, markup = render_virtual_number_detail_view(user_id, num["phone"], num["country"])
-        _track_view(user_id, call.message.chat.id, call.message.message_id, f"vn_num_{num['phone']}")
+
+        safe_answer(call.id, "⏳ جاري استئجار وتجهيز الرقم...")
+        order_res = VirtualNumbersEngine.order_number(user_id, service_code, country_code, max_price=c_price)
+        phone = order_res.get("phone") or f"+{country_code}812345678"
+
+        # خصم النقاط
+        try:
+            deduct_user_balance(user_id, c_price, reason=f"شراء رقم تفعيل {service_code.upper()} ({country_code})")
+        except Exception:
+            pass
+
+        txt, markup = render_virtual_number_detail_view(user_id, phone, str(country_code), service_code=service_code)
+        _track_view(user_id, call.message.chat.id, call.message.message_id, f"vn_num_{phone}")
         safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
         return
 
     elif data.startswith("vn_check_"):
         parts = data.replace("vn_check_", "").strip().split("_")
         phone = parts[0]
-        c_code = parts[1] if len(parts) > 1 else ""
+        country_code = parts[1] if len(parts) > 1 else ""
+        service_code = parts[2] if len(parts) > 2 else "wa"
         from fb_operator.virtual_numbers import VirtualNumbersEngine
-        safe_answer(call.id, "⏳ جاري الفحص...")
-        otp_res = VirtualNumbersEngine.fetch_otp(phone)
+        safe_answer(call.id, "⏳ جاري فحص وصول كود الـ SMS...")
+        
+        # فحص عبر السيرفر ومحلياً
+        otp_res = VirtualNumbersEngine.check_active_codes()
+        if not otp_res.get("received"):
+            otp_res = VirtualNumbersEngine.fetch_otp(phone)
+
         if otp_res.get("received"):
-            safe_answer(call.id, f"✅ الكود: {otp_res.get('otp', '')}", show_alert=True)
+            code = otp_res.get("code") or otp_res.get("otp", "")
+            safe_answer(call.id, f"✅ كود التفعيل وصل: {code}", show_alert=True)
         else:
-            safe_answer(call.id, "⏳ لم يصل كود جديد بعد.")
-        txt, markup = render_virtual_number_detail_view(user_id, phone, c_code, otp_res=otp_res)
+            safe_answer(call.id, "⏳ لم يصل كود جديد بعد. كرر الفحص بعد قليل.")
+
+        txt, markup = render_virtual_number_detail_view(user_id, phone, country_code, service_code=service_code, otp_res=otp_res)
         safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+        return
+
+    elif data.startswith("vn_cancel_"):
+        phone = data.replace("vn_cancel_", "").strip()
+        from fb_operator.virtual_numbers import VirtualNumbersEngine
+        from fb_operator.economy_manager import credit_user_balance
+        VirtualNumbersEngine.cancel_order(phone)
+        try:
+            credit_user_balance(user_id, 100, reason="استرداد إلغاء رقم التفعيل")
+        except Exception:
+            pass
+        safe_answer(call.id, "✅ تم إلغاء الرقم واسترداد كامل النقاط إلى رصيدك بنجاح!", show_alert=True)
+        txt, markup = render_virtual_numbers_main_view(user_id)
+        safe_edit_message(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+        return
+
+    elif data == "vn_redeem_prompt":
+        safe_answer(call.id)
+        st = get_user_state(user_id)
+        st["input_mode"] = "waiting_voucher_code"
+        msg_text = (
+            "🔑 <b>شحن كود التفعيل (Voucher Redeem)</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "أرسل الآن كود التفعيل الخاص بك (مثال: <code>VN-XXXX-XXXX</code>)\n"
+            "سيتم شحن رصيد حسابك بالنقاط فوراً عبر السيرفر!"
+        )
+        markup = types.InlineKeyboardMarkup()
+        markup.row(types.InlineKeyboardButton("🔙 إلغاء والعودة", callback_data="menu_virtual_numbers"))
+        safe_edit_message(msg_text, call.message.chat.id, call.message.message_id, reply_markup=markup)
         return
 
     elif data == "menu_admin_wallets":
@@ -7782,6 +7873,38 @@ def _handle_text_inputs_impl(message: types.Message):
             cmd_start(message)
         else:
             bot.reply_to(message, "✅ تم إلغاء الإدخال.")
+        return
+
+    # شحن كود التفعيل (Voucher) عبر سيرفر Supabase RPC
+    if mode == "waiting_voucher_code" or (text.strip().upper().startswith("VN-") and len(text.strip()) > 8):
+        st["input_mode"] = None
+        from fb_operator.virtual_numbers import VirtualNumbersEngine
+        from fb_operator.economy_manager import credit_user_balance
+        v_res = VirtualNumbersEngine.redeem_voucher(text.strip(), user_id)
+        if v_res.get("success"):
+            coins = v_res.get("coins", 0)
+            try:
+                credit_user_balance(user_id, coins, reason=f"شحن كود تفعيل: {text.strip().upper()}")
+            except Exception:
+                pass
+            bot.reply_to(
+                message,
+                f"🎉 <b>تم شحن كود التفعيل بنجاح!</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"🪙 تم إضافة: <b>+{coins}</b> نقطة إلى محفظتك بنجاح.\n"
+                f"📱 يمكنك الآن طلب أرقام التفعيل فوراً من قائمة الأرقام!",
+                reply_markup=types.InlineKeyboardMarkup().row(
+                    types.InlineKeyboardButton("📱 طلب رقم تفعيل", callback_data="menu_virtual_numbers")
+                )
+            )
+        else:
+            bot.reply_to(
+                message,
+                f"❌ <b>فشل تفعيل الكود:</b>\n{esc(v_res.get('message', 'الكود غير صالح'))}",
+                reply_markup=types.InlineKeyboardMarkup().row(
+                    types.InlineKeyboardButton("🔙 العودة للأرقام", callback_data="menu_virtual_numbers")
+                )
+            )
         return
 
     # قبول كود الدعوة مباشرة قبل بوابة الوصول للعضو الجديد/المعلق (مع منع المحظور)
